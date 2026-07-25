@@ -1,0 +1,40 @@
+[Unit]
+Description=Ring0 — eBPF Security Command Center Daemon
+Documentation=https://github.com/ring0/ring0
+After=network.target local-fs.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ring0d
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+# Minimal Linux capabilities for eBPF + process introspection
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_PTRACE CAP_PERFMON CAP_KILL
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_PTRACE CAP_PERFMON CAP_KILL
+
+# Filesystem hardening
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run /var/log/ring0
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Process isolation
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+# Sandboxing
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @privileged
+
+[Install]
+WantedBy=multi-user.target
