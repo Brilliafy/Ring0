@@ -1,0 +1,29 @@
+module ring0d 1.0;
+
+require {
+    type unconfined_t;
+    type proc_t;
+    type sysfs_t;
+    type cgroup_t;
+    class capability { bpf net_admin sys_ptrace kill net_raw };
+    class process { signal ptrace };
+    class file { read write open getattr };
+    class dir { read write search add_name remove_name };
+    class netlink_audit_socket { create bind };
+}
+
+type ring0d_t;
+type ring0d_exec_t;
+
+init_daemon_domain(ring0d_t, ring0d_exec_t)
+
+allow ring0d_t self:capability { bpf net_admin sys_ptrace kill net_raw };
+allow ring0d_t self:process { signal ptrace };
+allow ring0d_t self:netlink_audit_socket { create bind };
+
+allow ring0d_t proc_t:file { read open getattr };
+allow ring0d_t sysfs_t:file { read open getattr };
+allow ring0d_t cgroup_t:dir { read write search add_name remove_name };
+allow ring0d_t cgroup_t:file { read write open getattr };
+
+allow ring0d_t ring0d_exec_t:file { execute execute_no_trans };

@@ -1,0 +1,19 @@
+[package]
+name = "ring0-gui"
+version.workspace = true
+edition.workspace = true
+
+build = "build.rs"
+
+[dependencies]
+cxx-qt = "0.6"
+cxx = "1"
+ring0-common = { path = "../ring0-common" }
+tokio = { version = "1", features = ["full"] }
+capnp = "0.21"
+anyhow = "1"
+zbus = "4"
+serde_json = "1"
+
+[build-dependencies]
+cxx-qt-build = "0.6"

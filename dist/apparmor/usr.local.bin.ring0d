@@ -1,0 +1,26 @@
+#include <tunables/global>
+
+/usr/local/bin/ring0d {
+  #include <abstractions/base>
+  #include <abstractions/openssl>
+
+  capability bpf,
+  capability net_admin,
+  capability sys_ptrace,
+  capability kill,
+  capability net_raw,
+
+  /run/ring0d.sock rw,
+  /etc/ring0/** r,
+  /var/log/ring0/** rw,
+  /var/lib/ring0/** rw,
+  /sys/fs/cgroup/** rw,
+  /sys/kernel/btf/vmlinux r,
+  /sys/kernel/security/lsm r,
+  /proc/** r,
+  /usr/local/bin/ring0ctl r,
+
+  /usr/lib/x86_64-linux-gnu/libssl.so.* mr,
+  /usr/lib64/libssl.so.* mr,
+  /lib64/libssl.so.* mr,
+}

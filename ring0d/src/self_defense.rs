@@ -1,0 +1,88 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+use tracing::{error, info, warn};
+
+use crate::ipc;
+
+const DAEMON_PID: u32 = std::process::id();
+
+#[derive(Debug, Clone)]
+pub struct SelfDefenseEvent {
+    pub timestamp: u64,
+    pub attacker_pid: u32,
+    pub target_path: String,
+    pub syscall: String,
+    pub blocked: bool,
+}
+
+pub struct SelfDefense {
+    locked: AtomicBool,
+    events: Arc<RwLock<Vec<SelfDefenseEvent>>>,
+    daemon_pid: u32,
+}
+
+impl SelfDefense {
+    pub fn new() -> Self {
+        info!("SelfDefense active for PID {DAEMON_PID}");
+        Self {
+            locked: AtomicBool::new(false),
+            events: Arc::new(RwLock::new(Vec::with_capacity(256))),
+            daemon_pid: DAEMON_PID,
+        }
+    }
+
+    pub fn lock_ebpf_maps(&self) {
+        self.locked.store(true, Ordering::SeqCst);
+        info!("eBPF maps locked — detach/resize prevented");
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::SeqCst)
+    }
+
+    pub fn ingest_kill_attempt(
+        &self,
+        attacker_pid: u32,
+        target_pid: u32,
+        sig: u32,
+    ) -> Option<SelfDefenseEvent> {
+        if target_pid != self.daemon_pid {
+            return None;
+        }
+        let attacker_binary = crate::process::ProcessResolver::binary_path(attacker_pid)
+            .unwrap_or_else(|| "unknown".into());
+        warn!("self-defense: PID {attacker_pid} ({attacker_binary}) attempted SIG{sig} on daemon PID {target_pid}");
+
+        let evt = SelfDefenseEvent {
+            timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+            attacker_pid,
+            target_path: format!("PID {}", target_pid),
+            syscall: format!("kill(pid={}, sig={})", target_pid, sig),
+            blocked: true,
+        };
+        self.events.write().push(evt.clone());
+        Some(evt)
+    }
+
+    pub fn ingest_unlink_attempt(&self, attacker_pid: u32, path: &str) -> Option<SelfDefenseEvent> {
+        let attacker_binary = crate::process::ProcessResolver::binary_path(attacker_pid)
+            .unwrap_or_else(|| "unknown".into());
+        warn!("self-defense: PID {attacker_pid} ({attacker_binary}) attempted unlink {path}");
+
+        let evt = SelfDefenseEvent {
+            timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+            attacker_pid,
+            target_path: path.to_string(),
+            syscall: format!("unlinkat({})", path),
+            blocked: true,
+        };
+        self.events.write().push(evt.clone());
+        Some(evt)
+    }
+
+    pub fn recent_events(&self) -> Vec<SelfDefenseEvent> {
+        self.events.read().iter().rev().take(50).cloned().collect()
+    }
+}

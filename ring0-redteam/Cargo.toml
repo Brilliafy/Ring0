@@ -1,0 +1,11 @@
+[package]
+name = "ring0-redteam"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+nix = { version = "0.29", features = ["signal", "process"] }
+chrono = "0.4"
+ring0-common = { path = "../ring0-common" }

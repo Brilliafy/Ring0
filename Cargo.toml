@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "xtask",
+    "ring0-common",
+    "ring0-ebpf",
+    "ring0d",
+    "ring0-gui",
+    "ring0ctl",
+    "ring0-redteam",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"

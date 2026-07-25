@@ -1,0 +1,9 @@
+target/
+*.o
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.rs.bk
+Cargo.lock

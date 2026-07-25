@@ -1,0 +1,10 @@
+[package]
+name = "ring0-ebpf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aya-ebpf = "0.1"
+
+[features]
+default = []

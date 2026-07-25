@@ -1,0 +1,83 @@
+rules:
+  network:
+    - id: 1001
+      name: "Block internal squid"
+      cidrs:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+      ports: [3128, 8080]
+      protocols: ["tcp"]
+      severity: 1
+      enabled: true
+    - id: 1002
+      name: "SQLi pattern match"
+      signatures:
+        - "(?i)(%27|')\\s*OR\\s*"
+        - "(?i)UNION\\s+.*SELECT\\s+"
+      severity: 2
+      enabled: true
+    - id: 1003
+      name: "C2 beacon pattern"
+      signatures:
+        - "(?i)cmd=whoami"
+        - "(?i)cmd=id\\b"
+      severity: 3
+      enabled: true
+    - id: 1004
+      name: "Drop SSH from WAN"
+      ports: [22]
+      protocols: ["tcp"]
+      cidrs:
+        - "0.0.0.0/0"
+      severity: 2
+      enabled: false
+
+  process:
+    - id: 2001
+      name: "Web shell detection"
+      binary_paths:
+        - "/usr/sbin/apache"
+        - "/usr/sbin/nginx"
+        - "/usr/sbin/lighttpd"
+      child_blacklist:
+        - "/bin/sh"
+        - "/bin/bash"
+        - "/usr/bin/python"
+        - "/usr/bin/perl"
+      severity: 3
+      enabled: true
+    - id: 2002
+      name: "Reverse shell binaries"
+      binary_paths:
+        - "/bin/nc"
+        - "/usr/bin/ncat"
+        - "/usr/bin/socat"
+      severity: 3
+      enabled: true
+
+  file:
+    - id: 3001
+      name: "Shadow file access"
+      path_glob: "/etc/shadow"
+      severity: 3
+      read_only: false
+      enabled: true
+    - id: 3002
+      name: "SSH key access"
+      path_glob: "~/.ssh/id_*"
+      severity: 2
+      read_only: true
+      enabled: true
+    - id: 3003
+      name: "Sudoers read"
+      path_glob: "/etc/sudoers"
+      severity: 3
+      read_only: true
+      enabled: true
+    - id: 3004
+      name: "Kernel symbols"
+      path_glob: "/proc/kallsyms"
+      severity: 2
+      read_only: true
+      enabled: true
