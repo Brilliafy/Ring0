@@ -97,6 +97,13 @@ const MAX_QUEUED_EVENTS: usize = 4096;
 // disconnects while it is blocked waiting for the next daemon frame.
 const READER_POLL_MS: u64 = 250;
 
+// One Tokio runtime shared by all bridge calls. Creating a fresh runtime per
+// `send_frame` call (the previous behavior) spawned thread pools and allocated
+// heap on every IPC command.
+static SHARED_RT: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+    tokio::runtime::Runtime::new().expect("failed to build shared tokio runtime")
+});
+
 pub struct Ring0BridgeRust {
     stream: Option<Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>>,
     event_queue: Arc<Mutex<VecDeque<String>>>,
@@ -136,11 +143,7 @@ impl Ring0BridgeRust {
             return;
         };
         if let Ok(mut guard) = stream.lock() {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(_) => return,
-            };
-            rt.block_on(async {
+            SHARED_RT.block_on(async {
                 let len = (frame.len() as u32).to_le_bytes();
                 let _ = guard.write_all(&len).await;
                 let _ = guard.write_all(frame).await;
@@ -321,11 +324,7 @@ impl Ring0BridgeRust {
         let message: String = message.into();
         let notifier = self.get_mut().dbus_notifier.clone();
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(_) => return,
-            };
-            rt.block_on(async move {
+            SHARED_RT.block_on(async move {
                 let urgency = match severity {
                     0..=1 => 0,
                     2 => 1,
@@ -341,7 +340,7 @@ impl Ring0BridgeRust {
                     ],
                 };
                 let mut guard = notifier.lock().await;
-                if let Some(ref mut n) = *guard {
+                if let Some(n) = guard.as_mut() {
                     let _ = n.send_notification(notif).await;
                 }
             });
@@ -351,11 +350,7 @@ impl Ring0BridgeRust {
     pub fn initDbusNotifications(self: Pin<&mut Self>) {
         let notifier = self.get_mut().dbus_notifier.clone();
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(_) => return,
-            };
-            rt.block_on(async move {
+            SHARED_RT.block_on(async move {
                 let mut n = DbusNotifier::new();
                 match n.connect().await {
                     Ok(true) => {

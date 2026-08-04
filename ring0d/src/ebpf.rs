@@ -75,6 +75,7 @@ pub struct EbpfManager {
     privesc_tx: broadcast::Sender<Vec<u8>>,
     ebpf: Option<Ebpf>,
     loaded: Arc<AtomicBool>,
+    lsm_attached: Arc<AtomicBool>,
     // software fallback for when the kernel maps are unavailable
     fallback_blocked_ips: std::sync::Mutex<Vec<String>>,
     fallback_blocked_ports: std::sync::Mutex<Vec<u16>>,
@@ -125,6 +126,7 @@ impl EbpfManager {
                     privesc_tx,
                     ebpf: None,
                     loaded: Arc::new(AtomicBool::new(false)),
+                    lsm_attached: Arc::new(AtomicBool::new(false)),
                     fallback_blocked_ips: std::sync::Mutex::new(Vec::new()),
                     fallback_blocked_ports: std::sync::Mutex::new(Vec::new()),
                     fallback_dns_domains: std::sync::Mutex::new(Vec::new()),
@@ -184,6 +186,7 @@ impl EbpfManager {
         }
 
         // ── Attach LSM programs (by section name) ──
+        let mut lsm_ok = false;
         for name in [
             "lsm/file_open",
             "lsm/bprm_check",
@@ -192,7 +195,7 @@ impl EbpfManager {
             "lsm/capable",
         ] {
             match attach_lsm(&mut ebpf, name) {
-                Ok(()) => {}
+                Ok(()) => lsm_ok = true,
                 Err(e) => warn!("LSM {name} attach failed: {e}"),
             }
         }
@@ -218,6 +221,7 @@ impl EbpfManager {
             privesc_tx: privesc_tx.clone(),
             ebpf: Some(ebpf),
             loaded: Arc::new(AtomicBool::new(true)),
+            lsm_attached: Arc::new(AtomicBool::new(lsm_ok)),
             fallback_blocked_ips: std::sync::Mutex::new(Vec::new()),
             fallback_blocked_ports: std::sync::Mutex::new(Vec::new()),
             fallback_dns_domains: std::sync::Mutex::new(Vec::new()),
@@ -248,7 +252,7 @@ impl EbpfManager {
     }
 
     pub fn lsm_available(&self) -> bool {
-        self.ebpf.is_some()
+        self.lsm_attached.load(Ordering::Relaxed)
     }
 
     pub fn enable_lsm_enforcement(&mut self) {
