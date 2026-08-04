@@ -4,7 +4,6 @@ pub mod containment;
 pub mod contextual_security;
 pub mod correlation;
 pub mod desktop_sandbox;
-pub mod dns_inspector;
 pub mod dpi;
 pub mod ebpf;
 pub mod enrichment;
@@ -22,14 +21,11 @@ pub mod power;
 pub mod privesc;
 pub mod process;
 pub mod prompt;
-pub mod qos;
-pub mod reassembly;
 pub mod rootkit;
 pub mod rules;
 pub mod self_defense;
 pub mod storage;
 pub mod sucadara;
-pub mod telemetry;
 pub mod threat_blocklist;
 pub mod trust;
 
@@ -93,7 +89,6 @@ struct Daemon {
     rules: rules::RuleEngine,
     correlation: correlation::CorrelationEngine,
     self_defense: self_defense::SelfDefense,
-    _telemetry: telemetry::TelemetryEngine,
     ipc: ipc::IpcServer,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<ipc::DaemonCmd>,
     shutdown: Arc<Notify>,
@@ -106,12 +101,9 @@ struct Daemon {
     trust: trust::TrustEngine,
     fastpath: fastpath::FastPathManager,
     prompt: prompt::PromptEngine,
-    reassembly: reassembly::ReassemblyEngine,
     enrichment: enrichment::EnrichmentEngine,
-    dns_inspector: dns_inspector::DnsInspector,
     threat_blocklist: threat_blocklist::ThreatBlocklist,
     contextual: contextual_security::ContextualSecurity,
-    qos: qos::QosManager,
     fim: fim::FimEngine,
     privesc: privesc::PrivEscDetector,
     desktop_sandbox: desktop_sandbox::DesktopSandbox,
@@ -125,6 +117,12 @@ struct Daemon {
 impl Daemon {
     async fn new(shutdown: Arc<Notify>) -> Result<Self> {
         let mut ebpf = ebpf::EbpfManager::load()?;
+        // Fast-path DPI: sync literal patterns into the kernel map. Observe-only
+        // by default; RING0_DPI_ENFORCE=1 switches the fast path to drop.
+        let dpi_synced = ebpf.sync_dpi_patterns(ebpf::BPF_DPI_SIGNATURES);
+        let dpi_enforce = std::env::var("RING0_DPI_ENFORCE").as_deref() == Ok("1");
+        ebpf.set_dpi_enforce(dpi_enforce);
+        info!("DPI fast path: {dpi_synced} literal patterns synced");
         let storage = Arc::new(storage::RocksManager::open(&ring0_common::db_path())?);
         let dpi = dpi::DpiEngine::new()?;
         let rules_path = bundled_config_path("rules.yaml");
@@ -136,7 +134,6 @@ impl Daemon {
         let self_defense = self_defense::SelfDefense::new();
         self_defense.lock_ebpf_maps();
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let _telemetry = telemetry::TelemetryEngine::new();
         let ipc = ipc::IpcServer::bind(
             &ring0_common::socket_path(),
             storage.clone(),
@@ -186,9 +183,7 @@ impl Daemon {
         let trust = trust::TrustEngine::new();
         let fastpath = fastpath::FastPathManager::new();
         let prompt = prompt::PromptEngine::new(cmd_tx.clone(), &rules_path);
-        let reassembly = reassembly::ReassemblyEngine::new();
         let enrichment = enrichment::EnrichmentEngine::new();
-        let dns_inspector = dns_inspector::DnsInspector::new();
         let threat_blocklist = threat_blocklist::ThreatBlocklist::new();
         threat_blocklist.load_local_file(&bundled_config_path("threat_domains.txt"));
         info!(
@@ -197,7 +192,6 @@ impl Daemon {
         );
         let mut contextual = contextual_security::ContextualSecurity::new();
         contextual.start_dbus_monitor();
-        let qos = qos::QosManager::new();
         let fim = fim::FimEngine::new(rocksdb_inner.clone());
         // Hash the system directories in the background: /usr/lib64 alone can
         // be several GB, and a synchronous scan would leave the daemon
@@ -247,7 +241,6 @@ impl Daemon {
             rules,
             correlation,
             self_defense,
-            _telemetry,
             ipc,
             cmd_rx,
             shutdown,
@@ -260,12 +253,9 @@ impl Daemon {
             trust,
             fastpath,
             prompt,
-            reassembly,
             enrichment,
-            dns_inspector,
             threat_blocklist,
             contextual,
-            qos,
             fim,
             privesc,
             desktop_sandbox,
@@ -343,6 +333,7 @@ impl Daemon {
             4 => self.on_kill_event(raw).await,
             5 => self.on_unlink_event(raw).await,
             6 => self.on_tls_event(raw).await,
+            30 => self.on_dpi_event(raw).await,
             _ => {}
         }
     }
@@ -608,6 +599,42 @@ impl Daemon {
         }
     }
 
+    /// Handle a fast-path DPI match from the kernel (KIND_DPI). The kernel has
+    /// already passed or dropped the packet; here we just record and surface it.
+    async fn on_dpi_event(&self, raw: &[u8]) {
+        self.event_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if raw.len() < 36 {
+            return;
+        }
+        let rule_id = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
+        let src_ip = u32::from_le_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
+        let dst_ip = u32::from_le_bytes(raw[28..32].try_into().unwrap_or([0; 4]));
+        let dst_port = u16::from_le_bytes(raw[32..34].try_into().unwrap_or([0; 2]));
+        let proto = raw[34];
+        let name = self
+            .dpi
+            .signature_name(rule_id)
+            .unwrap_or("unknown pattern");
+        let msg = format!(
+            "DPI match rule={rule_id} ({name}) {}.{}.{}.{} -> {}.{}.{}.{}:{}{}",
+            (src_ip >> 24) & 0xFF,
+            (src_ip >> 16) & 0xFF,
+            (src_ip >> 8) & 0xFF,
+            src_ip & 0xFF,
+            (dst_ip >> 24) & 0xFF,
+            (dst_ip >> 16) & 0xFF,
+            (dst_ip >> 8) & 0xFF,
+            dst_ip & 0xFF,
+            dst_port,
+            if proto == 17 { "/udp" } else { "/tcp" }
+        );
+        let alert = build_alert_bytes_rule(5000 + rule_id, 2, &msg);
+        self.storage.write_alert(&alert);
+        self.ipc.broadcast_raw(&alert).await;
+        info!("[DPI] {msg}");
+    }
+
     async fn on_lsm_event(&self, raw: &[u8]) {
         self.event_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -784,11 +811,15 @@ impl Daemon {
                     self.ipc.broadcast_raw(&a).await;
                     info!("[ROOTKIT] {desc}");
                     if let Some(binary) = crate::process::ProcessResolver::binary_path(pid) {
-                        let yara_matches = self.intel.scan_binary(&binary);
-                        for m in yara_matches {
-                            let a = build_alert_bytes_rule(7003, 3, &m);
-                            self.storage.write_alert(&a);
-                            self.ipc.broadcast_raw(&a).await;
+                        match self.intel.scan_binary(&binary) {
+                            Ok(matches) => {
+                                for m in matches {
+                                    let a = build_alert_bytes_rule(7003, 3, &m);
+                                    self.storage.write_alert(&a);
+                                    self.ipc.broadcast_raw(&a).await;
+                                }
+                            }
+                            Err(e) => warn!("YARA scan skipped for {binary}: {e}"),
                         }
                     }
                 }

@@ -168,6 +168,15 @@ impl DpiEngine {
         self.regexes.len()
     }
 
+    /// Look up a signature name by rule id (for the kernel fast-path DPI
+    /// events, whose rule ids mirror this table).
+    pub fn signature_name(&self, rule_id: u32) -> Option<&'static str> {
+        SIGNATURES
+            .iter()
+            .find(|s| s.rule_id == rule_id)
+            .map(|s| s.name)
+    }
+
     /// Scan a payload (e.g. TLS plaintext, reassembled stream) for threat signatures.
     pub fn scan_payload(&self, payload: &[u8]) -> Vec<DpiMatch> {
         if payload.is_empty() {

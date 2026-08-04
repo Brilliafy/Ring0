@@ -1,6 +1,11 @@
 #![no_std]
 #![no_main]
 #![allow(unused_unsafe)]
+//
+// Kernel structs (e.g. `task_struct`) are intentionally NOT shipped in
+// aya-ebpf-bindings for CO-RE portability. To read task fields from a program
+// (e.g. an eBPF-native PID-set iterator), generate per-kernel bindings with
+// `aya-tool generate task_struct > src/vmlinux.rs` and include! them.
 
 use core::ptr;
 
@@ -58,6 +63,18 @@ pub static ROOTKIT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 #[map]
 pub static PRIVESC_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
+// ── DPI (in-kernel fast-path pattern matching) ──────────────────
+//
+// Patterns are literal byte substrings keyed by rule id. DPI_MODE key 1
+// selects enforcement (drop on match); when unset the daemon observes only
+// (emits a DPI event and passes the packet, never interrupting the flow).
+
+#[map]
+pub static DPI_PATTERNS: HashMap<u32, DpiPattern> = HashMap::with_max_entries(64, 0);
+
+#[map]
+pub static DPI_MODE: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
+
 // ── Struct definitions ───────────────────────────────────────
 
 #[repr(C)]
@@ -99,6 +116,7 @@ pub const KIND_PTRACE: u8 = 14;
 pub const KIND_MEMFD: u8 = 20;
 pub const KIND_MMAP: u8 = 21;
 pub const KIND_MODULE: u8 = 22;
+pub const KIND_DPI: u8 = 30;
 
 #[repr(C)]
 pub struct PacketEvent {
@@ -235,6 +253,24 @@ pub struct TlsEvent {
     pub direction: u8,
     pub len: u32,
     pub buf: [u8; 256],
+}
+
+#[repr(C)]
+pub struct DpiPattern {
+    pub len: u8,
+    pub data: [u8; 32],
+}
+
+#[repr(C)]
+pub struct DpiEvent {
+    pub kind: u8,
+    pub timestamp: u64,
+    pub pid: u32,
+    pub rule_id: u32,
+    pub src_ip: u32,
+    pub dst_ip: u32,
+    pub dst_port: u16,
+    pub protocol: u8,
 }
 
 // ── Helper functions ─────────────────────────────────────────
@@ -394,6 +430,55 @@ unsafe fn dns_query_blocked<T: PktData>(ctx: &T, qname_off: usize) -> bool {
     false
 }
 
+// ── DPI fast-path pattern scan ────────────────────────────────
+//
+// Scans the first SCAN_WINDOW bytes of a packet payload for the literal
+// patterns in DPI_PATTERNS. Pure observation — never touches the flow other
+// than optionally dropping in enforce mode.
+
+#[inline(always)]
+unsafe fn dpi_scan_packet(ctx: &XdpContext, payload_off: usize) -> u32 {
+    const MAX_PATTERNS: u32 = 64;
+    const SCAN_WINDOW: usize = 64;
+
+    let mut rule_id = 0u32;
+    let mut idx = 0u32;
+    while idx < MAX_PATTERNS {
+        if let Some(pat) = DPI_PATTERNS.get_ptr(&idx) {
+            let plen = (*pat).len as usize;
+            if plen > 0 && plen <= 32 {
+                let mut off = 0usize;
+                while off < SCAN_WINDOW {
+                    let mut matched = true;
+                    let mut k = 0usize;
+                    while k < plen {
+                        let pos = payload_off + off + k;
+                        if pos >= ctx.data_end() {
+                            matched = false;
+                            break;
+                        }
+                        if *(ctx.data() as *const u8).add(pos) != (*pat).data[k] {
+                            matched = false;
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if matched {
+                        rule_id = idx;
+                        break;
+                    }
+                    off += 1;
+                }
+                if rule_id != 0 {
+                    break;
+                }
+            }
+        }
+        idx += 1;
+    }
+    rule_id
+}
+
 // ── XDP program ──────────────────────────────────────────────
 
 #[xdp]
@@ -469,6 +554,49 @@ unsafe fn try_ring0_xdp(ctx: &XdpContext) -> Result<u32, u32> {
     };
     if ESTABLISHED_FLOWS.get_ptr(&flow_key).is_some() {
         return Ok(xdp_action::XDP_PASS);
+    }
+
+    // Fast-path DPI on the payload of new flows (no reassembly): literal
+    // byte-pattern match, observe-and-pass by default; drop only in enforce
+    // mode (DPI_MODE key 1).
+    let dpi_payload_off = if proto == 6 {
+        let l4 = ip + 20;
+        if ctx.data_end() < l4 + 14 {
+            0
+        } else {
+            // TCP data offset: high nibble of byte 12 in the TCP header.
+            l4 + (((*(l4 as *const u8).add(12)) >> 4) as usize) * 4
+        }
+    } else if proto == 17 {
+        let l4 = ip + 20;
+        if ctx.data_end() < l4 + 8 {
+            0
+        } else {
+            l4 + 8
+        }
+    } else {
+        0
+    };
+    if dpi_payload_off > eth && dpi_payload_off < ctx.data_end() {
+        let rule = dpi_scan_packet(ctx, dpi_payload_off);
+        if rule != 0 {
+            if DPI_MODE.get_ptr(&1).is_some() {
+                return Ok(xdp_action::XDP_DROP);
+            }
+            if let Some(mut entry) = RING_BUF.reserve::<DpiEvent>(0) {
+                entry.write(DpiEvent {
+                    kind: KIND_DPI,
+                    timestamp: ktime_get_ns(),
+                    pid: 0,
+                    rule_id: rule,
+                    src_ip,
+                    dst_ip,
+                    dst_port: dp,
+                    protocol: proto,
+                });
+                entry.submit(0);
+            }
+        }
     }
 
     if let Some(mut entry) = RING_BUF.reserve::<PacketEvent>(0) {

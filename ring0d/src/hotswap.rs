@@ -31,15 +31,13 @@ impl HotswapManager {
         Ok(())
     }
 
-    pub fn pin_map(&self, name: &str, fd: i32) -> Result<()> {
-        if !self.pinned.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let pin_path = format!("{BPFFS_PATH}/{name}");
-        bpf_pin_map(fd, &pin_path)
-            .with_context(|| format!("Failed to pin map {name} to {pin_path}"))?;
-        info!("Hotswap: pinned map {name}");
-        Ok(())
+    pub fn pin_map(&self, name: &str, _fd: i32) -> Result<()> {
+        // Pinning is not implemented. Failing loudly here is intentional: a
+        // fake Ok(()) would make callers believe the map survives a daemon
+        // restart when it actually does not.
+        Err(anyhow::anyhow!(
+            "map pinning is not implemented — map {name} was not pinned"
+        ))
     }
 
     pub fn unpin_map(&self, name: &str) {
@@ -48,16 +46,16 @@ impl HotswapManager {
         info!("Hotswap: unpinned map {name}");
     }
 
-    pub fn hotswap_program(&self, _prog_name: &str, _new_fd: i32) -> Result<()> {
-        info!("Hotswap: program hotswap requested (BPF_LINK_UPDATE)");
-        self.fallback_active.store(false, Ordering::Relaxed);
-        Ok(())
+    pub fn hotswap_program(&self, prog_name: &str, _new_fd: i32) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "program hotswap is not implemented — {prog_name} was not swapped"
+        ))
     }
 
-    pub fn rollback(&self, _prog_name: &str, _old_fd: i32) -> Result<()> {
-        warn!("Hotswap: rolling back to previous eBPF program");
-        self.fallback_active.store(true, Ordering::Relaxed);
-        Ok(())
+    pub fn rollback(&self, prog_name: &str, _old_fd: i32) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "program rollback is not implemented — {prog_name} was not rolled back"
+        ))
     }
 
     pub fn is_fallback_active(&self) -> bool {
@@ -65,12 +63,8 @@ impl HotswapManager {
     }
 }
 
-fn bpf_pin_map(fd: i32, _path: &str) -> Result<()> {
-    use std::os::unix::io::FromRawFd;
-    if fd < 0 {
-        return Ok(());
-    }
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let _ = file;
-    Ok(())
+fn bpf_pin_map(_fd: i32, _path: &str) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "eBPF map pinning is not implemented — the map will not survive a daemon restart"
+    ))
 }
