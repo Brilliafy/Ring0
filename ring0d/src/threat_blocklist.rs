@@ -207,16 +207,22 @@ impl ThreatBlocklist {
                 return 0;
             }
         };
-        let mut domains = self.domains.write();
         let mut count = 0usize;
-        for line in content.lines() {
-            let t = line.trim().to_lowercase();
-            if !t.is_empty() && !t.starts_with('#') && t.contains('.') {
-                if domains.insert(t) {
-                    count += 1;
+        {
+            let mut domains = self.domains.write();
+            for line in content.lines() {
+                let t = line.trim().to_lowercase();
+                if !t.is_empty() && !t.starts_with('#') && t.contains('.') {
+                    if domains.insert(t) {
+                        count += 1;
+                    }
                 }
             }
         }
+        // Note: the write lock must be dropped before rebuilding the matcher;
+        // `rebuild_ac_matcher` takes the read lock and parking_lot RwLocks are
+        // not reentrant — holding the write lock here used to deadlock the
+        // daemon at startup.
         info!("ThreatBlocklist: loaded {count} domains from {path}");
         self.rebuild_ac_matcher();
         count
