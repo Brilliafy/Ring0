@@ -202,14 +202,14 @@ impl IntelManager {
         self.sync_tx.subscribe()
     }
 
+    /// Scan a binary with the loaded YARA rules.
+    ///
+    /// NOTE: real YARA rule compilation/matching is not implemented yet; the
+    /// `yara_compiled` database is kept for when it is. This deliberately returns
+    /// no matches rather than fabricating alerts (the previous implementation
+    /// matched on the path containing "suspicious"/"malware", producing false
+    /// positives that looked like genuine YARA detections).
     pub fn scan_binary(&self, _path: &str) -> Vec<String> {
-        let mut matches = Vec::new();
-        let rules = self.yara_rules_count.read();
-        if *rules > 0 {
-            if _path.contains("suspicious") || _path.contains("malware") {
-                matches.push("YARA.Rule.Test: suspicious_path_match".into());
-            }
-        }
-        matches
+        Vec::new()
     }
 }

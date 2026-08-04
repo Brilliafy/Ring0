@@ -166,7 +166,7 @@ impl CorrelationEngine {
                     ),
                     timestamp: now,
                 };
-                self.alerts.write().push(alert.clone());
+                self.push_alert(alert.clone());
                 results.push(alert);
             }
         }
@@ -211,7 +211,7 @@ impl CorrelationEngine {
                     ),
                     timestamp: now,
                 };
-                self.alerts.write().push(alert.clone());
+                self.push_alert(alert.clone());
                 results.push(alert);
             }
         }
@@ -221,6 +221,17 @@ impl CorrelationEngine {
 
     pub fn recent_alerts(&self) -> Vec<CorrelationAlert> {
         self.alerts.read().iter().rev().take(100).cloned().collect()
+    }
+
+    /// Keep the in-memory alert history bounded.
+    fn push_alert(&self, alert: CorrelationAlert) {
+        const MAX_ALERTS: usize = 4096;
+        let mut alerts = self.alerts.write();
+        if alerts.len() >= MAX_ALERTS {
+            let excess = alerts.len() - MAX_ALERTS + 1;
+            alerts.drain(0..excess);
+        }
+        alerts.push(alert);
     }
 
     fn evict_old<T>(&self, map: &DashMap<u32, Vec<T>>, window: u64)

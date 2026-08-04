@@ -24,9 +24,10 @@ pub struct SocketEntry {
 
 pub struct ProcessResolver;
 
-static mut INODE_CACHE: Option<HashMap<u64, CachedPid>> = None;
-static SOCKET_CACHE: once_cell::sync::Lazy<Mutex<Vec<SocketEntry>>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(Vec::with_capacity(4096)));
+static INODE_CACHE: std::sync::LazyLock<Mutex<HashMap<u64, CachedPid>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::with_capacity(4096)));
+static SOCKET_CACHE: std::sync::LazyLock<Mutex<Vec<SocketEntry>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::with_capacity(4096)));
 
 struct CachedPid {
     pid: u32,
@@ -108,28 +109,25 @@ impl ProcessResolver {
     }
 
     fn pid_from_inode_cached(inode: u64) -> Option<u32> {
-        unsafe {
-            if let Some(ref cache) = INODE_CACHE {
-                if let Some(entry) = cache.get(&inode) {
-                    if entry.stamp.elapsed().as_secs() < 5 {
-                        return Some(entry.pid);
-                    }
+        {
+            let cache = INODE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = cache.get(&inode) {
+                if entry.stamp.elapsed().as_secs() < 5 {
+                    return Some(entry.pid);
                 }
             }
         }
         let pid = Self::pid_from_inode(inode)?;
-        unsafe {
-            let cache = INODE_CACHE.get_or_insert_with(HashMap::new);
-            cache.insert(
-                inode,
-                CachedPid {
-                    pid,
-                    stamp: std::time::Instant::now(),
-                },
-            );
-            if cache.len() > 16384 {
-                cache.clear();
-            }
+        let mut cache = INODE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(
+            inode,
+            CachedPid {
+                pid,
+                stamp: std::time::Instant::now(),
+            },
+        );
+        if cache.len() > 16384 {
+            cache.clear();
         }
         Some(pid)
     }

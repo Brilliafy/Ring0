@@ -1,15 +1,12 @@
 use std::collections::HashSet;
 use std::fs;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use parking_lot::RwLock;
 use tracing::warn;
 
 pub struct RootkitDetector {
-    hidden_scan_interval: Duration,
-    last_scan: Instant,
     known_pids: Arc<RwLock<HashSet<u32>>>,
     scan_count: Arc<RwLock<u64>>,
 }
@@ -27,8 +24,6 @@ pub struct RootkitFinding {
 impl RootkitDetector {
     pub fn new() -> Self {
         Self {
-            hidden_scan_interval: Duration::from_secs(60),
-            last_scan: Instant::now(),
             known_pids: Arc::new(RwLock::new(HashSet::new())),
             scan_count: Arc::new(RwLock::new(0)),
         }
@@ -237,14 +232,6 @@ impl RootkitDetector {
             module_name: _name.to_string(),
             timestamp: now,
         })
-    }
-
-    pub fn should_scan(&self) -> bool {
-        self.last_scan.elapsed() >= self.hidden_scan_interval
-    }
-
-    pub fn mark_scanned(&mut self) {
-        self.last_scan = Instant::now();
     }
 
     pub fn scan_count(&self) -> u64 {

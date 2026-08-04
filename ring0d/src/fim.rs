@@ -91,11 +91,10 @@ impl FimEngine {
         let mut baseline = self.baseline.write();
         baseline.clear();
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
-        for item in iter {
-            if let Ok((key, val)) = item {
-                let path = String::from_utf8_lossy(&key).to_string();
-                baseline.insert(path, val.to_vec());
-            }
+        for item in iter.flatten() {
+            let (key, val) = item;
+            let path = String::from_utf8_lossy(&key).to_string();
+            baseline.insert(path, val.to_vec());
         }
         info!("FIM: loaded {} baselines from database", baseline.len());
     }

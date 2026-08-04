@@ -51,13 +51,13 @@ impl DbusNotifier {
         };
 
         let mut hints = HashMap::new();
-        hints.insert("urgency", Value::from(u8::from(notif.urgency)));
+        hints.insert("urgency", Value::from(notif.urgency));
         hints.insert("category", Value::from("im"));
 
         let action_keys: Vec<&str> = notif.actions.iter().map(|(k, _)| k.as_str()).collect();
         let action_labels: Vec<&str> = notif.actions.iter().map(|(_, v)| v.as_str()).collect();
         let mut actions = Vec::new();
-        for (k, l) in action_keys.into_iter().zip(action_labels.into_iter()) {
+        for (k, l) in action_keys.into_iter().zip(action_labels) {
             actions.push(k);
             actions.push(l);
         }
@@ -67,13 +67,13 @@ impl DbusNotifier {
                 "Notify",
                 &(
                     "ring0",
-                    0u32,       // replaces_id
-                    app_icon,    // app_icon
+                    0u32,     // replaces_id
+                    app_icon, // app_icon
                     notif.summary.as_str(),
                     notif.body.as_str(),
-                    actions,     // actions: Vec<&str>
-                    hints,       // hints: a{sv}
-                    -1i32,       // timeout (default)
+                    actions, // actions: Vec<&str>
+                    hints,   // hints: a{sv}
+                    -1i32,   // timeout (default)
                 ),
             )
             .await?;

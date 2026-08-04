@@ -126,7 +126,7 @@ impl DesktopSandbox {
                 app.app_id, pid
             ),
         };
-        self.anomalies.write().push(anomaly.clone());
+        self.push_anomaly(anomaly.clone());
         info!("[SANDBOX] {} — no network permission", anomaly.description);
         Some(anomaly)
     }
@@ -149,7 +149,7 @@ impl DesktopSandbox {
                     app.app_id, pid, path
                 ),
             };
-            self.anomalies.write().push(anomaly.clone());
+            self.push_anomaly(anomaly.clone());
             info!("[SANDBOX] {} — host file access", anomaly.description);
             return Some(anomaly);
         }
@@ -166,6 +166,16 @@ impl DesktopSandbox {
 
     pub fn anomaly_count(&self) -> usize {
         self.anomalies.read().len()
+    }
+
+    /// Push an anomaly into the bounded history buffer.
+    fn push_anomaly(&self, anomaly: SandboxAnomaly) {
+        const MAX_ANOMALIES: usize = 2048;
+        let mut anomalies = self.anomalies.write();
+        if anomalies.len() >= MAX_ANOMALIES {
+            anomalies.remove(0);
+        }
+        anomalies.push(anomaly);
     }
 
     pub fn recent_anomalies(&self, n: usize) -> Vec<SandboxAnomaly> {

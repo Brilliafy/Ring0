@@ -62,7 +62,12 @@ impl EnrichmentEngine {
                 Ok(result) => match result.decode::<maxminddb::geoip2::Country>() {
                     Ok(Some(country)) => {
                         let code = country.country.iso_code.unwrap_or("XX").to_string();
-                        let name = country.country.names.english.unwrap_or("Unknown").to_string();
+                        let name = country
+                            .country
+                            .names
+                            .english
+                            .unwrap_or("Unknown")
+                            .to_string();
                         (code, name)
                     }
                     _ => ("XX".into(), "Unknown".into()),

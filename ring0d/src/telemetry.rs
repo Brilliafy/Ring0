@@ -1,14 +1,8 @@
-use std::collections::HashMap;
-
-pub struct TelemetryEngine {
-    ja4_cache: HashMap<String, String>,
-}
+pub struct TelemetryEngine;
 
 impl TelemetryEngine {
     pub fn new() -> Self {
-        Self {
-            ja4_cache: HashMap::new(),
-        }
+        Self
     }
 
     pub fn compute_ja4(tls_version: u16, ciphers: &[u16], extensions: &[u16]) -> String {

@@ -126,7 +126,11 @@ impl RocksManager {
                     .map_err(|e| warn!("RocksDB alert iteration error: {e}"))
                     .ok()
             })
-            .filter(|(_, v)| v.len() > 5 && v[4] >= severity_threshold)
+            .filter(|(_, v)| {
+                // Alert byte layout: [0..8] timestamp (BE), [8] severity,
+                // [9..13] rule id, [13] message length, [14..] message.
+                v.len() > 8 && v[8] >= severity_threshold
+            })
             .take(limit)
             .collect()
     }

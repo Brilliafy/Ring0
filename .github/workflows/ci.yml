@@ -8,7 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: nightly
+  # NOTE: the toolchain is pinned by rust-toolchain.toml (stable); the eBPF
+  # build selects nightly explicitly in xtask via RUSTUP_TOOLCHAIN.
 
 jobs:
   lint:

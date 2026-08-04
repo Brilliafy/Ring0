@@ -109,49 +109,58 @@ impl BaselineEngine {
     }
 
     pub fn record_exec(&self, binary: &str, parent_binary: Option<&str>) {
-        {
+        let count = {
             let mut paths = self.learned_exec_paths.write();
-            *paths.entry(binary.to_string()).or_insert(0) += 1;
-        }
+            let n = paths.entry(binary.to_string()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        self.persist_count(b"exec:", binary.as_bytes(), count);
         if let Some(parent) = parent_binary {
-            let mut pairs = self.learned_parent_pairs.write();
-            *pairs
-                .entry((parent.to_string(), binary.to_string()))
-                .or_insert(0) += 1;
-        }
-        self.persist_key(b"exec:", binary.as_bytes());
-        if let Some(parent) = parent_binary {
+            let count = {
+                let mut pairs = self.learned_parent_pairs.write();
+                let n = pairs
+                    .entry((parent.to_string(), binary.to_string()))
+                    .or_insert(0);
+                *n += 1;
+                *n
+            };
             let mut key = b"parent:".to_vec();
             key.extend_from_slice(parent.as_bytes());
             key.push(b'|');
             key.extend_from_slice(binary.as_bytes());
-            self.persist_raw(&key);
+            self.persist_count_raw(&key, count);
         }
     }
 
     pub fn record_connection(&self, dst_ip: u32, dst_port: u16) {
-        let mut conns = self.learned_connections.write();
-        *conns.entry((dst_ip, dst_port)).or_insert(0) += 1;
+        let count = {
+            let mut conns = self.learned_connections.write();
+            let n = conns.entry((dst_ip, dst_port)).or_insert(0);
+            *n += 1;
+            *n
+        };
         let mut key = b"conn:".to_vec();
-        key.extend_from_slice(&dst_ip.to_string().as_bytes());
+        key.extend_from_slice(dst_ip.to_string().as_bytes());
         key.push(b':');
-        key.extend_from_slice(&dst_port.to_string().as_bytes());
-        self.persist_raw(&key);
+        key.extend_from_slice(dst_port.to_string().as_bytes());
+        self.persist_count_raw(&key, count);
     }
 
-    fn persist_raw(&self, key: &[u8]) {
+    /// Persist a counter value under `prefix ++ suffix` (replacing the previous value).
+    fn persist_count(&self, prefix: &[u8], suffix: &[u8], count: u64) {
+        let mut key = prefix.to_vec();
+        key.extend_from_slice(suffix);
+        self.persist_count_raw(&key, count);
+    }
+
+    fn persist_count_raw(&self, key: &[u8], count: u64) {
         if let Some(cf) = self.db.cf_handle(BASELINE_CF) {
-            let val = 1u64.to_be_bytes();
+            let val = count.to_be_bytes();
             if let Err(e) = self.db.put_cf(&cf, key, val) {
                 warn!("Baseline persist failed: {e}");
             }
         }
-    }
-
-    fn persist_key(&self, prefix: &[u8], suffix: &[u8]) {
-        let mut key = prefix.to_vec();
-        key.extend_from_slice(suffix);
-        self.persist_raw(&key);
     }
 
     pub fn check_exec_anomaly(&self, binary: &str, parent_binary: Option<&str>) -> Option<String> {

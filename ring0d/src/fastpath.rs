@@ -4,9 +4,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use parking_lot::RwLock;
-use tracing::{info, warn};
-
-use crate::ebpf;
+use tracing::info;
 
 const IDLE_TIMEOUT_SECS: u64 = 300;
 const MAX_FLOWS: u32 = 65536;
@@ -23,19 +21,13 @@ pub struct FlowKey {
 
 pub struct FastPathManager {
     active_flows: Arc<RwLock<VecDeque<(FlowKey, Instant)>>>,
-    ebpf_handle: Option<*const ebpf::EbpfManager>,
 }
 
 impl FastPathManager {
     pub fn new() -> Self {
         Self {
             active_flows: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_FLOWS as usize))),
-            ebpf_handle: None,
         }
-    }
-
-    pub fn set_ebpf(&mut self, mgr: &ebpf::EbpfManager) {
-        self.ebpf_handle = Some(mgr as *const ebpf::EbpfManager);
     }
 
     pub fn mark_flow_safe(
@@ -53,17 +45,6 @@ impl FastPathManager {
             dst_port,
             protocol,
         };
-
-        if let Some(handle) = self.ebpf_handle {
-            unsafe {
-                let mgr = &*handle;
-                if let Err(e) =
-                    mgr.add_established_flow(src_ip, dst_ip, src_port, dst_port, protocol)
-                {
-                    warn!("Failed to insert flow into eBPF map: {e:?}");
-                }
-            }
-        }
 
         let mut flows = self.active_flows.write();
         if flows.len() >= MAX_FLOWS as usize {
@@ -88,13 +69,6 @@ impl FastPathManager {
             dst_port,
             protocol,
         };
-
-        if let Some(handle) = self.ebpf_handle {
-            unsafe {
-                let mgr = &*handle;
-                let _ = mgr.remove_established_flow(src_ip, dst_ip, src_port, dst_port, protocol);
-            }
-        }
 
         let mut flows = self.active_flows.write();
         flows.retain(|(k, _)| k != &key);
