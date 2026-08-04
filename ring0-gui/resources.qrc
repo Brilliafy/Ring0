@@ -7,5 +7,9 @@
         <file>qml/components/MitreMatrix.qml</file>
         <file>qml/components/ProcessTree.qml</file>
         <file>qml/components/Settings.qml</file>
+        <file>qml/components/DnsSecurityInspector.qml</file>
+        <file>icons/shield_green.png</file>
+        <file>icons/shield_yellow.png</file>
+        <file>icons/shield_red.png</file>
     </qresource>
 </RCC>
