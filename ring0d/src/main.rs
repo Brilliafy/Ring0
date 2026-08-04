@@ -146,8 +146,18 @@ impl Daemon {
 
         let lsm_attached = ebpf.lsm_available();
         if lsm_attached {
-            ebpf.enable_lsm_enforcement();
-            info!("eBPF LSM inline prevention active");
+            // Audit-by-default: the LSM hooks emit alerts but do not deny until
+            // inline enforcement is explicitly enabled. The previous behavior
+            // (always-on deny) broke gdb/strace and system daemons that rely on
+            // ptrace/CAP_NET_ADMIN/CAP_SYS_ADMIN.
+            if std::env::var("RING0_LSM_ENFORCE").as_deref() == Ok("1") {
+                ebpf.enable_lsm_enforcement();
+                info!("eBPF LSM inline prevention active (enforce mode)");
+            } else {
+                info!(
+                    "eBPF LSM in AUDIT mode — set RING0_LSM_ENFORCE=1 to enable inline prevention"
+                );
+            }
         } else {
             warn!("eBPF LSM not available — using XDP/tracepoint fallback enforcement");
         }
@@ -882,11 +892,18 @@ impl Daemon {
                 self.threat_blocklist.unblock_port(port);
             }
             KillProcess(pid) => {
-                let r = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-                if r == 0 {
-                    info!("killed {pid}")
+                // Confused-deputy hardening: never let a caller (even a
+                // privileged one) terminate critical system processes.
+                let daemon_pid = std::process::id();
+                if pid == 0 || pid == 1 || pid == daemon_pid {
+                    warn!("refusing to kill protected PID {pid}");
                 } else {
-                    error!("kill {pid}: {}", std::io::Error::last_os_error())
+                    let r = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                    if r == 0 {
+                        info!("killed {pid}")
+                    } else {
+                        error!("kill {pid}: {}", std::io::Error::last_os_error())
+                    }
                 }
             }
             ReloadFilters => info!("reload filters"),

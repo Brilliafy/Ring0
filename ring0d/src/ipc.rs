@@ -65,7 +65,7 @@ impl IpcServer {
                         let cmd_tx = cmd_tx.clone();
                         let storage = storage.clone();
                         let client_count = client_count.clone();
-                        let peer_uid = peer_euid(&stream);
+                        let peer_cred = peer_credentials(&stream);
 
                         tokio::spawn(async move {
                             client_count.fetch_add(1, Ordering::Relaxed);
@@ -121,12 +121,16 @@ impl IpcServer {
                                             // The daemon runs as root; the socket is
                                             // world-writable so the (unprivileged) GUI/CLI
                                             // can connect. Destructive commands must be
-                                            // restricted to root callers, otherwise any
-                                            // local process can kill arbitrary processes
-                                            // or shut the daemon down.
-                                            if is_privileged_command(&cmd) && peer_uid != 0 {
+                                            // restricted to root or members of the "ring0"
+                                            // admin group, otherwise any local process
+                                            // can kill arbitrary processes or shut the
+                                            // daemon down.
+                                            if is_privileged_command(&cmd)
+                                                && !peer_is_privileged(&peer_cred)
+                                            {
                                                 warn!(
-                                                    "denied privileged command {cmd:?} from uid {peer_uid}"
+                                                    "denied privileged command {cmd:?} from uid {}",
+                                                    peer_cred.uid
                                                 );
                                             } else if cmd_tx.send(cmd).is_err() {
                                                 break;
@@ -175,8 +179,9 @@ impl IpcServer {
     }
 }
 
-/// Effective uid of the peer on the other end of a Unix socket.
-fn peer_euid(stream: &tokio::net::UnixStream) -> u32 {
+/// Kernel-verified credentials of the peer on the other end of a Unix socket
+/// (SO_PEERCRED): the caller's pid, uid and gid, as seen by the kernel.
+fn peer_credentials(stream: &tokio::net::UnixStream) -> libc::ucred {
     let mut cred = libc::ucred {
         pid: 0,
         uid: u32::MAX,
@@ -192,16 +197,63 @@ fn peer_euid(stream: &tokio::net::UnixStream) -> u32 {
             &mut len,
         )
     };
-    if rc == 0 {
-        cred.uid
-    } else {
-        u32::MAX
+    if rc != 0 {
+        cred.uid = u32::MAX;
+        cred.pid = 0;
     }
+    cred
 }
 
-/// Commands that can damage the system and are therefore restricted to root
-/// callers (the daemon runs as root; the socket is world-writable so the
-/// unprivileged GUI/CLI can connect for monitoring).
+/// GID of the "ring0" admin group (as created by dist/install.sh), if present.
+fn ring0_group_gid() -> Option<u32> {
+    static RING0_GID: std::sync::LazyLock<Option<u32>> = std::sync::LazyLock::new(|| unsafe {
+        let gr = libc::getgrnam(c"ring0".as_ptr());
+        if gr.is_null() {
+            None
+        } else {
+            Some((*gr).gr_gid)
+        }
+    });
+    *RING0_GID
+}
+
+/// Supplementary groups of the given process, read from /proc/<pid>/status
+/// (the daemon runs as root, so this always succeeds for local processes).
+fn process_groups(pid: u32) -> Option<Vec<u32>> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Groups:") {
+            return Some(
+                rest.split_whitespace()
+                    .filter_map(|g| g.parse::<u32>().ok())
+                    .collect(),
+            );
+        }
+    }
+    None
+}
+
+/// A peer may issue privileged commands if it runs as root or is a member of
+/// the dedicated "ring0" admin group.
+fn peer_is_privileged(cred: &libc::ucred) -> bool {
+    if cred.uid == 0 {
+        return true;
+    }
+    if let Some(ring0_gid) = ring0_group_gid() {
+        // Include the peer's primary gid as well as its supplementary groups.
+        if cred.gid == ring0_gid {
+            return true;
+        }
+        if let Some(groups) = process_groups(cred.pid as u32) {
+            return groups.contains(&ring0_gid);
+        }
+    }
+    false
+}
+
+/// Commands that can damage the system and are therefore restricted to
+/// privileged callers (see [`peer_is_privileged`]); the unprivileged GUI/CLI
+/// can still connect for monitoring.
 fn is_privileged_command(cmd: &DaemonCmd) -> bool {
     use DaemonCmd::*;
     matches!(

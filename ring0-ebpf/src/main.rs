@@ -982,9 +982,8 @@ pub fn ring0_lsm_socket_connect(ctx: LsmContext) -> i32 {
 
 #[lsm(hook = "ptrace_access_check")]
 pub fn ring0_lsm_ptrace(ctx: LsmContext) -> i32 {
-    if !is_lsm_enforced() {
-        return 0;
-    }
+    // Audit every ptrace_access_check; deny only in enforce mode. Always-on
+    // denial breaks debuggers (gdb/strace) and core dumps for every user.
     let pid = ctx.pid();
     let uid = ctx.uid();
     let target = unsafe { ptr::read_unaligned(ctx.as_ptr() as *const u32) };
@@ -1000,14 +999,18 @@ pub fn ring0_lsm_ptrace(ctx: LsmContext) -> i32 {
         buf.write(evt);
         buf.submit(0);
     }
-    -1
+    if is_lsm_enforced() {
+        -1
+    } else {
+        0
+    }
 }
 
 #[lsm(hook = "capable")]
 pub fn ring0_lsm_capable(ctx: LsmContext) -> i32 {
-    if !is_lsm_enforced() {
-        return 0;
-    }
+    // Audit high-risk capability checks; deny only in enforce mode. Always-on
+    // denial of CAP_NET_ADMIN/CAP_SYS_ADMIN/CAP_SYS_MODULE breaks networking
+    // daemons, mount/container tooling and driver loading.
     let pid = ctx.pid();
     let uid = ctx.uid();
     let cap = unsafe { ptr::read_unaligned(ctx.as_ptr() as *const u32) };
@@ -1024,7 +1027,9 @@ pub fn ring0_lsm_capable(ctx: LsmContext) -> i32 {
             buf.write(evt);
             buf.submit(0);
         }
-        return -1;
+        if is_lsm_enforced() {
+            return -1;
+        }
     }
     0
 }
