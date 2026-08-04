@@ -5,6 +5,9 @@ edition.workspace = true
 
 build = "build.rs"
 
+[lib]
+crate-type = ["staticlib"]
+
 [dependencies]
 cxx-qt = "0.9"
 cxx-qt-lib = "0.9"

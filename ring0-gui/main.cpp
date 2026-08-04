@@ -1,7 +1,8 @@
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
-#include "cxx-qt-gen/qobject.cxxqt.h"
+#include <QtQml>
+#include "ring0-gui/src/lib.cxxqt.h"
 
 int main(int argc, char *argv[])
 {
@@ -12,6 +13,9 @@ int main(int argc, char *argv[])
     qmlRegisterType<ring0::PacketLogModel>("ring0", 1, 0, "PacketLogModel");
     qmlRegisterType<ring0::ProcessListModel>("ring0", 1, 0, "ProcessListModel");
     qmlRegisterType<ring0::TopologyModel>("ring0", 1, 0, "TopologyModel");
+
+    ring0::Ring0Bridge *bridge = new ring0::Ring0Bridge(&app);
+    engine.rootContext()->setContextProperty("bridge", bridge);
 
     engine.load(QUrl(QStringLiteral("qrc:/qml/main.qml")));
 
