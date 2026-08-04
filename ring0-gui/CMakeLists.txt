@@ -34,7 +34,7 @@ file(GLOB CXXQT_SOURCES "${CXXQT_GEN_DIR}/src/*.cpp")
 
 # Qt resource file for QML
 set(QRC_FILE "${CMAKE_CURRENT_SOURCE_DIR}/resources.qrc")
-qt_add_resources(ring0_qml QRC_FILE)
+qt_add_resources(ring0_qml "${QRC_FILE}")
 
 # Build the CXX-Qt generated C++ into an object library
 add_library(ring0-gui-cpp OBJECT ${CXXQT_SOURCES})
@@ -64,7 +64,7 @@ add_custom_target(ring0-gui-rust-lib ALL DEPENDS ${RING0_GUI_LIB})
 # Create the final executable
 add_executable(ring0-gui
     "main.cpp"
-    ${ring0_qml_QRC_FILE}
+    ${ring0_qml}
     $<TARGET_OBJECTS:ring0-gui-cpp>
 )
 target_include_directories(ring0-gui PRIVATE

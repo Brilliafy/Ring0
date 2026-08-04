@@ -110,15 +110,9 @@ fn send_command(frame: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn cmd_status() -> Result<()> {
-    let mut message = capnp::message::Builder::new_default();
-    message
-        .init_root::<capnp_schema::daemon_command::Builder>()
-        .setReloadFilters(());
-    let mut buf = Vec::new();
-    capnp::serialize::write_message(&mut buf, &message)?;
-    match send_command(&buf) {
-        Ok(resp) if !resp.is_empty() => println!("{}", "Daemon: Connected".green().bold()),
-        _ => println!("{}", "Daemon: Connected".green().bold()),
+    match connect_timeout() {
+        Ok(_) => println!("{}", "Daemon: Connected".green().bold()),
+        Err(_) => println!("{}", "Daemon: Disconnected".red().bold()),
     }
     Ok(())
 }
