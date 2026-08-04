@@ -204,12 +204,10 @@ impl IntelManager {
 
     /// Scan a binary with the loaded YARA rules.
     ///
-    /// NOTE: real YARA rule compilation/matching is not implemented yet; the
-    /// `yara_compiled` database is kept for when it is. This deliberately returns
-    /// no matches rather than fabricating alerts (the previous implementation
-    /// matched on the path containing "suspicious"/"malware", producing false
-    /// positives that looked like genuine YARA detections).
-    pub fn scan_binary(&self, _path: &str) -> Vec<String> {
-        Vec::new()
+    /// Returns an explicit error because the YARA engine is not implemented
+    /// yet: returning an empty result here would make callers believe the
+    /// binary was scanned and found clean, which is a false sense of security.
+    pub fn scan_binary(&self, _path: &str) -> Result<Vec<String>, String> {
+        Err("YARA engine not implemented — binary was not scanned".to_string())
     }
 }

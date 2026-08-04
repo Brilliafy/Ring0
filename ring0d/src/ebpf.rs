@@ -26,6 +26,33 @@ pub const KIND_PTRACE: u8 = 14;
 pub const KIND_MEMFD: u8 = 20;
 pub const KIND_MMAP: u8 = 21;
 pub const KIND_MODULE: u8 = 22;
+pub const KIND_DPI: u8 = 30;
+
+/// Literal DPI signatures synced into the kernel DPI_PATTERNS map (rule id,
+/// bytes). These mirror the literal patterns of the hyperscan rule set so the
+/// fast path can observe/drop them without userspace reassembly.
+pub const BPF_DPI_SIGNATURES: &[(u32, &[u8])] = &[
+    (5001, b"/bin/sh"),
+    (5008, b"/etc/passwd"),
+    (5009, b"/etc/shadow"),
+    (5010, b"powershell"),
+    (5013, b"beacon"),
+    (5017, b"UPX!"),
+    (5018, b"mimikatz"),
+    (5005, b"sqlmap"),
+    (5006, b"nikto"),
+    (5007, b"nmap"),
+];
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DpiPattern {
+    len: u8,
+    data: [u8; 32],
+}
+
+// Plain old data: all fields are byte arrays/ints, so this is sound.
+unsafe impl aya::Pod for DpiPattern {}
 
 /// Looks for the compiled eBPF object produced by `cargo xtask build`.
 fn find_bpf_object() -> Option<String> {
@@ -77,9 +104,9 @@ pub struct EbpfManager {
     loaded: Arc<AtomicBool>,
     lsm_attached: Arc<AtomicBool>,
     // software fallback for when the kernel maps are unavailable
-    fallback_blocked_ips: std::sync::Mutex<Vec<String>>,
-    fallback_blocked_ports: std::sync::Mutex<Vec<u16>>,
-    fallback_dns_domains: std::sync::Mutex<Vec<String>>,
+    fallback_blocked_ips: parking_lot::Mutex<Vec<String>>,
+    fallback_blocked_ports: parking_lot::Mutex<Vec<u16>>,
+    fallback_dns_domains: parking_lot::Mutex<Vec<String>>,
 }
 
 fn make_channels() -> (
@@ -127,9 +154,9 @@ impl EbpfManager {
                     ebpf: None,
                     loaded: Arc::new(AtomicBool::new(false)),
                     lsm_attached: Arc::new(AtomicBool::new(false)),
-                    fallback_blocked_ips: std::sync::Mutex::new(Vec::new()),
-                    fallback_blocked_ports: std::sync::Mutex::new(Vec::new()),
-                    fallback_dns_domains: std::sync::Mutex::new(Vec::new()),
+                    fallback_blocked_ips: parking_lot::Mutex::new(Vec::new()),
+                    fallback_blocked_ports: parking_lot::Mutex::new(Vec::new()),
+                    fallback_dns_domains: parking_lot::Mutex::new(Vec::new()),
                 })
             }
         }
@@ -222,9 +249,9 @@ impl EbpfManager {
             ebpf: Some(ebpf),
             loaded: Arc::new(AtomicBool::new(true)),
             lsm_attached: Arc::new(AtomicBool::new(lsm_ok)),
-            fallback_blocked_ips: std::sync::Mutex::new(Vec::new()),
-            fallback_blocked_ports: std::sync::Mutex::new(Vec::new()),
-            fallback_dns_domains: std::sync::Mutex::new(Vec::new()),
+            fallback_blocked_ips: parking_lot::Mutex::new(Vec::new()),
+            fallback_blocked_ports: parking_lot::Mutex::new(Vec::new()),
+            fallback_dns_domains: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -316,7 +343,7 @@ impl EbpfManager {
                 false
             };
             if !inserted {
-                let mut list = self.fallback_blocked_ips.lock().unwrap();
+                let mut list = self.fallback_blocked_ips.lock();
                 let s = ip.to_string();
                 if !list.contains(&s) {
                     list.push(s);
@@ -344,7 +371,7 @@ impl EbpfManager {
                 false
             };
             if !removed {
-                let mut list = self.fallback_blocked_ips.lock().unwrap();
+                let mut list = self.fallback_blocked_ips.lock();
                 let s = ip.to_string();
                 list.retain(|x| x != &s);
             }
@@ -368,7 +395,7 @@ impl EbpfManager {
             false
         };
         if !inserted {
-            let mut list = self.fallback_blocked_ports.lock().unwrap();
+            let mut list = self.fallback_blocked_ports.lock();
             if !list.contains(&port) {
                 list.push(port);
             }
@@ -392,7 +419,7 @@ impl EbpfManager {
             false
         };
         if !removed {
-            let mut list = self.fallback_blocked_ports.lock().unwrap();
+            let mut list = self.fallback_blocked_ports.lock();
             list.retain(|x| x != &port);
         }
         Ok(())
@@ -401,7 +428,7 @@ impl EbpfManager {
     /// List currently blocked IPs (from the kernel map or the fallback list).
     pub fn blocked_ips(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let list = self.fallback_blocked_ips.lock().unwrap();
+        let list = self.fallback_blocked_ips.lock();
         out.extend(list.iter().cloned());
         out
     }
@@ -437,7 +464,7 @@ impl EbpfManager {
                 }
             }
         }
-        let mut list = self.fallback_blocked_ips.lock().unwrap();
+        let mut list = self.fallback_blocked_ips.lock();
         for (ip, prefix) in cidrs {
             let s = format!("{}/{}", std::net::Ipv4Addr::from(*ip), prefix);
             if !list.contains(&s) {
@@ -462,7 +489,7 @@ impl EbpfManager {
                 }
             }
         }
-        let mut list = self.fallback_dns_domains.lock().unwrap();
+        let mut list = self.fallback_dns_domains.lock();
         for d in domains {
             if !list.contains(d) {
                 list.push(d.clone());
@@ -485,7 +512,7 @@ impl EbpfManager {
                 }
             }
         }
-        let mut list = self.fallback_blocked_ports.lock().unwrap();
+        let mut list = self.fallback_blocked_ports.lock();
         for p in ports {
             if !list.contains(p) {
                 list.push(*p);
@@ -496,12 +523,52 @@ impl EbpfManager {
 
     /// Number of domains in the kernel/fallback DNS blocklist.
     pub fn blocked_domain_count(&self) -> usize {
-        self.fallback_dns_domains.lock().unwrap().len()
+        self.fallback_dns_domains.lock().len()
+    }
+
+    /// Sync the literal DPI patterns into the kernel DPI_PATTERNS map.
+    pub fn sync_dpi_patterns(&mut self, patterns: &[(u32, &[u8])]) -> usize {
+        let mut added = 0usize;
+        if let Some(ebpf) = self.ebpf.as_mut() {
+            if let Some(map) = ebpf.map_mut("DPI_PATTERNS") {
+                if let Ok(mut map) = HashMap::<&mut MapData, u32, DpiPattern>::try_from(map) {
+                    for (rule_id, bytes) in patterns {
+                        let n = bytes.len().min(32);
+                        let mut pat = DpiPattern {
+                            len: n as u8,
+                            data: [0u8; 32],
+                        };
+                        pat.data[..n].copy_from_slice(&bytes[..n]);
+                        if map.insert(rule_id, &pat, 0).is_ok() {
+                            added += 1;
+                        }
+                    }
+                }
+            }
+        }
+        added
+    }
+
+    /// Set DPI enforcement (drop on match). Off by default = observe-only.
+    pub fn set_dpi_enforce(&mut self, enforce: bool) {
+        if let Some(ebpf) = self.ebpf.as_mut() {
+            if let Some(map) = ebpf.map_mut("DPI_MODE") {
+                if let Ok(mut map) = HashMap::<&mut MapData, u32, u8>::try_from(map) {
+                    let value = if enforce { 1u8 } else { 0u8 };
+                    let _ = map.insert(&1, &value, 0);
+                }
+            }
+        }
+        if enforce {
+            info!("DPI enforcement enabled — matching traffic will be dropped");
+        } else {
+            info!("DPI in observe mode — matching traffic is reported, not dropped");
+        }
     }
 
     /// Number of blocked ports.
     pub fn blocked_port_count(&self) -> usize {
-        self.fallback_blocked_ports.lock().unwrap().len()
+        self.fallback_blocked_ports.lock().len()
     }
 
     pub fn detach(&mut self) {
