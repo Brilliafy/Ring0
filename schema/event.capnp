@@ -74,6 +74,9 @@ struct DaemonStatus {
     activeFilters @0 : List(Text);
     cpuUsagePercent @1 : Float32; ramUsageBytes @2 : UInt64;
     eventsPerSec @3 : Float64;
+    blockedDomains @4 : UInt32;
+    blockedCidrs @5 : UInt32;
+    blockedPorts @6 : UInt32;
 }
 struct Ring0Event {
     union {

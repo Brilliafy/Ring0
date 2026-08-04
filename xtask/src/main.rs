@@ -21,7 +21,7 @@ fn main() -> Result<()> {
 
     match cli {
         Cli::Build { name } => {
-            let target = format!("{}-unknown-none", std::env::consts::ARCH);
+            let target = "bpfel-unknown-none";
 
             if let Some(n) = &name {
                 eprintln!("building eBPF prog: {n}");

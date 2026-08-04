@@ -389,7 +389,7 @@ fn deserialize_to_json(data: &[u8]) -> Option<String> {
                     filters.push(f.ok().and_then(|r| r.to_str().ok()).unwrap_or("").to_string());
                 }
             }
-            serde_json::json!({"type":"status","activeFilters":filters,"cpuUsagePercent":st.getCpuUsagePercent(),"ramUsageBytes":st.getRamUsageBytes(),"eventsPerSec":st.getEventsPerSec()})
+            serde_json::json!({"type":"status","activeFilters":filters,"cpuUsagePercent":st.getCpuUsagePercent(),"ramUsageBytes":st.getRamUsageBytes(),"eventsPerSec":st.getEventsPerSec(),"blockedDomains":st.getBlockedDomains(),"blockedCidrs":st.getBlockedCidrs(),"blockedPorts":st.getBlockedPorts()})
         }
         _ => return None,
     };
