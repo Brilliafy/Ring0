@@ -83,6 +83,22 @@ ApplicationWindow {
                 font.pixelSize: 12
                 rightPadding: 12
             }
+            Label {
+                id: cpuLabel
+                text: ""
+                color: "#8b949e"
+                font.pixelSize: 11
+                rightPadding: 8
+                visible: daemonConnected
+            }
+            Label {
+                id: epsLabel
+                text: ""
+                color: "#8b949e"
+                font.pixelSize: 11
+                rightPadding: 8
+                visible: daemonConnected
+            }
             Rectangle {
                 width: 8; height: 8; radius: 4
                 color: protectionStatus === 0 ? "#3fb950" : protectionStatus === 1 ? "#d29922" : "#f85149"
@@ -265,6 +281,16 @@ ApplicationWindow {
         }
     }
 
+    Timer {
+        id: statusTimer
+        interval: 5000
+        running: daemonConnected
+        repeat: true
+        onTriggered: {
+            bridge.daemonStatus()
+        }
+    }
+
     function processEvent(evt) {
         if (evt.type === "packet") {
             eventList.appendPacket(
@@ -310,6 +336,13 @@ ApplicationWindow {
             pendingAlertIp = ""
             alertMsg.text = pendingAlertMsg
             alertPopup.open()
+        } else if (evt.type === "status") {
+            var filters = evt.activeFilters || []
+            filterCountLabel.text = filters.length.toString()
+            if (typeof evt.cpuUsagePercent === "number")
+                cpuLabel.text = "CPU " + evt.cpuUsagePercent.toFixed(1) + "%"
+            if (typeof evt.eventsPerSec === "number")
+                epsLabel.text = evt.eventsPerSec >= 100 ? evt.eventsPerSec.toFixed(0) + " eps" : evt.eventsPerSec.toFixed(1) + " eps"
         }
     }
 
@@ -357,7 +390,7 @@ ApplicationWindow {
 
     Component.onCompleted: {
         if (bridge) {
-            daemonConnected = bridge.connectDaemon("/run/ring0d.sock");
+            daemonConnected = bridge.connectDaemon(daemonSocket || "/run/ring0d.sock");
             bridge.initDbusNotifications();
         }
     }

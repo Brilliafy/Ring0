@@ -10,12 +10,14 @@ int main(int argc, char *argv[])
     QQmlApplicationEngine engine;
 
     qmlRegisterType<ring0::Ring0Bridge>("ring0", 1, 0, "Ring0Bridge");
-    qmlRegisterType<ring0::PacketLogModel>("ring0", 1, 0, "PacketLogModel");
-    qmlRegisterType<ring0::ProcessListModel>("ring0", 1, 0, "ProcessListModel");
-    qmlRegisterType<ring0::TopologyModel>("ring0", 1, 0, "TopologyModel");
 
     ring0::Ring0Bridge *bridge = new ring0::Ring0Bridge(&app);
     engine.rootContext()->setContextProperty("bridge", bridge);
+
+    const char *socketEnv = qgetenv("RING0_SOCKET");
+    const QString daemonSocket =
+        (socketEnv && *socketEnv) ? QString::fromUtf8(socketEnv) : QStringLiteral("/run/ring0d.sock");
+    engine.rootContext()->setContextProperty("daemonSocket", daemonSocket);
 
     engine.load(QUrl(QStringLiteral("qrc:/qml/main.qml")));
 

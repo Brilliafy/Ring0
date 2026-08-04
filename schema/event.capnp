@@ -140,5 +140,8 @@ struct DaemonCommand {
     powerStatus @12 : Void;
     updateSettings @13 : Text;
     runDoctor @14 : Void;
+    status @15 : Void;
+    blockPort @16 : UInt32;
+    unblockPort @17 : UInt32;
     }
 }

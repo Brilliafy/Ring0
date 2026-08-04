@@ -1,0 +1,69 @@
+# Ring0 default detection rules
+rules:
+  network:
+    - id: 100
+      name: "SSH brute-force source"
+      cidrs: []
+      ports: [22]
+      protocols: ["tcp"]
+      signatures: []
+      severity: 2
+      enabled: true
+    - id: 101
+      name: "RDP exposure"
+      cidrs: []
+      ports: [3389]
+      protocols: ["tcp"]
+      signatures: []
+      severity: 2
+      enabled: true
+    - id: 102
+      name: "Telnet (insecure protocol)"
+      cidrs: []
+      ports: [23]
+      protocols: ["tcp"]
+      signatures: []
+      severity: 1
+      enabled: true
+    - id: 103
+      name: "SMB (CVE-prone)"
+      cidrs: []
+      ports: [445, 139]
+      protocols: ["tcp"]
+      signatures: []
+      severity: 2
+      enabled: true
+  process:
+    - id: 200
+      name: "Block suspicious interpreters spawned by browsers"
+      binary_paths: ["/usr/bin/bash", "/bin/bash", "/usr/bin/sh"]
+      child_blacklist: ["/usr/bin/bash", "/bin/sh"]
+      sha256_hashes: []
+      severity: 3
+      enabled: true
+    - id: 201
+      name: "Harden: never execute from /tmp"
+      binary_paths: ["/tmp/", "/var/tmp/", "/dev/shm/"]
+      child_blacklist: []
+      sha256_hashes: []
+      severity: 4
+      enabled: true
+  file:
+    - id: 300
+      name: "Credential store access"
+      path_glob: "/etc/shadow"
+      severity: 4
+      read_only: true
+      enabled: true
+    - id: 301
+      name: "SSH private key access"
+      path_glob: "**/.ssh/id_*"
+      severity: 3
+      read_only: true
+      enabled: true
+    - id: 302
+      name: "Sudoers modification"
+      path_glob: "/etc/sudoers"
+      severity: 4
+      read_only: false
+      enabled: true

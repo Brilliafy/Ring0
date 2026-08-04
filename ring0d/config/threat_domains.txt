@@ -1,0 +1,8 @@
+# Known malicious / C2 domains (seed list)
+evil.com
+malware-test.example
+c2.beacon.example
+phishing.example
+botnet-panel.example
+keylogger.example
+ransomware.example

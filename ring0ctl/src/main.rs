@@ -8,6 +8,10 @@ use ring0_common::proto as capnp_schema;
 
 const SOCKET_PATH: &str = "/run/ring0d.sock";
 
+fn socket_path() -> String {
+    std::env::var("RING0_SOCKET").unwrap_or_else(|_| SOCKET_PATH.to_string())
+}
+
 #[derive(Parser)]
 #[command(name = "ring0ctl", about = "Ring0 desktop security CLI")]
 enum Cli {
@@ -58,7 +62,7 @@ fn connect_timeout() -> Result<std::os::unix::net::UnixStream> {
     use std::net::Shutdown;
     let (mut tx, rx) = std::os::unix::net::UnixStream::pair()
         .context("failed to create socket pair for connect timeout")?;
-    let socket_path = SOCKET_PATH.to_string();
+    let socket_path = socket_path();
     let path_for_thread = socket_path.clone();
     let handle = std::thread::spawn(move || {
         let stream = std::os::unix::net::UnixStream::connect(&path_for_thread);

@@ -29,6 +29,9 @@ pub enum DaemonCmd {
     PowerStatus,
     UpdateSettings(String),
     RunDoctor,
+    Status,
+    BlockPort(u16),
+    UnblockPort(u16),
 }
 
 pub struct IpcServer {
@@ -151,6 +154,13 @@ impl IpcServer {
         }
         let _ = self.evt_tx.send(data.to_vec());
     }
+
+    pub fn broadcast_sync(&self, data: &[u8]) {
+        if self.evt_tx.receiver_count() == 0 {
+            return;
+        }
+        let _ = self.evt_tx.send(data.to_vec());
+    }
 }
 
 fn parse_command_frame(data: &[u8]) -> Result<DaemonCmd> {
@@ -229,6 +239,9 @@ fn parse_command_frame(data: &[u8]) -> Result<DaemonCmd> {
             ))
         }
         Which::RunDoctor(()) => Ok(DaemonCmd::RunDoctor),
+        Which::Status(()) => Ok(DaemonCmd::Status),
+        Which::BlockPort(port) => Ok(DaemonCmd::BlockPort(port as u16)),
+        Which::UnblockPort(port) => Ok(DaemonCmd::UnblockPort(port as u16)),
     }
 }
 
@@ -253,6 +266,71 @@ fn build_query_response(results: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     }
     let mut buf = Vec::new();
     let _ = capnp::serialize::write_message(&mut buf, &message);
+    buf
+}
+
+pub fn build_status_event(
+    active_filters: &[String],
+    cpu_percent: f32,
+    ram_bytes: u64,
+    events_per_sec: f64,
+) -> Vec<u8> {
+    let mut msg = capnp::message::Builder::new_default();
+    let evt = msg.init_root::<capnp_schema::ring0_event::Builder>();
+    let mut s = evt.initStatus();
+    let mut filters = s.reborrow().initActiveFilters(active_filters.len() as u32);
+    for (i, f) in active_filters.iter().enumerate() {
+        filters.reborrow().set(i as u32, f);
+    }
+    s.setCpuUsagePercent(cpu_percent);
+    s.setRamUsageBytes(ram_bytes);
+    s.setEventsPerSec(events_per_sec);
+    let mut buf = Vec::new();
+    let _ = capnp::serialize::write_message(&mut buf, &msg);
+    buf
+}
+
+pub fn build_packet_event(
+    timestamp: u64,
+    src_ip: u32,
+    dst_ip: u32,
+    src_port: u16,
+    dst_port: u16,
+    protocol: u8,
+    pid: u32,
+    action: u8,
+) -> Vec<u8> {
+    let mut msg = capnp::message::Builder::new_default();
+    let evt = msg.init_root::<capnp_schema::ring0_event::Builder>();
+    let mut p = evt.initPacket();
+    p.setTimestamp(timestamp);
+    {
+        let mut ip = p.reborrow().getSrcIp().unwrap();
+        ip.setV4(src_ip);
+    }
+    {
+        let mut ip = p.reborrow().getDstIp().unwrap();
+        ip.setV4(dst_ip);
+    }
+    p.setSrcPort(src_port);
+    p.setDstPort(dst_port);
+    p.setProtocol(if protocol == 17 {
+        capnp_schema::Protocol::Udp
+    } else if protocol == 1 {
+        capnp_schema::Protocol::Icmp
+    } else {
+        capnp_schema::Protocol::Tcp
+    });
+    p.setPid(pid);
+    p.setAction(if action == 1 {
+        capnp_schema::Action::Drop
+    } else if action == 2 {
+        capnp_schema::Action::Alert
+    } else {
+        capnp_schema::Action::Pass
+    });
+    let mut buf = Vec::new();
+    let _ = capnp::serialize::write_message(&mut buf, &msg);
     buf
 }
 

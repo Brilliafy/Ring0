@@ -3,13 +3,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
 const _SCREEN_LOCKED_POLICY: &str = "drop_background_on_lock";
 const _BACKGROUND_ISOLATION_POLICY: &str = "block_background_network";
 
 pub struct ContextualSecurity {
-    screen_locked: AtomicBool,
+    screen_locked: Arc<AtomicBool>,
     background_whitelist: Arc<RwLock<HashSet<String>>>,
     per_process_policies: Arc<RwLock<HashMap<u32, ProcessPolicy>>>,
     dbus_monitor: Option<tokio::task::JoinHandle<()>>,
@@ -34,7 +34,7 @@ impl ContextualSecurity {
         whitelist.insert("systemd-resolved".into());
 
         Self {
-            screen_locked: AtomicBool::new(false),
+            screen_locked: Arc::new(AtomicBool::new(false)),
             background_whitelist: Arc::new(RwLock::new(whitelist)),
             per_process_policies: Arc::new(RwLock::new(HashMap::new())),
             dbus_monitor: None,
@@ -42,7 +42,20 @@ impl ContextualSecurity {
     }
 
     pub fn start_dbus_monitor(&mut self) {
-        warn!("ContextualSecurity: D-Bus monitor not available (zbus API mismatch)");
+        let locked = self.screen_locked.clone();
+        self.dbus_monitor = Some(tokio::spawn(async move {
+            let conn = zbus::Connection::session().await.ok();
+            loop {
+                if let Some(conn) = &conn {
+                    match screen_locked_via_dbus(conn).await {
+                        Some(l) => locked.store(l, Ordering::Relaxed),
+                        None => {}
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }));
+        info!("ContextualSecurity: D-Bus screen-lock monitor active");
     }
 
     pub fn is_screen_locked(&self) -> bool {
@@ -103,4 +116,19 @@ impl ContextualSecurity {
     pub fn policy_count(&self) -> usize {
         self.per_process_policies.read().len()
     }
+}
+async fn screen_locked_via_dbus(conn: &zbus::Connection) -> Option<bool> {
+    for (bus, path, iface) in [
+        ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver"),
+        ("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver"),
+        ("org.kde.screensaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver"),
+    ] {
+        let Ok(proxy) = zbus::proxy::Proxy::new(conn, bus, path, iface).await else {
+            continue;
+        };
+        if let Ok(active) = proxy.get_property::<bool>("Active").await {
+            return Some(active);
+        }
+    }
+    None
 }
