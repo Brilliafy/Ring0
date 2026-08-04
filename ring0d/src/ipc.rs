@@ -274,6 +274,9 @@ pub fn build_status_event(
     cpu_percent: f32,
     ram_bytes: u64,
     events_per_sec: f64,
+    blocked_domains: u32,
+    blocked_cidrs: u32,
+    blocked_ports: u32,
 ) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
     let evt = msg.init_root::<capnp_schema::ring0_event::Builder>();
@@ -285,6 +288,9 @@ pub fn build_status_event(
     s.setCpuUsagePercent(cpu_percent);
     s.setRamUsageBytes(ram_bytes);
     s.setEventsPerSec(events_per_sec);
+    s.setBlockedDomains(blocked_domains);
+    s.setBlockedCidrs(blocked_cidrs);
+    s.setBlockedPorts(blocked_ports);
     let mut buf = Vec::new();
     let _ = capnp::serialize::write_message(&mut buf, &msg);
     buf

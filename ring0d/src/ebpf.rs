@@ -29,14 +29,17 @@ pub const KIND_MODULE: u8 = 22;
 
 /// Looks for the compiled eBPF object produced by `cargo xtask build`.
 fn find_bpf_object() -> Option<String> {
-    let arch = std::env::consts::ARCH;
     let candidates = [
         format!(
-            "{}/target/{arch}-unknown-none/debug/ring0-ebpf",
+            "{}/../target/bpfel-unknown-none/debug/ring0-ebpf",
             env!("CARGO_MANIFEST_DIR")
         ),
         format!(
-            "{}/../target/{arch}-unknown-none/debug/ring0-ebpf",
+            "{}/target/bpfel-unknown-none/debug/ring0-ebpf",
+            env!("CARGO_MANIFEST_DIR")
+        ),
+        format!(
+            "{}/../target/bpfel-unknown-none/release/ring0-ebpf",
             env!("CARGO_MANIFEST_DIR")
         ),
     ];
@@ -75,6 +78,7 @@ pub struct EbpfManager {
     // software fallback for when the kernel maps are unavailable
     fallback_blocked_ips: std::sync::Mutex<Vec<String>>,
     fallback_blocked_ports: std::sync::Mutex<Vec<u16>>,
+    fallback_dns_domains: std::sync::Mutex<Vec<String>>,
 }
 
 fn make_channels() -> (
@@ -125,6 +129,7 @@ impl EbpfManager {
                     loaded: Arc::new(AtomicBool::new(false)),
                     fallback_blocked_ips: std::sync::Mutex::new(Vec::new()),
                     fallback_blocked_ports: std::sync::Mutex::new(Vec::new()),
+                    fallback_dns_domains: std::sync::Mutex::new(Vec::new()),
                 })
             }
         }
@@ -165,19 +170,17 @@ impl EbpfManager {
             }
         }
 
-        // ── Attach BTF tracepoints ──
+        // ── Attach BTF tracepoints (looked up by ELF section name) ──
         for name in [
-            "ring0_sched_exec",
-            "ring0_openat",
-            "ring0_connect",
-            "ring0_kill",
-            "ring0_unlinkat",
-            "ring0_setuid",
-            "ring0_memfd_create",
-            "ring0_mmap",
-            "ring0_finit_module",
-            "ring0_canary_openat",
-            "ring0_canary_unlinkat",
+            "tp_btf/sched_process_exec",
+            "tp_btf/sys_enter_openat",
+            "tp_btf/sys_enter_connect",
+            "tp_btf/sys_enter_kill",
+            "tp_btf/sys_enter_unlinkat",
+            "tp_btf/sys_enter_setuid",
+            "tp_btf/sys_enter_memfd_create",
+            "tp_btf/sys_enter_mmap",
+            "tp_btf/sys_enter_finit_module",
         ] {
             match attach_tracepoint(&mut ebpf, name) {
                 Ok(()) => {}
@@ -185,13 +188,13 @@ impl EbpfManager {
             }
         }
 
-        // ── Attach LSM programs ──
+        // ── Attach LSM programs (by section name) ──
         for name in [
-            "ring0_lsm_file_open",
-            "ring0_lsm_bprm_check",
-            "ring0_lsm_socket_connect",
-            "ring0_lsm_ptrace",
-            "ring0_lsm_capable",
+            "lsm/file_open",
+            "lsm/bprm_check",
+            "lsm/socket_connect",
+            "lsm/ptrace_access_check",
+            "lsm/capable",
         ] {
             match attach_lsm(&mut ebpf, name) {
                 Ok(()) => {}
@@ -223,6 +226,7 @@ impl EbpfManager {
             loaded: Arc::new(AtomicBool::new(true)),
             fallback_blocked_ips: std::sync::Mutex::new(Vec::new()),
             fallback_blocked_ports: std::sync::Mutex::new(Vec::new()),
+            fallback_dns_domains: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -440,6 +444,88 @@ impl EbpfManager {
         false
     }
 
+    /// Batch-sync IP CIDRs into the kernel BLOCKED_IPS map.
+    pub fn sync_blocked_cidrs(&mut self, cidrs: &[(u32, u8)]) -> usize {
+        let mut added = 0;
+        if let Some(ebpf) = self.ebpf.as_mut() {
+            if let Some(map) = ebpf.map_mut("BLOCKED_IPS") {
+                if let Ok(mut map) = LpmTrie::<&mut MapData, u32, u8>::try_from(map) {
+                    for (ip, prefix) in cidrs {
+                        let key = LpmTrieKey::new(*prefix as u32, *ip);
+                        if map.insert(&key, &1, 0).is_ok() {
+                            added += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let mut list = self.fallback_blocked_ips.lock().unwrap();
+        for (ip, prefix) in cidrs {
+            let s = format!("{}/{}", std::net::Ipv4Addr::from(*ip), prefix);
+            if !list.contains(&s) {
+                list.push(s);
+            }
+        }
+        added
+    }
+
+    /// Batch-sync hashed DNS domains into the kernel DNS_DOMAIN_BLOCK map.
+    pub fn sync_dns_domains(&mut self, domains: &[String]) -> usize {
+        let mut added = 0;
+        if let Some(ebpf) = self.ebpf.as_mut() {
+            if let Some(map) = ebpf.map_mut("DNS_DOMAIN_BLOCK") {
+                if let Ok(mut map) = HashMap::<&mut MapData, u64, u8>::try_from(map) {
+                    for d in domains {
+                        let h = crate::sucadara::fnv1a_hash(d);
+                        if map.insert(&h, &1, 0).is_ok() {
+                            added += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let mut list = self.fallback_dns_domains.lock().unwrap();
+        for d in domains {
+            if !list.contains(d) {
+                list.push(d.clone());
+            }
+        }
+        added
+    }
+
+    /// Batch-sync ports into the kernel BLOCKED_PORTS map.
+    pub fn sync_blocked_ports(&mut self, ports: &[u16]) -> usize {
+        let mut added = 0;
+        if let Some(ebpf) = self.ebpf.as_mut() {
+            if let Some(map) = ebpf.map_mut("BLOCKED_PORTS") {
+                if let Ok(mut map) = HashMap::<&mut MapData, u16, u32>::try_from(map) {
+                    for p in ports {
+                        if map.insert(p, &1, 0).is_ok() {
+                            added += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let mut list = self.fallback_blocked_ports.lock().unwrap();
+        for p in ports {
+            if !list.contains(p) {
+                list.push(*p);
+            }
+        }
+        added
+    }
+
+    /// Number of domains in the kernel/fallback DNS blocklist.
+    pub fn blocked_domain_count(&self) -> usize {
+        self.fallback_dns_domains.lock().unwrap().len()
+    }
+
+    /// Number of blocked ports.
+    pub fn blocked_port_count(&self) -> usize {
+        self.fallback_blocked_ports.lock().unwrap().len()
+    }
+
     pub fn detach(&mut self) {
         // Dropping the Ebpf object detaches all programs.
         if let Some(ebpf) = self.ebpf.take() {
@@ -453,8 +539,8 @@ type LpmTrieKey = aya::maps::lpm_trie::Key<u32>;
 
 fn attach_xdp(ebpf: &mut Ebpf, iface: &str) -> Result<()> {
     let program: &mut Xdp = ebpf
-        .program_mut("ring0_xdp")
-        .context("ring0_xdp not found")?
+        .program_mut("xdp")
+        .context("xdp program not found")?
         .try_into()?;
     program.attach(iface, XdpMode::default())?;
     Ok(())
@@ -464,8 +550,8 @@ fn attach_tc(ebpf: &mut Ebpf, iface: &str) -> Result<()> {
     use aya::programs::tc;
     tc::qdisc_add_clsact(iface)?;
     let program: &mut SchedClassifier = ebpf
-        .program_mut("ring0_tc")
-        .context("ring0_tc not found")?
+        .program_mut("classifier")
+        .context("tc classifier not found")?
         .try_into()?;
     program.attach(iface, TcAttachType::Ingress)?;
     Ok(())
@@ -493,19 +579,22 @@ fn attach_uprobes(ebpf: &mut Ebpf) -> Result<()> {
     use aya::programs::uprobe::UProbeScope;
     use aya::programs::UProbe;
     let libssl = find_libssl()?;
-    for fn_name in ["ring0_ssl_write", "ring0_ssl_read"] {
-        let program: &mut UProbe = ebpf
-            .program_mut(fn_name)
-            .context("uprobe program not found")?
-            .try_into()?;
-        let symbol = if fn_name.ends_with("write") {
-            "SSL_write"
-        } else {
-            "SSL_read"
-        };
-        program.attach(symbol, &libssl, UProbeScope::AllProcesses)?;
+    let program: &mut UProbe = ebpf
+        .program_mut("uprobe")
+        .context("uprobe program not found")?
+        .try_into()?;
+    // The uprobe section covers both ssl_write and ssl_read hooks.
+    match program.attach("SSL_write", &libssl, UProbeScope::AllProcesses) {
+        Ok(_) => {
+            let _ = program.attach("SSL_read", &libssl, UProbeScope::AllProcesses);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = program.attach("SSL_read", &libssl, UProbeScope::AllProcesses);
+            warn!("TLS uprobe attach failed: {e}");
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 fn find_libssl() -> Result<String> {

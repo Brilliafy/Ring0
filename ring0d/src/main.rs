@@ -25,6 +25,7 @@ pub mod rootkit;
 pub mod rules;
 pub mod self_defense;
 pub mod storage;
+pub mod sucadara;
 pub mod telemetry;
 pub mod threat_blocklist;
 pub mod trust;
@@ -115,6 +116,7 @@ struct Daemon {
     power: power::PowerGovernor,
     event_count: std::sync::atomic::AtomicU64,
     last_status: parking_lot::Mutex<Option<(u64, std::time::Instant)>>,
+    blocklist_payload: Arc<parking_lot::Mutex<Option<sucadara::SyncPayload>>>,
 }
 
 impl Daemon {
@@ -193,6 +195,27 @@ impl Daemon {
         let event_count = std::sync::atomic::AtomicU64::new(0);
         let last_status = parking_lot::Mutex::new(None);
 
+        // Kick off the Suricata rules + DNS/IP blocklist sync in the background.
+        let blocklist_payload: Arc<parking_lot::Mutex<Option<sucadara::SyncPayload>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        {
+            let sink = blocklist_payload.clone();
+            tokio::spawn(async move {
+                info!("Fetching Suricata rules + DNS/IP blocklists...");
+                let (report, payload) = sucadara::fetch_all().await;
+                info!(
+                    "Blocklist fetch done: {} rules, {} domains, {} cidrs, {} ports ({} ok/{} failed)",
+                    report.rules_parsed,
+                    report.domains,
+                    report.cidrs,
+                    report.ports,
+                    report.sources_ok,
+                    report.sources_failed
+                );
+                *sink.lock() = Some(payload);
+            });
+        }
+
         Ok(Self {
             ebpf,
             storage,
@@ -226,6 +249,7 @@ impl Daemon {
             power,
             event_count,
             last_status,
+            blocklist_payload,
         })
     }
 
@@ -243,6 +267,7 @@ impl Daemon {
         let mut governor_tick = tokio::time::interval(std::time::Duration::from_secs(5));
         let mut fastpath_tick = tokio::time::interval(std::time::Duration::from_secs(60));
         let mut prompt_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut blocklist_tick = tokio::time::interval(std::time::Duration::from_secs(60));
 
         loop {
             tokio::select! {
@@ -261,6 +286,7 @@ impl Daemon {
                 _ = governor_tick.tick() => { self.tick_governor(); }
                 _ = fastpath_tick.tick() => { self.fastpath.purge_idle_flows(); }
                 _ = prompt_tick.tick() => { self.prompt.check_timeouts(); }
+                _ = blocklist_tick.tick() => { self.apply_blocklist_payload(); }
                 Some(cmd) = self.cmd_rx.recv() => { self.handle_command(cmd); }
             }
         }
@@ -814,6 +840,22 @@ impl Daemon {
         evt
     }
 
+    fn apply_blocklist_payload(&mut self) {
+        let payload = self.blocklist_payload.lock().take();
+        if let Some(payload) = payload {
+            info!(
+                "Applying blocklist to kernel maps: {} cidrs, {} domains, {} ports",
+                payload.cidrs.len(),
+                payload.domains.len(),
+                payload.ports.len()
+            );
+            let c = self.ebpf.sync_blocked_cidrs(&payload.cidrs);
+            let d = self.ebpf.sync_dns_domains(&payload.domains);
+            let p = self.ebpf.sync_blocked_ports(&payload.ports);
+            info!("Kernel sync complete: {c} cidrs, {d} domains, {p} ports in eBPF maps");
+        }
+    }
+
     fn handle_command(&mut self, cmd: ipc::DaemonCmd) {
         use ipc::DaemonCmd::*;
         match cmd {
@@ -905,6 +947,7 @@ impl Daemon {
             UpdateSettings(json) => info!("Settings: {json}"),
             RunDoctor => info!("Doctor requested"),
             Status => {
+                self.apply_blocklist_payload();
                 let total = self.event_count.load(std::sync::atomic::Ordering::Relaxed);
                 let mut last = self.last_status.lock();
                 let now = std::time::Instant::now();
@@ -923,7 +966,10 @@ impl Daemon {
                 let cpu = self.governor.daemon_cpu_pct();
                 let ram = read_vm_rss();
                 let filters = self.ebpf.blocked_ips();
-                let status = ipc::build_status_event(&filters, cpu, ram, eps);
+                let domains = self.ebpf.blocked_domain_count() as u32;
+                let cidrs = filters.len() as u32;
+                let ports = self.ebpf.blocked_port_count() as u32;
+                let status = ipc::build_status_event(&filters, cpu, ram, eps, domains, cidrs, ports);
                 self.ipc.broadcast_sync(&status);
             }
         }

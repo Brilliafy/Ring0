@@ -20,10 +20,13 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 // ── Map definitions ──────────────────────────────────────────
 
 #[map]
-pub static BLOCKED_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(1024, 0);
+pub static BLOCKED_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(65536, 0);
 
 #[map]
 pub static BLOCKED_PORTS: HashMap<u16, u32> = HashMap::with_max_entries(256, 0);
+
+#[map]
+pub static DNS_DOMAIN_BLOCK: HashMap<u64, u8> = HashMap::with_max_entries(200000, 0);
 
 #[map]
 pub static RING_BUF: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -281,6 +284,133 @@ fn check_blocked(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16) -> u32 
     xdp_action::XDP_PASS
 }
 
+// ── DNS domain hash blocklist ──────────────────────────────
+
+const FNV_OFFSET: u64 = 14695981039346656037;
+const FNV_PRIME: u64 = 1099511628211;
+
+#[inline(always)]
+fn fnv1a(mut h: u64, b: u8) -> u64 {
+    h ^= b as u64;
+    h.wrapping_mul(FNV_PRIME)
+}
+
+#[inline(always)]
+fn lowercase(b: u8) -> u8 {
+    if (b'A'..=b'Z').contains(&b) {
+        b + 32
+    } else {
+        b
+    }
+}
+
+trait PktData {
+    fn data(&self) -> usize;
+    fn data_end(&self) -> usize;
+}
+impl PktData for XdpContext {
+    fn data(&self) -> usize {
+        self.data()
+    }
+    fn data_end(&self) -> usize {
+        self.data_end()
+    }
+}
+impl PktData for TcContext {
+    fn data(&self) -> usize {
+        self.data()
+    }
+    fn data_end(&self) -> usize {
+        self.data_end()
+    }
+}
+
+/// Parse the DNS query name at `qname_off` and check its hash (full name and
+/// registrable last-two-labels) against the kernel domain blocklist.
+/// Returns true when the query should be dropped.
+unsafe fn dns_query_blocked<T: PktData>(ctx: &T, qname_off: usize) -> bool {
+    let mut off = qname_off;
+    let mut label_starts = [0u16; 8];
+    let mut n_labels = 0usize;
+    let mut full_hash = FNV_OFFSET;
+    let mut first = true;
+    let mut name_len = 0usize;
+
+    while off < ctx.data_end() {
+        let len = *(ctx.data() as *const u8).add(off) as usize;
+        if len == 0 {
+            break;
+        }
+        if len > 63 || n_labels >= 8 || name_len + len + 1 > 255 {
+            return false;
+        }
+        if n_labels < 8 {
+            label_starts[n_labels] = off as u16 + 1;
+        }
+        n_labels += 1;
+        for i in 0..len {
+            if off + 1 + i >= ctx.data_end() {
+                return false;
+            }
+            let b = lowercase(*(ctx.data() as *const u8).add(off + 1 + i));
+            if !first {
+                full_hash = fnv1a(full_hash, b'.');
+            }
+            first = false;
+            full_hash = fnv1a(full_hash, b);
+            name_len += 1;
+        }
+        off += 1 + len;
+    }
+
+    if DNS_DOMAIN_BLOCK.get(&full_hash).is_some() {
+        return true;
+    }
+    if n_labels >= 2 {
+        let start = label_starts[n_labels - 2] as usize;
+        let mut h = FNV_OFFSET;
+        let mut first_l = true;
+        let mut i = start;
+        while i < off && i < ctx.data_end() {
+            let b = lowercase(*(ctx.data() as *const u8).add(i));
+            if b == 0 {
+                break;
+            }
+            if !first_l {
+                h = fnv1a(h, b'.');
+            }
+            first_l = false;
+            h = fnv1a(h, b);
+            i += 1;
+        }
+        if DNS_DOMAIN_BLOCK.get(&h).is_some() {
+            return true;
+        }
+    }
+    if n_labels >= 3 {
+        let start = label_starts[n_labels - 3] as usize;
+        let mut h = FNV_OFFSET;
+        let mut first_l = true;
+        let mut i = start;
+        while i < off && i < ctx.data_end() {
+            let b = lowercase(*(ctx.data() as *const u8).add(i));
+            if b == 0 {
+                break;
+            }
+            if !first_l {
+                h = fnv1a(h, b'.');
+            }
+            first_l = false;
+            h = fnv1a(h, b);
+            i += 1;
+        }
+        if DNS_DOMAIN_BLOCK.get(&h).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
 // ── XDP program ──────────────────────────────────────────────
 
 #[xdp]
@@ -333,6 +463,17 @@ unsafe fn try_ring0_xdp(ctx: &XdpContext) -> Result<u32, u32> {
     };
     if dns_match {
         return Ok(xdp_action::XDP_DROP);
+    }
+
+    // Kernel-level DNS domain blocklist (hashed FQDN lookup, sub-µs).
+    if proto == 17 && dp == 53 {
+        let dns = ip + 20 + 8;
+        if ctx.data_end() >= dns + 12 + 1 {
+            let qname = dns + 12;
+            if unsafe { dns_query_blocked(ctx, qname) } {
+                return Ok(xdp_action::XDP_DROP);
+            }
+        }
     }
 
     let flow_key = FlowKey {
@@ -411,6 +552,17 @@ unsafe fn try_ring0_tc(ctx: &TcContext) -> Result<i32, i32> {
     };
     if dns_match {
         return Ok(-1);
+    }
+
+    // Kernel-level DNS domain blocklist (hashed FQDN lookup, sub-µs).
+    if proto == 17 && dp == 53 {
+        let dns = ip + 20 + 8;
+        if ctx.data_end() >= dns + 12 + 1 {
+            let qname = dns + 12;
+            if unsafe { dns_query_blocked(ctx, qname) } {
+                return Ok(-1);
+            }
+        }
     }
 
     let flow_key = FlowKey {
