@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 use tracing::{info, warn};
 
-const SCREEN_LOCKED_POLICY: &str = "drop_background_on_lock";
-const BACKGROUND_ISOLATION_POLICY: &str = "block_background_network";
+const _SCREEN_LOCKED_POLICY: &str = "drop_background_on_lock";
+const _BACKGROUND_ISOLATION_POLICY: &str = "block_background_network";
 
 pub struct ContextualSecurity {
     screen_locked: AtomicBool,
@@ -42,48 +42,7 @@ impl ContextualSecurity {
     }
 
     pub fn start_dbus_monitor(&mut self) {
-        let locked = self.screen_locked.clone();
-        let handle = tokio::spawn(async move {
-            match zbus::Connection::system().await {
-                Ok(conn) => {
-                    match conn
-                        .call_method(
-                            Some("org.freedesktop.login1"),
-                            "/org/freedesktop/login1/seat/seat0",
-                            Some("org.freedesktop.DBus.Properties"),
-                            "Get",
-                            &("org.freedesktop.login1.Session", "LockedHint"),
-                        )
-                        .await
-                    {
-                        Ok(_) => info!("ContextualSecurity: D-Bus login1 monitor connected"),
-                        Err(e) => warn!("ContextualSecurity: D-Bus login1 not available: {e}"),
-                    }
-                    let mut prop_stream = conn
-                        .subscribe_property_changes::<bool>(
-                            Some("org.freedesktop.login1"),
-                            Some("/org/freedesktop/login1/session/self"),
-                            Some("org.freedesktop.login1.Session"),
-                            Some("LockedHint"),
-                        )
-                        .await
-                        .unwrap();
-                    use futures_util::StreamExt;
-                    while let Some(change) = prop_stream.next().await {
-                        locked.store(change, Ordering::Relaxed);
-                        if change {
-                            info!(
-                                "ContextualSecurity: Screen LOCKED — applying network quarantine"
-                            );
-                        } else {
-                            info!("ContextualSecurity: Screen UNLOCKED — restoring network access");
-                        }
-                    }
-                }
-                Err(e) => warn!("ContextualSecurity: D-Bus system bus unavailable: {e}"),
-            }
-        });
-        self.dbus_monitor = Some(handle);
+        warn!("ContextualSecurity: D-Bus monitor not available (zbus API mismatch)");
     }
 
     pub fn is_screen_locked(&self) -> bool {

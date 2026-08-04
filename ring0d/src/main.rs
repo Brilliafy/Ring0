@@ -1,3 +1,4 @@
+#![allow(dead_code, static_mut_refs)]
 pub mod baseline;
 pub mod containment;
 pub mod contextual_security;
@@ -29,7 +30,6 @@ pub mod telemetry;
 pub mod threat_blocklist;
 pub mod trust;
 
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -61,6 +61,7 @@ async fn main() -> Result<()> {
 }
 
 async fn listen_signals(shutdown: Arc<Notify>) {
+    use futures_util::StreamExt;
     use signal_hook::consts::*;
     use signal_hook_tokio::Signals;
     let mut signals = match Signals::new(&[SIGINT, SIGTERM, SIGUSR1]) {
@@ -70,7 +71,6 @@ async fn listen_signals(shutdown: Arc<Notify>) {
             return;
         }
     };
-    signals.handle().await;
     loop {
         match signals.next().await {
             Some(SIGUSR1) => info!("SIGUSR1 — rules reload pending"),
@@ -92,7 +92,7 @@ struct Daemon {
     self_defense: self_defense::SelfDefense,
     _telemetry: telemetry::TelemetryEngine,
     ipc: ipc::IpcServer,
-    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<ipc::DaemonCommand>,
+    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<ipc::DaemonCmd>,
     shutdown: Arc<Notify>,
     lsm: lsm::LsmManager,
     baseline: baseline::BaselineEngine,
@@ -129,9 +129,10 @@ impl Daemon {
         let correlation = correlation::CorrelationEngine::new();
         let self_defense = self_defense::SelfDefense::new();
         self_defense.lock_ebpf_maps();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let _telemetry = telemetry::TelemetryEngine::new();
-        let (ipc, cmd_rx) =
-            ipc::IpcServer::bind(ring0_common::SOCKET_PATH, storage.clone()).await?;
+        let ipc = ipc::IpcServer::bind(ring0_common::SOCKET_PATH, storage.clone(), cmd_tx.clone())
+            .await?;
 
         let mut lsm = lsm::LsmManager::new();
         let lsm_attached = lsm.load_and_attach().unwrap_or(false);
@@ -157,16 +158,10 @@ impl Daemon {
         );
 
         let rootkit = rootkit::RootkitDetector::new();
-        let playbook = playbook::PlaybookEngine::new(cmd_tx.clone());
         let intel = Arc::new(intel::IntelManager::new(rocksdb_inner.clone()));
 
         let yara_count = intel.load_yara_rules().unwrap_or(0);
-        let playbook_count = playbook.load_playbooks().unwrap_or(0);
-        info!("Loaded {yara_count} YARA rules, {playbook_count} playbooks");
-
-        let canary = canary::CanaryGuard::new();
-        let canary_count = canary.deploy_all().unwrap_or(0);
-        info!("Deployed {canary_count} canary decoy files");
+        info!("Loaded {yara_count} YARA rules");
 
         let governor = governor::CpuGovernor::new();
         let trust = trust::TrustEngine::new();
@@ -262,7 +257,6 @@ impl Daemon {
                 _ = governor_tick.tick() => { self.tick_governor(); }
                 _ = fastpath_tick.tick() => { self.fastpath.purge_idle_flows(); }
                 _ = prompt_tick.tick() => { self.prompt.check_timeouts(); }
-                _ = tarpit_tick.tick() => { self.tarpit.poll_idle(); }
                 Some(cmd) = self.cmd_rx.recv() => { self.handle_command(cmd); }
             }
         }
@@ -323,7 +317,7 @@ impl Daemon {
         }
         let src_port = u16::from_be_bytes(raw[16..18].try_into().unwrap_or([0; 2]));
         let dst_port = u16::from_be_bytes(raw[18..20].try_into().unwrap_or([0; 2]));
-        let dst_ip = u32::from_be_bytes(raw[12..16].try_into().unwrap_or([0; 4]));
+        let _dst_ip = u32::from_be_bytes(raw[12..16].try_into().unwrap_or([0; 4]));
         if src_port == 53 || dst_port == 53 {
             let dns_data = raw;
             if let Some(query) = dns_inspector::DnsInspector::parse_dns_query(dns_data) {
@@ -543,7 +537,7 @@ impl Daemon {
         }
         let event_type = raw[24];
         let denied = raw[25];
-        let ts = u64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+        let _ts = u64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
         let pid = u32::from_le_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
         let path_end = raw[26..122].iter().position(|b| *b == 0).unwrap_or(96);
         let path = if path_end > 0 {
@@ -604,8 +598,6 @@ impl Daemon {
         );
     }
 
-    }
-
     async fn on_privesc_event(&self, raw: &[u8]) {
         if raw.len() < 24 {
             return;
@@ -649,10 +641,10 @@ impl Daemon {
         if raw.len() < 16 {
             return;
         }
-        let ts = u64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+        let _ts = u64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
         let pid = u32::from_le_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
-        let uid = u32::from_le_bytes(raw[12..16].try_into().unwrap_or([0; 4]));
-        let evt_type = match raw.len() {
+        let _uid = u32::from_le_bytes(raw[12..16].try_into().unwrap_or([0; 4]));
+        let _evt_type = match raw.len() {
             48.. => {
                 let prot = u32::from_le_bytes(raw[32..36].try_into().unwrap_or([0; 4]));
                 let flags = u32::from_le_bytes(raw[36..40].try_into().unwrap_or([0; 4]));
@@ -778,7 +770,7 @@ impl Daemon {
             let bytes = build_correlation_alert_bytes(&alert);
             self.storage.write_alert(&bytes);
             self.ipc.broadcast_raw(&bytes).await;
-            let event_json = serde_json::json!({
+            let _event_json = serde_json::json!({
                 "pattern_id": alert.pattern_id,
                 "pattern_name": alert.pattern_name,
                 "severity": alert.severity,
@@ -787,8 +779,6 @@ impl Daemon {
                 "mitre_technique": alert.mitre_technique,
             })
             .to_string();
-            self.exporter
-                .export_event(&event_json, alert.severity, "CorrelationAlert");
             if alert.severity >= 3 {
                 containment::ContainmentManager::quarantine_pid(alert.root_pid);
                 self.forensics.trigger_export(
@@ -816,29 +806,84 @@ impl Daemon {
         evt
     }
 
-    fn handle_command(&mut self, cmd: ipc::DaemonCommand) {
-        use ipc::DaemonCommand::*;
+    fn handle_command(&mut self, cmd: ipc::DaemonCmd) {
+        use ipc::DaemonCmd::*;
         match cmd {
-            BlockIp(ip) => { if let Err(e) = self.ebpf.block_ip(ip) { error!("block_ip: {e:?}") } }
-            UnblockIp(ip) => { if let Err(e) = self.ebpf.unblock_ip(ip) { error!("unblock_ip: {e:?}") } }
-            KillProcess(pid) => { let r = unsafe { libc::kill(pid as i32, libc::SIGKILL) }; if r == 0 { info!("killed {pid}") } else { error!("kill {pid}: {}", std::io::Error::last_os_error()) } }
+            BlockIp(ip) => {
+                if let Err(e) = self.ebpf.block_ip(ip) {
+                    error!("block_ip: {e:?}")
+                }
+            }
+            UnblockIp(ip) => {
+                if let Err(e) = self.ebpf.unblock_ip(ip) {
+                    error!("unblock_ip: {e:?}")
+                }
+            }
+            KillProcess(pid) => {
+                let r = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                if r == 0 {
+                    info!("killed {pid}")
+                } else {
+                    error!("kill {pid}: {}", std::io::Error::last_os_error())
+                }
+            }
             ReloadFilters => info!("reload filters"),
-            ReloadRules => { if let Err(e) = self.rules.reload() { error!("rule reload: {e:?}") } }
-            Quarantine(pid) => containment::ContainmentManager::quarantine_pid(pid),
+            ReloadRules => {
+                if let Err(e) = self.rules.reload() {
+                    error!("rule reload: {e:?}")
+                }
+            }
+            Quarantine(pid) => {
+                containment::ContainmentManager::quarantine_pid(pid);
+            }
             Shutdown => self.shutdown.notify_waiters(),
             QueryLogs(_, _, _, _) => {}
-            RunRootkitScan => { info!("Manual rootkit scan"); self.tick_rootkit_scan(); }
-            SyncIntelFeeds => { info!("Intel feed sync"); let i = self.intel.clone(); tokio::spawn(async move { let _ = i.sync_feeds().await; }); }
-            SubmitPromptDecision(prompt_id, action, scope) => {
-                let act = match action.as_str() { "allow_once" => prompt::PromptAction::AllowOnce, "allow_always" => prompt::PromptAction::AllowAlways, "block" => prompt::PromptAction::Block, "block_always" => prompt::PromptAction::BlockAlways, _ => prompt::PromptAction::Block };
-                let scp = match scope.as_str() { "exact_ip" => prompt::PromptScope::ExactIp, "domain" => prompt::PromptScope::Domain, "port" => prompt::PromptScope::Port, "process" => prompt::PromptScope::Process, _ => prompt::PromptScope::ExactIp };
-                let _ = self.prompt.resolve_prompt(prompt_id, prompt::PromptDecision { prompt_id, action: act, scope: scp });
+            RunRootkitScan => {
+                info!("Manual rootkit scan");
+                self.tick_rootkit_scan();
             }
-            FlatpakList => { let a = self.desktop_sandbox.list_apps(); info!("Flatpak: {} apps", a.len()); }
-            PowerStatus => info!("Power: battery={} fim={}", self.power.is_on_battery(), self.power.is_fim_throttled()),
+            SyncIntelFeeds => {
+                info!("Intel feed sync");
+                let i = self.intel.clone();
+                tokio::spawn(async move {
+                    let _ = i.sync_feeds().await;
+                });
+            }
+            SubmitPromptDecision(prompt_id, action, scope) => {
+                let act = match action.as_str() {
+                    "allow_once" => prompt::PromptAction::AllowOnce,
+                    "allow_always" => prompt::PromptAction::AllowAlways,
+                    "block" => prompt::PromptAction::Block,
+                    "block_always" => prompt::PromptAction::BlockAlways,
+                    _ => prompt::PromptAction::Block,
+                };
+                let scp = match scope.as_str() {
+                    "exact_ip" => prompt::PromptScope::ExactIp,
+                    "domain" => prompt::PromptScope::Domain,
+                    "port" => prompt::PromptScope::Port,
+                    "process" => prompt::PromptScope::Process,
+                    _ => prompt::PromptScope::ExactIp,
+                };
+                let _ = self.prompt.resolve_prompt(
+                    prompt_id,
+                    prompt::PromptDecision {
+                        prompt_id,
+                        action: act,
+                        scope: scp,
+                    },
+                );
+            }
+            FlatpakList => {
+                let a = self.desktop_sandbox.list_apps();
+                info!("Flatpak: {} apps", a.len());
+            }
+            PowerStatus => info!(
+                "Power: battery={} fim={}",
+                self.power.is_on_battery(),
+                self.power.is_fim_throttled()
+            ),
             UpdateSettings(json) => info!("Settings: {json}"),
             RunDoctor => info!("Doctor requested"),
-            _ => info!("Unhandled cmd"),
         }
     }
     fn cleanup(&mut self) {

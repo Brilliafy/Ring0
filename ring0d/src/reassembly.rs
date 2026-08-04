@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use parking_lot::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::dpi::DpiEngine;
 
@@ -50,7 +50,7 @@ impl ReassemblyEngine {
         key: &FlowKey5,
         seq: u32,
         payload: &[u8],
-        ack: u32,
+        _ack: u32,
         fin: bool,
         dpi: &DpiEngine,
     ) -> Vec<String> {

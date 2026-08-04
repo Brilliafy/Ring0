@@ -1,12 +1,11 @@
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ring0_common::event_capnp as capnp_schema;
 
-const SOCKET_PATH: &str = "/run/ring0d.sock";
+const _SOCKET_PATH: &str = "/run/ring0d.sock";
 
 #[derive(Parser)]
 #[command(
@@ -63,14 +62,14 @@ impl Color for &str {
     }
 }
 
-fn connect() -> Result<UnixStream> {
-    let stream = UnixStream::connect(SOCKET_PATH).context("connect to ring0d socket")?;
+fn _connect() -> Result<UnixStream> {
+    let stream = UnixStream::connect(_SOCKET_PATH).context("connect to ring0d socket")?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     Ok(stream)
 }
 
-fn send_cmd(frame: &[u8]) -> Result<()> {
-    let mut stream = connect()?;
+fn _send_cmd(frame: &[u8]) -> Result<()> {
+    let mut stream = _connect()?;
     let len = (frame.len() as u32).to_le_bytes();
     stream.write_all(&len)?;
     stream.write_all(frame)?;
@@ -109,7 +108,7 @@ fn test_tamper() -> Result<()> {
     if std::path::Path::new(rules_path).exists() {
         let original = std::fs::read_to_string(rules_path).ok();
         let _ = std::fs::write(rules_path, tamper_content);
-        if let Ok(orig) = original {
+        if let Some(orig) = original {
             let _ = std::fs::write(rules_path, &orig);
         }
     }

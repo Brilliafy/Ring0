@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
 const DNS_HEADER_SIZE: usize = 12;
 const TYPE_A: u16 = 1;
-const TYPE_AAAA: u16 = 28;
+const _TYPE_AAAA: u16 = 28;
 const TYPE_CNAME: u16 = 5;
 
 #[derive(Debug, Clone)]
@@ -50,7 +50,7 @@ impl DnsInspector {
             return None;
         }
         let transaction_id = u16::from_be_bytes([data[0], data[1]]);
-        let flags = u16::from_be_bytes([data[2], data[3]]);
+        let _flags = u16::from_be_bytes([data[2], data[3]]);
         let qdcount = u16::from_be_bytes([data[4], data[5]]);
         if qdcount == 0 {
             return None;
@@ -122,7 +122,7 @@ impl DnsInspector {
         let mut labels = Vec::new();
         let mut jumped = false;
         let mut pos = *offset;
-        let orig_offset = *offset;
+        let _orig_offset = *offset;
 
         loop {
             if pos >= data.len() {
@@ -166,7 +166,7 @@ impl DnsInspector {
             return None;
         }
         let rtype = u16::from_be_bytes([data[*offset], data[*offset + 1]]);
-        let rclass = u16::from_be_bytes([data[*offset + 2], data[*offset + 3]]);
+        let _rclass = u16::from_be_bytes([data[*offset + 2], data[*offset + 3]]);
         let ttl = u32::from_be_bytes([
             data[*offset + 4],
             data[*offset + 5],

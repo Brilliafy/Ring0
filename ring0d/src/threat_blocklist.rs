@@ -100,7 +100,7 @@ impl ThreatBlocklist {
     async fn sync_single_feed(
         &self,
         client: &reqwest::Client,
-        name: &str,
+        _name: &str,
         url: &str,
     ) -> Result<Vec<String>, String> {
         let resp = client

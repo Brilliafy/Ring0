@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use parking_lot::RwLock;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::ebpf;
 

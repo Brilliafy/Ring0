@@ -86,8 +86,26 @@ struct Ring0Event {
     correlation @6 : CorrelationAlert;
     selfDefense @7 : SelfDefenseEvent;
     dns @8 : DnsQueryEvent;
+    connectionPrompt @9 : ConnectionPromptEvent;
     }
 }
+
+struct ConnectionPromptEvent {
+    timestamp @0 : UInt64;
+    promptId @1 : UInt64;
+    pid @2 : UInt32;
+    ppid @3 : UInt32;
+    binaryPath @4 : Text;
+    parentBinary @5 : Text;
+    dstIp @6 : UInt32;
+    dstPort @7 : UInt16;
+    protocol @8 : UInt8;
+    countryCode @9 : Text;
+    countryName @10 : Text;
+    rdnsName @11 : Text;
+    timeoutSecs @12 : UInt32;
+}
+
 struct LogQuery {
     startTimestamp @0 : UInt64; endTimestamp @1 : UInt64;
     severityThreshold @2 : UInt8; limit @3 : UInt32;

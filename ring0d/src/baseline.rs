@@ -1,9 +1,8 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
 use parking_lot::RwLock;
 use rocksdb::DB;
 use tracing::{info, warn};
@@ -13,7 +12,7 @@ const LEARNING_PERIOD_SECS: u64 = 86400;
 
 pub struct BaselineEngine {
     db: Arc<DB>,
-    start_time: Instant,
+    start_time: RwLock<Instant>,
     learning_mode: AtomicBool,
     learned_exec_paths: Arc<RwLock<HashMap<String, u64>>>,
     learned_parent_pairs: Arc<RwLock<HashMap<(String, String), u64>>>,
@@ -29,15 +28,16 @@ impl BaselineEngine {
                 cf
             }
             None => {
-                warn!("Baseline column family not found — creating");
-                match db.create_cf(BASELINE_CF, &rocksdb::Options::default()) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("Failed to create baseline CF: {e:?}");
-                    }
-                }
-                db.cf_handle(BASELINE_CF)
-                    .expect("baseline CF must exist after create")
+                warn!("Baseline column family not found — skipping (not available at runtime)");
+                return Self {
+                    db,
+                    start_time: RwLock::new(Instant::now()),
+                    learning_mode: AtomicBool::new(true),
+                    learned_exec_paths: Arc::new(RwLock::new(HashMap::new())),
+                    learned_parent_pairs: Arc::new(RwLock::new(HashMap::new())),
+                    learned_connections: Arc::new(RwLock::new(HashMap::new())),
+                    anomaly_count: Arc::new(RwLock::new(0u64)),
+                };
             }
         };
 
@@ -56,7 +56,7 @@ impl BaselineEngine {
 
         Self {
             db,
-            start_time: Instant::now(),
+            start_time: RwLock::new(Instant::now()),
             learning_mode: AtomicBool::new(true),
             learned_exec_paths,
             learned_parent_pairs,
@@ -216,7 +216,7 @@ impl BaselineEngine {
 
     pub fn finish_learning(&self) {
         self.learning_mode.store(false, Ordering::Relaxed);
-        let elapsed = self.start_time.elapsed();
+        let elapsed = self.start_time.read().elapsed();
         info!(
             "Baseline learning finished after {:.2}s — switching to anomaly detection. \
              Learned: {} exec paths, {} parent pairs, {} connections",
@@ -232,7 +232,7 @@ impl BaselineEngine {
     }
 
     pub fn learning_progress(&self) -> f64 {
-        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let elapsed = self.start_time.read().elapsed().as_secs_f64();
         (elapsed / LEARNING_PERIOD_SECS as f64).min(1.0)
     }
 
@@ -242,7 +242,7 @@ impl BaselineEngine {
 
     pub fn force_learning(&self) {
         self.learning_mode.store(true, Ordering::Relaxed);
-        self.start_time = Instant::now();
+        *self.start_time.write() = Instant::now();
         info!("Baseline learning mode re-enabled");
     }
 }

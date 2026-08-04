@@ -97,10 +97,10 @@ impl ProcessResolver {
             if local_fields.len() != 2 {
                 continue;
             }
-            if local_fields[1] != *src_hex {
+            if local_fields[1] != src_hex {
                 continue;
             }
-            if parts[2] == *dst_hex {
+            if parts[2] == dst_hex {
                 return parts[9].parse::<u64>().ok();
             }
         }

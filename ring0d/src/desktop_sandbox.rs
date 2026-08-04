@@ -1,15 +1,13 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
-const FLATPAK_DIRS: &[&str] = &["/var/lib/flatpak/app", "~/.local/share/flatpak/app"];
+const _FLATPAK_DIRS: &[&str] = &["/var/lib/flatpak/app", "~/.local/share/flatpak/app"];
 
-const BWRAP_EXEC: &str = "bwrap";
+const _BWRAP_EXEC: &str = "bwrap";
 
 #[derive(Debug, Clone)]
 pub struct FlatpakApp {

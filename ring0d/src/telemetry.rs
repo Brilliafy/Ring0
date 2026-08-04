@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use tracing::info;
-
 pub struct TelemetryEngine {
     ja4_cache: HashMap<String, String>,
 }
@@ -13,7 +11,7 @@ impl TelemetryEngine {
         }
     }
 
-    pub fn compute_ja4(tls_version: u8, ciphers: &[u16], extensions: &[u16]) -> String {
+    pub fn compute_ja4(tls_version: u16, ciphers: &[u16], extensions: &[u16]) -> String {
         let t = match tls_version {
             0x0304 => "t13",
             0x0303 => "t12",
@@ -90,7 +88,7 @@ impl TelemetryEngine {
     pub fn compute_dga_score(domain: &str) -> f32 {
         let name = domain.trim_end_matches('.');
         if let Some(dot) = name.rfind('.') {
-            let tld = &name[dot + 1..];
+            let _tld = &name[dot + 1..];
             let sld = &name[..dot];
             if let Some(dot2) = sld.rfind('.') {
                 let reg = &sld[dot2 + 1..];

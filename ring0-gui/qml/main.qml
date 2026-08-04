@@ -198,7 +198,7 @@ ApplicationWindow {
                     border.color: "#30363d"; border.width: 1; clip: true
                     ColumnLayout { anchors.fill: parent; anchors.margins: 4
                         RowLayout { spacing: 4
-                            TextField { id: filterInput; placeholderText: "Filter by PID, IP, or Rule..."; color: "#c9d1d9"; placeholderTextColor: "#484f58"; background: Rectangle { color: "#0d1117"; radius: 4; border.color: "#30363d"; border.width: 1 }; Layout.fillWidth: true; Layout.preferredHeight: 28 }
+                            TextField { id: filterInput; placeholderText: "Filter by PID, IP, or Rule..."; color: "#c9d1d9"; placeholderTextColor: "#484f58"; background: Rectangle { color: "#0d1117"; radius: 4; border.color: "#30363d"; border.width: 1 } Layout.fillWidth: true; Layout.preferredHeight: 28 }
                             Button { text: "Clear"; flat: true; onClicked: filterInput.text = "" }
                         }
                         EventLogTable { id: eventList; Layout.fillWidth: true; Layout.fillHeight: true }

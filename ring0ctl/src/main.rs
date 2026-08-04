@@ -1,11 +1,10 @@
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::*;
 use ring0_common::proto as capnp_schema;
-use ring0_common::{DaemonCommand, LogQuery, QueryResponse, Ring0Event};
 
 const SOCKET_PATH: &str = "/run/ring0d.sock";
 
@@ -60,8 +59,9 @@ fn connect_timeout() -> Result<std::os::unix::net::UnixStream> {
     let (mut tx, rx) = std::os::unix::net::UnixStream::pair()
         .context("failed to create socket pair for connect timeout")?;
     let socket_path = SOCKET_PATH.to_string();
+    let path_for_thread = socket_path.clone();
     let handle = std::thread::spawn(move || {
-        let stream = std::os::unix::net::UnixStream::connect(&socket_path);
+        let stream = std::os::unix::net::UnixStream::connect(&path_for_thread);
         let _ = tx.write_all(&[0u8; 1]);
         stream
     });
@@ -166,7 +166,7 @@ fn cmd_kill(pid: u32) -> Result<()> {
 }
 
 fn cmd_tail() -> Result<()> {
-    let mut stream = connect_timeout()?;
+    let stream = connect_timeout()?;
     stream
         .set_read_timeout(None)
         .context("failed to set infinite read timeout")?;
@@ -202,7 +202,7 @@ fn cmd_query(last_minutes: u64, severity: u8, json_flag: bool) -> Result<()> {
     let start = now.saturating_sub(last_minutes * 60 * 1_000_000_000);
     let mut message = capnp::message::Builder::new_default();
     {
-        let mut cmd = message.init_root::<capnp_schema::daemon_command::Builder>();
+        let cmd = message.init_root::<capnp_schema::daemon_command::Builder>();
         let mut q = cmd.initQueryLogs();
         q.setStartTimestamp(start);
         q.setEndTimestamp(now);
@@ -212,9 +212,13 @@ fn cmd_query(last_minutes: u64, severity: u8, json_flag: bool) -> Result<()> {
     let mut buf = Vec::new();
     capnp::serialize::write_message(&mut buf, &message)?;
     let resp = send_command(&buf)?;
-    let reader =
-        capnp::serialize::read_message_from_flat_slice(&resp, capnp::message::ReaderOptions::new())
-            .context("failed to parse query response")?;
+    let resp_mut = resp;
+    let mut bytes = &resp_mut[..];
+    let reader = capnp::serialize::read_message_from_flat_slice(
+        &mut bytes,
+        capnp::message::ReaderOptions::new(),
+    )
+    .context("failed to parse query response")?;
     let qr = reader
         .get_root::<capnp_schema::query_response::Reader>()
         .context("failed to get query response root")?;
@@ -223,7 +227,7 @@ fn cmd_query(last_minutes: u64, severity: u8, json_flag: bool) -> Result<()> {
     if json_flag {
         let mut results = Vec::new();
         for alert in alerts.iter() {
-            results.push(serde_json::json!({"timestamp": alert.getTimestamp(), "rule_id": alert.getRuleId(), "signature": alert.getSignatureName().ok().map(|s| s.to_string()).ok().unwrap_or_default()}));
+            results.push(serde_json::json!({"timestamp": alert.getTimestamp(), "rule_id": alert.getRuleId(), "signature": alert.getSignatureName().map(|s| s.to_str().unwrap_or("").to_string()).unwrap_or_default()}));
         }
         println!(
             "{}",
@@ -236,10 +240,10 @@ fn cmd_query(last_minutes: u64, severity: u8, json_flag: bool) -> Result<()> {
             println!(
                 "  {}\t{}\t{}",
                 format!("{:>8}", alert.getRuleId()).cyan(),
-                format_severity(alert.getSeverity()),
+                format_severity(alert.getSeverity().unwrap_or(capnp_schema::Severity::Low)),
                 alert
                     .getSignatureName()
-                    .map(|s| s.to_string())
+                    .map(|s| s.to_str().unwrap_or("").to_string())
                     .unwrap_or_default()
                     .white()
             );
@@ -252,25 +256,34 @@ fn cmd_doctor() -> Result<()> {
     println!("{}", "Ring0 Diagnostic Suite".bold().white());
     use std::fs;
     use std::path::Path;
-    for check in &[
-        ("Kernel >= 5.8", || {
-            let k = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-            k.trim()
-                .split('.')
-                .next()
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(0)
-                >= 5
-        }),
-        ("BTF vmlinux", || {
-            Path::new("/sys/kernel/btf/vmlinux").exists()
-        }),
-        ("Cgroup v2", || {
-            Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
-        }),
-        ("Daemon socket", || Path::new("/run/ring0d.sock").exists()),
-    ] {
-        let pass = check.1();
+    let checks: Vec<(&str, Box<dyn Fn() -> bool>)> = vec![
+        (
+            "Kernel >= 5.8",
+            Box::new(|| {
+                let k = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+                k.trim()
+                    .split('.')
+                    .next()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0)
+                    >= 5
+            }),
+        ),
+        (
+            "BTF vmlinux",
+            Box::new(|| Path::new("/sys/kernel/btf/vmlinux").exists()),
+        ),
+        (
+            "Cgroup v2",
+            Box::new(|| Path::new("/sys/fs/cgroup/cgroup.controllers").exists()),
+        ),
+        (
+            "Daemon socket",
+            Box::new(|| Path::new("/run/ring0d.sock").exists()),
+        ),
+    ];
+    for check in &checks {
+        let pass = (check.1)();
         print!("[..] {} ... ", check.0);
         if pass {
             println!("{}", "PASS".green().bold());
@@ -307,9 +320,12 @@ fn cmd_power_status() -> Result<()> {
 }
 
 fn format_event_capnp(data: &[u8]) -> Result<String> {
-    let reader =
-        capnp::serialize::read_message_from_flat_slice(data, capnp::message::ReaderOptions::new())
-            .context("capnp parse failed")?;
+    let mut data_mut = data;
+    let reader = capnp::serialize::read_message_from_flat_slice(
+        &mut data_mut,
+        capnp::message::ReaderOptions::new(),
+    )
+    .context("capnp parse failed")?;
     let event = reader
         .get_root::<capnp_schema::ring0_event::Reader>()
         .context("capnp root failed")?;
@@ -322,12 +338,14 @@ fn format_event_capnp(data: &[u8]) -> Result<String> {
             let p = pkt.map_err(|e| anyhow::anyhow!("packet read failed: {e}"))?;
             let src = ip_to_string(p.getSrcIp().map_err(|e| anyhow::anyhow!("src_ip: {e}"))?);
             let dst = ip_to_string(p.getDstIp().map_err(|e| anyhow::anyhow!("dst_ip: {e}"))?);
-            let proto = match p.getProtocol() {
+            let proto_id = p.getProtocol().unwrap_or(capnp_schema::Protocol::Tcp);
+            let proto = match proto_id {
                 capnp_schema::Protocol::Tcp => "TCP".cyan(),
                 capnp_schema::Protocol::Udp => "UDP".yellow(),
                 capnp_schema::Protocol::Icmp => "ICMP".red(),
             };
-            let action = match p.getAction() {
+            let act = p.getAction().unwrap_or(capnp_schema::Action::Pass);
+            let action = match act {
                 capnp_schema::Action::Drop => "DROP".red().bold(),
                 capnp_schema::Action::Alert => "ALERT".yellow().bold(),
                 _ => "PASS".green(),
@@ -345,16 +363,15 @@ fn format_event_capnp(data: &[u8]) -> Result<String> {
         }
         Which::Alert(a) => {
             let alert = a.map_err(|e| anyhow::anyhow!("alert read failed: {e}"))?;
+            let sig = alert
+                .getSignatureName()
+                .map(|s| s.to_str().unwrap_or("").to_string())
+                .unwrap_or_default();
             Ok(format!(
                 "{} rule={} {}",
                 "ALERT".red().bold(),
                 alert.getRuleId(),
-                alert
-                    .getSignatureName()
-.ok()
-                    .map(|s| s.to_string())
-                    .unwrap_or_default()
-                    .white()
+                sig.white()
             ))
         }
         _ => Ok("unknown event".into()),

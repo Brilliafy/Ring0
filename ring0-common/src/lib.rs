@@ -1,3 +1,5 @@
+#![allow(overflowing_literals, non_snake_case)]
+
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/event_capnp.rs"));
 }

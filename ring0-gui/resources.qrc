@@ -1,0 +1,11 @@
+<RCC>
+    <qresource prefix="/">
+        <file>qml/main.qml</file>
+        <file>qml/components/ConnectionPrompt.qml</file>
+        <file>qml/components/EventLogTable.qml</file>
+        <file>qml/components/LiveTrafficChart.qml</file>
+        <file>qml/components/MitreMatrix.qml</file>
+        <file>qml/components/ProcessTree.qml</file>
+        <file>qml/components/Settings.qml</file>
+    </qresource>
+</RCC>

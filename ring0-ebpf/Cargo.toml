@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-aya-ebpf = "0.1"
+aya-ebpf = "0.2"
+aya-ebpf-bindings = "0.2"
 
 [features]
 default = []

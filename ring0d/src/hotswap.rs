@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 const BPFFS_PATH: &str = "/sys/fs/bpf/ring0";
 
@@ -65,7 +65,7 @@ impl HotswapManager {
     }
 }
 
-fn bpf_pin_map(fd: i32, path: &str) -> Result<()> {
+fn bpf_pin_map(fd: i32, _path: &str) -> Result<()> {
     use std::os::unix::io::FromRawFd;
     if fd < 0 {
         return Ok(());

@@ -3,8 +3,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
+#[derive(Debug, Clone)]
 pub struct QosPolicy {
     pub pid: u32,
     pub rate_limit_bps: u64,
