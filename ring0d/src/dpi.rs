@@ -17,26 +17,126 @@ pub struct Signature {
 
 /// Built-in NIDS/DPI signature set (hyperscan regexes).
 const SIGNATURES: &[Signature] = &[
-    Signature { rule_id: 5001, name: "ET WEB_SPECIFIC_APPS /bin/sh command execution attempt", pattern: "/bin/sh", severity: 3 },
-    Signature { rule_id: 5002, name: "ET POLICY suspicious cmd.exe execution", pattern: "cmd\\.exe", severity: 2 },
-    Signature { rule_id: 5003, name: "ET WEB_SERVER SQL injection SELECT..FROM", pattern: "(?i)select\\s+.{0,16}from", severity: 3 },
-    Signature { rule_id: 5004, name: "ET WEB_SPECIFIC_APPS PHP webshell eval(base64_decode", pattern: "eval\\s*\\(\\s*base64_decode", severity: 4 },
-    Signature { rule_id: 5005, name: "ET SCAN sqlmap user-agent", pattern: "(?i)user-agent:.*sqlmap", severity: 2 },
-    Signature { rule_id: 5006, name: "ET SCAN Nikto user-agent", pattern: "(?i)user-agent:.*nikto", severity: 2 },
-    Signature { rule_id: 5007, name: "ET SCAN Nmap scripted scan", pattern: "(?i)user-agent:.*nmap", severity: 2 },
-    Signature { rule_id: 5008, name: "ET INFO /etc/passwd access attempt", pattern: "/etc/passwd", severity: 2 },
-    Signature { rule_id: 5009, name: "ET INFO /etc/shadow access attempt", pattern: "/etc/shadow", severity: 3 },
-    Signature { rule_id: 5010, name: "ET POLICY powershell encoded command", pattern: "(?i)powershell.{0,32}-e", severity: 3 },
-    Signature { rule_id: 5011, name: "ET TROJAN suspicious wget -O", pattern: "(?i)wget.{0,24}-O", severity: 2 },
-    Signature { rule_id: 5012, name: "ET TROJAN suspicious curl -o", pattern: "(?i)curl.{0,24}-o", severity: 2 },
-    Signature { rule_id: 5013, name: "ET TROJAN Cobalt Strike beacon", pattern: "(?i)(MZ|beacon)", severity: 4 },
-    Signature { rule_id: 5014, name: "ET MALWARE webshell one-liner", pattern: "(?i)(assert|system|exec)\\(\\$_", severity: 4 },
-    Signature { rule_id: 5015, name: "ET WEB_SERVER PHP code injection", pattern: "\\$_GET.{0,32}exec", severity: 4 },
-    Signature { rule_id: 5016, name: "ET SHELLCODE x86 NOP sled", pattern: "\\x90{8,}", severity: 3 },
-    Signature { rule_id: 5017, name: "ET MALWARE UPX packed binary", pattern: "UPX!", severity: 2 },
-    Signature { rule_id: 5018, name: "ET MALWARE Mimikatz strings", pattern: "(?i)mimikatz", severity: 4 },
-    Signature { rule_id: 5019, name: "ET TROJAN C2 check-in", pattern: "(?i)(POST|GET).{0,32}(/api/|/c2/)", severity: 2 },
-    Signature { rule_id: 5020, name: "ET TROJAN TOR bridge connection", pattern: "(?i)bridgedb|torproject", severity: 2 },
+    Signature {
+        rule_id: 5001,
+        name: "ET WEB_SPECIFIC_APPS /bin/sh command execution attempt",
+        pattern: "/bin/sh",
+        severity: 3,
+    },
+    Signature {
+        rule_id: 5002,
+        name: "ET POLICY suspicious cmd.exe execution",
+        pattern: "cmd\\.exe",
+        severity: 2,
+    },
+    Signature {
+        rule_id: 5003,
+        name: "ET WEB_SERVER SQL injection SELECT..FROM",
+        pattern: "(?i)select\\s+.{0,16}from",
+        severity: 3,
+    },
+    Signature {
+        rule_id: 5004,
+        name: "ET WEB_SPECIFIC_APPS PHP webshell eval(base64_decode",
+        pattern: "eval\\s*\\(\\s*base64_decode",
+        severity: 4,
+    },
+    Signature {
+        rule_id: 5005,
+        name: "ET SCAN sqlmap user-agent",
+        pattern: "(?i)user-agent:.*sqlmap",
+        severity: 2,
+    },
+    Signature {
+        rule_id: 5006,
+        name: "ET SCAN Nikto user-agent",
+        pattern: "(?i)user-agent:.*nikto",
+        severity: 2,
+    },
+    Signature {
+        rule_id: 5007,
+        name: "ET SCAN Nmap scripted scan",
+        pattern: "(?i)user-agent:.*nmap",
+        severity: 2,
+    },
+    Signature {
+        rule_id: 5008,
+        name: "ET INFO /etc/passwd access attempt",
+        pattern: "/etc/passwd",
+        severity: 2,
+    },
+    Signature {
+        rule_id: 5009,
+        name: "ET INFO /etc/shadow access attempt",
+        pattern: "/etc/shadow",
+        severity: 3,
+    },
+    Signature {
+        rule_id: 5010,
+        name: "ET POLICY powershell encoded command",
+        pattern: "(?i)powershell.{0,32}-e",
+        severity: 3,
+    },
+    Signature {
+        rule_id: 5011,
+        name: "ET TROJAN suspicious wget -O",
+        pattern: "(?i)wget.{0,24}-O",
+        severity: 2,
+    },
+    Signature {
+        rule_id: 5012,
+        name: "ET TROJAN suspicious curl -o",
+        pattern: "(?i)curl.{0,24}-o",
+        severity: 2,
+    },
+    Signature {
+        rule_id: 5013,
+        name: "ET TROJAN Cobalt Strike beacon",
+        pattern: "(?i)(MZ|beacon)",
+        severity: 4,
+    },
+    Signature {
+        rule_id: 5014,
+        name: "ET MALWARE webshell one-liner",
+        pattern: "(?i)(assert|system|exec)\\(\\$_",
+        severity: 4,
+    },
+    Signature {
+        rule_id: 5015,
+        name: "ET WEB_SERVER PHP code injection",
+        pattern: "\\$_GET.{0,32}exec",
+        severity: 4,
+    },
+    Signature {
+        rule_id: 5016,
+        name: "ET SHELLCODE x86 NOP sled",
+        pattern: "\\x90{8,}",
+        severity: 3,
+    },
+    Signature {
+        rule_id: 5017,
+        name: "ET MALWARE UPX packed binary",
+        pattern: "UPX!",
+        severity: 2,
+    },
+    Signature {
+        rule_id: 5018,
+        name: "ET MALWARE Mimikatz strings",
+        pattern: "(?i)mimikatz",
+        severity: 4,
+    },
+    Signature {
+        rule_id: 5019,
+        name: "ET TROJAN C2 check-in",
+        pattern: "(?i)(POST|GET).{0,32}(/api/|/c2/)",
+        severity: 2,
+    },
+    Signature {
+        rule_id: 5020,
+        name: "ET TROJAN TOR bridge connection",
+        pattern: "(?i)bridgedb|torproject",
+        severity: 2,
+    },
 ];
 
 pub struct DpiEngine {
@@ -90,6 +190,8 @@ impl DpiEngine {
 
 impl Default for DpiEngine {
     fn default() -> Self {
-        Self::new().unwrap_or_else(|_| Self { regexes: Vec::new() })
+        Self::new().unwrap_or_else(|_| Self {
+            regexes: Vec::new(),
+        })
     }
 }

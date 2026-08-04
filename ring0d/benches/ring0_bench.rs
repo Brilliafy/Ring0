@@ -1,35 +1,48 @@
-use ring0d::{dpi, process};
-use std::net::IpAddr;
+//! Benchmarks for ring0's hot paths.
+//!
+//! NOTE: `ring0d` is a binary-only crate, so benches cannot import its internal
+//! modules. Only benchmarks that exercise library crates (ring0-common) or
+//! standalone logic live here.
 
 #[divan::bench]
-fn bench_dpi_scan_sqli() -> Vec<dpi::DpiMatch> {
-    let engine = dpi::DpiEngine::new().expect("DPI engine init");
-    let payload = b"SELECT * FROM users WHERE id=1 OR '1'='1' UNION SELECT password FROM admins";
-    engine.scan_payload(payload)
-}
-
-#[divan::bench]
-fn bench_process_resolve() -> Option<process::ProcessInfo> {
-    process::ProcessResolver::resolve_for_socket(
-        443,
-        IpAddr::V4(std::net::Ipv4Addr::new(142, 250, 80, 142)),
-        80,
-    )
-}
-
-#[divan::bench]
-fn bench_capnp_serialize(b: &mut divan::Bencher) {
-    use ring0_common::event_capnp as capnp_schema;
+fn bench_capnp_serialize(b: divan::Bencher) {
+    use ring0_common::proto as capnp_schema;
 
     b.bench_local(|| {
         let mut msg = capnp::message::Builder::new_default();
-        let mut evt = msg.init_root::<capnp_schema::PacketEvent::Builder>();
+        let mut evt = msg.init_root::<capnp_schema::packet_event::Builder>();
         evt.setTimestamp(1_000_000_000);
         evt.setSrcPort(443);
         evt.setDstPort(80);
         let mut buf = Vec::new();
         capnp::serialize::write_message(&mut buf, &msg).expect("capnp serialize");
         buf
+    });
+}
+
+#[divan::bench]
+fn bench_capnp_deserialize(b: divan::Bencher) {
+    use ring0_common::proto as capnp_schema;
+
+    let mut msg = capnp::message::Builder::new_default();
+    let mut evt = msg.init_root::<capnp_schema::packet_event::Builder>();
+    evt.setTimestamp(1_000_000_000);
+    evt.setSrcPort(443);
+    evt.setDstPort(80);
+    let mut buf = Vec::new();
+    capnp::serialize::write_message(&mut buf, &msg).expect("capnp serialize");
+
+    b.bench_local(|| {
+        let mut bytes = &buf[..];
+        let reader = capnp::serialize::read_message_from_flat_slice(
+            &mut bytes,
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("capnp deserialize");
+        let evt = reader
+            .get_root::<capnp_schema::packet_event::Reader>()
+            .expect("capnp root");
+        let _ = (evt.getTimestamp(), evt.getSrcPort(), evt.getDstPort());
     });
 }
 

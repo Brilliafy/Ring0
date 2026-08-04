@@ -347,6 +347,9 @@ ApplicationWindow {
     }
 
     function intToIp(v) {
+        if (typeof v === "string") {
+            return v
+        }
         return ((v >>> 24) & 0xFF) + "." + ((v >>> 16) & 0xFF) + "." + ((v >>> 8) & 0xFF) + "." + (v & 0xFF)
     }
 
@@ -371,13 +374,7 @@ ApplicationWindow {
                 timeoutSecs: evt.timeoutSecs || 15
             })
             promptWindow.decisionMade.connect(function(promptId, action, scope) {
-                var msg = capnp.newMessage()
-                var cmd = msg.initRoot("daemonCommand")
-                var pd = cmd.initSubmitPromptDecision()
-                pd.setPromptId(promptId)
-                pd.setAction(action)
-                pd.setScope(scope)
-                sendCommand(msg)
+                bridge.submitPromptDecision(promptId, action, scope)
             })
             promptWindow.show()
         } else {

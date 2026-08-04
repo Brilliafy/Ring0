@@ -150,12 +150,9 @@ impl RuleEngine {
             if glob::Pattern::new(&glob_pattern)
                 .map(|p| p.matches(file_path))
                 .unwrap_or(false)
+                && (!rule.read_only || write_flag)
             {
-                if rule.read_only && write_flag {
-                    alerts.push(rule.id);
-                } else if !rule.read_only {
-                    alerts.push(rule.id);
-                }
+                alerts.push(rule.id);
             }
         }
         alerts

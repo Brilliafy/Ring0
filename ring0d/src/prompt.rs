@@ -252,9 +252,15 @@ impl PromptEngine {
         for id in timed_out {
             if let Some(prompt) = pending.remove(&id) {
                 info!(
-                    "PromptEngine: prompt {id} timed out after {}s — default deny for {}:{}",
-                    prompt.timeout_secs, prompt.dst_ip, prompt.dst_port,
+                    "PromptEngine: prompt {id} timed out after {}s — default deny for {}:{} ({})",
+                    prompt.timeout_secs, prompt.dst_ip, prompt.dst_port, prompt.binary_path,
                 );
+                // Enforce the documented "default deny": block the destination IP
+                // so the untrusted binary can no longer reach it.
+                let cmd = DaemonCmd::BlockIp(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                    prompt.dst_ip,
+                )));
+                let _ = self.cmd_tx.send(cmd);
             }
         }
     }

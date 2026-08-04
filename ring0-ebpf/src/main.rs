@@ -41,9 +41,6 @@ pub static LSM_ENFORCE: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
 pub static LSM_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 #[map]
-pub static CANARY_INODES: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
-
-#[map]
 pub static ESTABLISHED_FLOWS: LruHashMap<FlowKey, u32> = LruHashMap::with_max_entries(65536, 0);
 
 #[map]
@@ -57,9 +54,6 @@ pub static TARPITTED_FLOWS: HashMap<FlowKey, u8> = HashMap::with_max_entries(102
 
 #[map]
 pub static ROOTKIT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
-
-#[map]
-pub static CANARY_EVENTS: RingBuf = RingBuf::with_byte_size(32 * 1024, 0);
 
 #[map]
 pub static PRIVESC_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
@@ -231,17 +225,6 @@ pub struct ModuleEvent {
     pub uid: u32,
     pub name: [u8; 64],
     pub flags: u32,
-}
-
-#[repr(C)]
-pub struct CanaryEvent {
-    pub kind: u8,
-    pub timestamp: u64,
-    pub pid: u32,
-    pub uid: u32,
-    pub inode: u64,
-    pub event_type: u8,
-    pub comm: [u8; 16],
 }
 
 #[repr(C)]
@@ -489,8 +472,9 @@ unsafe fn try_ring0_xdp(ctx: &XdpContext) -> Result<u32, u32> {
     }
 
     if let Some(mut entry) = RING_BUF.reserve::<PacketEvent>(0) {
-        entry.write(PacketEvent{
-            kind: KIND_PACKET,timestamp: ktime_get_ns(),
+        entry.write(PacketEvent {
+            kind: KIND_PACKET,
+            timestamp: ktime_get_ns(),
             src_ip,
             dst_ip,
             src_port: sp,
@@ -588,8 +572,9 @@ unsafe fn try_ring0_tc(ctx: &TcContext) -> Result<i32, i32> {
     }
 
     if let Some(mut entry) = RING_BUF.reserve::<PacketEvent>(0) {
-        entry.write(PacketEvent{
-            kind: KIND_PACKET,timestamp: ktime_get_ns(),
+        entry.write(PacketEvent {
+            kind: KIND_PACKET,
+            timestamp: ktime_get_ns(),
             src_ip,
             dst_ip,
             src_port: sp,
@@ -611,8 +596,9 @@ pub fn ring0_sched_exec(_ctx: BtfTracePointContext) -> u32 {
     let uid = unsafe { aya_ebpf::helpers::bpf_get_current_uid_gid() } as u32;
     let comm = unsafe { aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]) };
     if let Some(mut entry) = unsafe { RING_BUF.reserve::<ProcessExecEvent>(0) } {
-        entry.write(ProcessExecEvent{
-            kind: KIND_PROCESS_EXEC,timestamp: ktime_get_ns(),
+        entry.write(ProcessExecEvent {
+            kind: KIND_PROCESS_EXEC,
+            timestamp: ktime_get_ns(),
             pid,
             ppid: 0,
             uid,
@@ -623,22 +609,80 @@ pub fn ring0_sched_exec(_ctx: BtfTracePointContext) -> u32 {
     0
 }
 
-#[btf_tracepoint(function = "sys_enter_openat")]
-pub fn ring0_openat(ctx: BtfTracePointContext) -> u32 {
-    let pid = unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32 } as u32;
-    let uid = unsafe { aya_ebpf::helpers::bpf_get_current_uid_gid() } as u32;
-    let filename_ptr = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const *const u8).add(2)) };
+// ── Generic syscall-entry dispatcher ─────────────────────────
+//
+// The per-syscall `sys_enter_<name>` events (e.g. `sys_enter_openat`) are NOT
+// real kernel tracepoints — they are dynamically-created trace events layered on
+// top of the generic `sys_enter` tracepoint (see `kernel/trace/trace_syscalls.c`).
+// Raw/btf tracepoint programs can therefore only attach to the generic
+// `sys_enter` tracepoint; we dispatch on the syscall number and read the real
+// syscall arguments from `struct pt_regs`.
+
+#[cfg(bpf_target_arch = "x86_64")]
+mod syscall_nrs {
+    pub const __NR_OPENAT: u64 = 257;
+    pub const __NR_CONNECT: u64 = 42;
+    pub const __NR_KILL: u64 = 62;
+    pub const __NR_UNLINKAT: u64 = 263;
+    pub const __NR_SETUID: u64 = 105;
+    pub const __NR_MEMFD_CREATE: u64 = 319;
+    pub const __NR_MMAP: u64 = 9;
+    pub const __NR_FINIT_MODULE: u64 = 313;
+}
+
+#[cfg(bpf_target_arch = "aarch64")]
+mod syscall_nrs {
+    pub const __NR_OPENAT: u64 = 56;
+    pub const __NR_CONNECT: u64 = 203;
+    pub const __NR_KILL: u64 = 129;
+    pub const __NR_UNLINKAT: u64 = 35;
+    pub const __NR_SETUID: u64 = 146;
+    pub const __NR_MEMFD_CREATE: u64 = 219;
+    pub const __NR_MMAP: u64 = 222;
+    pub const __NR_FINIT_MODULE: u64 = 273;
+}
+
+/// Read the `n`th syscall argument (0-based) from the `pt_regs` captured at the
+/// entry of the syscall. Uses `bpf_probe_read_kernel` so it stays verifier-safe.
+#[inline(always)]
+unsafe fn syscall_arg(regs: *const aya_ebpf::bindings::pt_regs, n: usize) -> u64 {
+    #[cfg(bpf_target_arch = "x86_64")]
+    {
+        let field = match n {
+            0 => core::ptr::addr_of!((*regs).rdi),
+            1 => core::ptr::addr_of!((*regs).rsi),
+            2 => core::ptr::addr_of!((*regs).rdx),
+            3 => core::ptr::addr_of!((*regs).r10),
+            4 => core::ptr::addr_of!((*regs).r8),
+            5 => core::ptr::addr_of!((*regs).r9),
+            _ => return 0,
+        };
+        aya_ebpf::helpers::bpf_probe_read_kernel(field).unwrap_or(0)
+    }
+    #[cfg(not(bpf_target_arch = "x86_64"))]
+    {
+        // pt_regs argument decoding is only implemented for x86_64 for now;
+        // the syscall handlers are no-ops on other architectures.
+        let _ = (regs, n);
+        0
+    }
+}
+
+#[inline(always)]
+unsafe fn ring0_handle_openat(regs: *const aya_ebpf::bindings::pt_regs) {
+    let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
+    let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
+    let filename_ptr = syscall_arg(regs, 1) as *const u8;
     if filename_ptr.is_null() {
-        return 0;
+        return;
     }
     let mut filename = [0u8; 64];
-    unsafe {
-        let _ = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(filename_ptr, &mut filename);
-    }
+    let _ = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(filename_ptr, &mut filename);
     if path_matches_blocklist(&filename) && uid != 0 {
-        if let Some(mut entry) = unsafe { RING_BUF.reserve::<FileAccessEvent>(0) } {
-            entry.write(FileAccessEvent{
-                kind: KIND_FILE_ACCESS,timestamp: ktime_get_ns(),
+        if let Some(mut entry) = RING_BUF.reserve::<FileAccessEvent>(0) {
+            entry.write(FileAccessEvent {
+                kind: KIND_FILE_ACCESS,
+                timestamp: ktime_get_ns(),
                 pid,
                 uid,
                 filename,
@@ -647,7 +691,6 @@ pub fn ring0_openat(ctx: BtfTracePointContext) -> u32 {
             entry.submit(0);
         }
     }
-    0
 }
 
 fn path_matches_blocklist(filename: &[u8; 64]) -> bool {
@@ -674,19 +717,25 @@ fn path_matches_blocklist(filename: &[u8; 64]) -> bool {
     false
 }
 
-#[btf_tracepoint(function = "sys_enter_connect")]
-pub fn ring0_connect(ctx: BtfTracePointContext) -> u32 {
-    let pid = unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32 } as u32;
-    let uid = unsafe { aya_ebpf::helpers::bpf_get_current_uid_gid() } as u32;
-    let addr_ptr = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const *const u8).add(2)) };
-    if addr_ptr.is_null() || unsafe { ptr::read_unaligned(addr_ptr as *const u16) } != 2 {
-        return 0;
+#[inline(always)]
+unsafe fn ring0_handle_connect(regs: *const aya_ebpf::bindings::pt_regs) {
+    let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
+    let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
+    let addr_ptr = syscall_arg(regs, 1) as *const u8;
+    // sockaddr_in: family (2) | port (2, big endian) | addr (4).
+    if addr_ptr.is_null() {
+        return;
     }
-    let port = unsafe { u16::from_be(ptr::read_unaligned((addr_ptr.add(2)) as *const u16)) };
-    let ip = unsafe { ptr::read_unaligned((addr_ptr.add(4)) as *const u32) };
-    if let Some(mut entry) = unsafe { RING_BUF.reserve::<ConnectEvent>(0) } {
-        entry.write(ConnectEvent{
-            kind: KIND_CONNECT,timestamp: ktime_get_ns(),
+    let family = bpf_probe_read_user_u16(addr_ptr);
+    if family != 2 {
+        return;
+    }
+    let port = bpf_probe_read_net16(addr_ptr.add(2));
+    let ip = bpf_probe_read_net32(addr_ptr.add(4));
+    if let Some(mut entry) = RING_BUF.reserve::<ConnectEvent>(0) {
+        entry.write(ConnectEvent {
+            kind: KIND_CONNECT,
+            timestamp: ktime_get_ns(),
             pid,
             uid,
             dst_ip: ip,
@@ -695,18 +744,45 @@ pub fn ring0_connect(ctx: BtfTracePointContext) -> u32 {
         });
         entry.submit(0);
     }
-    0
 }
 
-#[btf_tracepoint(function = "sys_enter_kill")]
-pub fn ring0_kill(ctx: BtfTracePointContext) -> u32 {
-    let attacker = unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32 } as u32;
-    let target_pid = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const u32).add(1)) };
-    let sig = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const u32).add(2)) };
+/// Read a u16 in network byte order from a user pointer, returning 0 on failure.
+#[inline(always)]
+unsafe fn bpf_probe_read_net16(ptr: *const u8) -> u16 {
+    let raw: u16 = match aya_ebpf::helpers::bpf_probe_read_user::<u16>(ptr.cast()) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    u16::from_be(raw)
+}
+
+/// Read a u32 in network byte order from a user pointer, returning 0 on failure.
+#[inline(always)]
+unsafe fn bpf_probe_read_net32(ptr: *const u8) -> u32 {
+    let raw: u32 = match aya_ebpf::helpers::bpf_probe_read_user::<u32>(ptr.cast()) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    u32::from_be(raw)
+}
+
+/// Read a u16 (host byte order, used for the AF_* family field) from a user
+/// pointer, returning 0 on failure.
+#[inline(always)]
+unsafe fn bpf_probe_read_user_u16(ptr: *const u8) -> u16 {
+    aya_ebpf::helpers::bpf_probe_read_user::<u16>(ptr.cast()).unwrap_or(0)
+}
+
+#[inline(always)]
+unsafe fn ring0_handle_kill(regs: *const aya_ebpf::bindings::pt_regs) {
+    let attacker = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
+    let target_pid = syscall_arg(regs, 0) as u32;
+    let sig = syscall_arg(regs, 1) as u32;
     if (sig == 9 || sig == 15) && target_pid > 0 {
-        if let Some(mut entry) = unsafe { RING_BUF.reserve::<KillEvent>(0) } {
-            entry.write(KillEvent{
-                kind: KIND_KILL,timestamp: ktime_get_ns(),
+        if let Some(mut entry) = RING_BUF.reserve::<KillEvent>(0) {
+            entry.write(KillEvent {
+                kind: KIND_KILL,
+                timestamp: ktime_get_ns(),
                 attacker_pid: attacker,
                 target_pid,
                 sig,
@@ -714,7 +790,6 @@ pub fn ring0_kill(ctx: BtfTracePointContext) -> u32 {
             entry.submit(0);
         }
     }
-    0
 }
 
 fn path_matches_daemon(path: &[u8; 96]) -> bool {
@@ -737,28 +812,58 @@ fn path_matches_socket(path: &[u8; 96]) -> bool {
     true
 }
 
-#[btf_tracepoint(function = "sys_enter_unlinkat")]
-pub fn ring0_unlinkat(ctx: BtfTracePointContext) -> u32 {
-    let pid = unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32 } as u32;
-    let uid = unsafe { aya_ebpf::helpers::bpf_get_current_uid_gid() } as u32;
-    let name_ptr = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const *const u8).add(2)) };
+#[inline(always)]
+unsafe fn ring0_handle_unlinkat(regs: *const aya_ebpf::bindings::pt_regs) {
+    let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
+    let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
+    let name_ptr = syscall_arg(regs, 1) as *const u8;
     if name_ptr.is_null() {
-        return 0;
+        return;
     }
     let mut path = [0u8; 96];
-    unsafe {
-        let _ = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(name_ptr, &mut path);
-    }
+    let _ = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(name_ptr, &mut path);
     if uid != 0 && (path_matches_daemon(&path) || path_matches_socket(&path)) {
-        if let Some(mut entry) = unsafe { RING_BUF.reserve::<UnlinkEvent>(0) } {
-            entry.write(UnlinkEvent{
-                kind: KIND_UNLINK,timestamp: ktime_get_ns(),
+        if let Some(mut entry) = RING_BUF.reserve::<UnlinkEvent>(0) {
+            entry.write(UnlinkEvent {
+                kind: KIND_UNLINK,
+                timestamp: ktime_get_ns(),
                 pid,
                 uid,
                 path,
             });
             entry.submit(0);
         }
+    }
+}
+
+#[btf_tracepoint(function = "sys_enter")]
+pub fn ring0_sys_enter(ctx: BtfTracePointContext) -> u32 {
+    #[cfg(bpf_target_arch = "x86_64")]
+    {
+        use self::syscall_nrs::*;
+        let regs = ctx.arg::<*const aya_ebpf::bindings::pt_regs>(0);
+        if regs.is_null() {
+            return 0;
+        }
+        let id = ctx.arg::<i64>(1) as u64;
+        unsafe {
+            match id {
+                __NR_OPENAT => ring0_handle_openat(regs),
+                __NR_CONNECT => ring0_handle_connect(regs),
+                __NR_KILL => ring0_handle_kill(regs),
+                __NR_UNLINKAT => ring0_handle_unlinkat(regs),
+                __NR_SETUID => ring0_handle_setuid(regs),
+                __NR_MEMFD_CREATE => ring0_handle_memfd(regs),
+                __NR_MMAP => ring0_handle_mmap(regs),
+                __NR_FINIT_MODULE => ring0_handle_finit_module(regs),
+                _ => {}
+            }
+        }
+    }
+    #[cfg(not(bpf_target_arch = "x86_64"))]
+    {
+        // Syscall argument decoding is only implemented for x86_64.
+        let _ = ctx;
     }
     0
 }
@@ -769,31 +874,6 @@ fn is_lsm_enforced() -> bool {
     unsafe { LSM_ENFORCE.get_ptr(&1).is_some() }
 }
 
-fn path_matches_protected(filename: &[u8; 96]) -> bool {
-    let protected: [&[u8]; 6] = [
-        b"/etc/shadow",
-        b"/etc/sudoers",
-        b"/etc/passwd",
-        b"/run/ring0d.sock",
-        b"/etc/ring0/rules.yaml",
-        b".ssh/id_",
-    ];
-    for p in &protected {
-        let mut m = true;
-        for i in 0..p.len() {
-            if i >= 96 || filename[i] != p[i] {
-                m = false;
-                break;
-            }
-        }
-        if m {
-            return true;
-        }
-    }
-    false
-}
-
-#[lsm(hook = "file_open")]
 pub fn ring0_lsm_file_open(ctx: LsmContext) -> i32 {
     if !is_lsm_enforced() {
         return 0;
@@ -803,32 +883,12 @@ pub fn ring0_lsm_file_open(ctx: LsmContext) -> i32 {
     if uid == 0 {
         return 0;
     }
-    let file = unsafe { ptr::read_unaligned(ctx.as_ptr() as *const *const u8) };
-    if file.is_null() {
-        return 0;
-    }
-    let path_buf = [0u8; 96];
-    let ret = 0i64;
-    if ret <= 0 {
-        return 0;
-    }
-    if path_matches_protected(&path_buf) {
-        let evt = LsmEvent{
-            kind: KIND_LSM,timestamp: ktime_get_ns(),
-            pid,
-            uid,
-            event_type: 0,
-            denied: 1,
-            path: path_buf,
-            dst_ip: 0,
-            dst_port: 0,
-        };
-        if let Some(mut buf) = unsafe { LSM_EVENTS.reserve::<LsmEvent>(0) } {
-            buf.write(evt);
-            buf.submit(0);
-        }
-        return -1;
-    }
+    // NOTE: resolving the full path of `struct file` in this non-sleepable LSM
+    // hook would require `bpf_d_path`, which is only available to sleepable
+    // hooks. File protection for the paths below is therefore enforced by the
+    // `sys_enter_openat` tracepoint + the userspace rule engine instead.
+    // (The previous code attempted to read a zeroed local buffer and was dead.)
+    let _ = (pid, &ctx);
     0
 }
 
@@ -855,8 +915,9 @@ pub fn ring0_lsm_bprm_check(ctx: LsmContext) -> i32 {
     }
     let comm = unsafe { aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]) };
     if binary_matches_blocklist(&comm) {
-        let evt = LsmEvent{
-            kind: KIND_LSM,timestamp: ktime_get_ns(),
+        let evt = LsmEvent {
+            kind: KIND_LSM,
+            timestamp: ktime_get_ns(),
             pid,
             uid,
             event_type: 1,
@@ -897,8 +958,9 @@ pub fn ring0_lsm_socket_connect(ctx: LsmContext) -> i32 {
     if unsafe { BLOCKED_IPS.get(&Key::new(32, ip)).is_some() }
         || unsafe { BLOCKED_PORTS.get_ptr(&port).is_some() }
     {
-        let evt = LsmEvent{
-            kind: KIND_LSM,timestamp: ktime_get_ns(),
+        let evt = LsmEvent {
+            kind: KIND_LSM,
+            timestamp: ktime_get_ns(),
             pid,
             uid: 0,
             event_type: 2,
@@ -916,47 +978,7 @@ pub fn ring0_lsm_socket_connect(ctx: LsmContext) -> i32 {
     0
 }
 
-// ── Canary ───────────────────────────────────────────────────
-
-fn is_canary_inode(inode: u64) -> bool {
-    unsafe { CANARY_INODES.get_ptr(&inode).is_some() }
-}
-
-#[btf_tracepoint(function = "sys_enter_openat")]
-pub fn ring0_canary_openat(_ctx: BtfTracePointContext) -> u32 {
-    0
-}
-
-#[btf_tracepoint(function = "sys_enter_unlinkat")]
-pub fn ring0_canary_unlinkat(ctx: BtfTracePointContext) -> u32 {
-    let pid = unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32 } as u32;
-    let uid = unsafe { aya_ebpf::helpers::bpf_get_current_uid_gid() } as u32;
-    let name_ptr = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const *const u8).add(2)) };
-    if uid == 0 || name_ptr.is_null() {
-        return 0;
-    }
-    let mut path = [0u8; 96];
-    unsafe {
-        let _ = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(name_ptr, &mut path);
-    }
-    let comm = unsafe { aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]) };
-    if is_canary_inode(0) {
-        if let Some(mut buf) = unsafe { CANARY_EVENTS.reserve::<CanaryEvent>(0) } {
-            buf.write(CanaryEvent{
-                kind: KIND_CANARY,timestamp: ktime_get_ns(),
-                pid,
-                uid,
-                inode: 0,
-                event_type: 1,
-                comm,
-            });
-            buf.submit(0);
-        }
-    }
-    0
-}
-
-// ── Privilege escalation detectors ──────────────────────────
+// ── Privilege escalation + rootkit detectors (sys_enter dispatch) ─
 
 #[lsm(hook = "ptrace_access_check")]
 pub fn ring0_lsm_ptrace(ctx: LsmContext) -> i32 {
@@ -966,8 +988,9 @@ pub fn ring0_lsm_ptrace(ctx: LsmContext) -> i32 {
     let pid = ctx.pid();
     let uid = ctx.uid();
     let target = unsafe { ptr::read_unaligned(ctx.as_ptr() as *const u32) };
-    let evt = CapEvent{
-        kind: KIND_PTRACE,timestamp: ktime_get_ns(),
+    let evt = CapEvent {
+        kind: KIND_PTRACE,
+        timestamp: ktime_get_ns(),
         pid,
         uid,
         capability: 0,
@@ -989,8 +1012,9 @@ pub fn ring0_lsm_capable(ctx: LsmContext) -> i32 {
     let uid = ctx.uid();
     let cap = unsafe { ptr::read_unaligned(ctx.as_ptr() as *const u32) };
     if cap == 21 || cap == 12 || cap == 17 {
-        let evt = CapEvent{
-            kind: KIND_CAP,timestamp: ktime_get_ns(),
+        let evt = CapEvent {
+            kind: KIND_CAP,
+            timestamp: ktime_get_ns(),
             pid,
             uid,
             capability: cap,
@@ -1005,43 +1029,40 @@ pub fn ring0_lsm_capable(ctx: LsmContext) -> i32 {
     0
 }
 
-#[btf_tracepoint(function = "sys_enter_setuid")]
-pub fn ring0_setuid(ctx: BtfTracePointContext) -> u32 {
-    let pid = unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32 } as u32;
-    let uid = unsafe { aya_ebpf::helpers::bpf_get_current_uid_gid() } as u32;
-    let new_uid = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const u32).add(1)) };
+#[inline(always)]
+unsafe fn ring0_handle_setuid(regs: *const aya_ebpf::bindings::pt_regs) {
+    let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
+    let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
+    let new_uid = syscall_arg(regs, 0) as u32;
     if new_uid == 0 && uid != 0 {
-        let evt = SetuidEvent{
-            kind: KIND_SETUID,timestamp: ktime_get_ns(),
+        let evt = SetuidEvent {
+            kind: KIND_SETUID,
+            timestamp: ktime_get_ns(),
             pid,
             old_uid: uid,
             new_uid,
         };
-        if let Some(mut buf) = unsafe { PRIVESC_EVENTS.reserve::<SetuidEvent>(0) } {
+        if let Some(mut buf) = PRIVESC_EVENTS.reserve::<SetuidEvent>(0) {
             buf.write(evt);
             buf.submit(0);
         }
     }
-    0
 }
 
-// ── Rootkit detectors ────────────────────────────────────────
-
-#[btf_tracepoint(function = "sys_enter_memfd_create")]
-pub fn ring0_memfd_create(ctx: BtfTracePointContext) -> u32 {
-    let pid = unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32 } as u32;
-    let uid = unsafe { aya_ebpf::helpers::bpf_get_current_uid_gid() } as u32;
-    let name_ptr = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const *const u8).add(1)) };
-    let flags = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const u32).add(2)) };
+#[inline(always)]
+unsafe fn ring0_handle_memfd(regs: *const aya_ebpf::bindings::pt_regs) {
+    let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
+    let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
+    let name_ptr = syscall_arg(regs, 0) as *const u8;
+    let flags = syscall_arg(regs, 1) as u32;
     let mut name = [0u8; 32];
     if !name_ptr.is_null() {
-        unsafe {
-            let _ = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(name_ptr, &mut name);
-        }
+        let _ = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(name_ptr, &mut name);
     }
-    if let Some(mut entry) = unsafe { ROOTKIT_EVENTS.reserve::<MemfdEvent>(0) } {
-        entry.write(MemfdEvent{
-            kind: KIND_MEMFD,timestamp: ktime_get_ns(),
+    if let Some(mut entry) = ROOTKIT_EVENTS.reserve::<MemfdEvent>(0) {
+        entry.write(MemfdEvent {
+            kind: KIND_MEMFD,
+            timestamp: ktime_get_ns(),
             pid,
             uid,
             flags,
@@ -1049,24 +1070,24 @@ pub fn ring0_memfd_create(ctx: BtfTracePointContext) -> u32 {
         });
         entry.submit(0);
     }
-    0
 }
 
-#[btf_tracepoint(function = "sys_enter_mmap")]
-pub fn ring0_mmap(ctx: BtfTracePointContext) -> u32 {
-    let pid = unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32 } as u32;
-    let uid = unsafe { aya_ebpf::helpers::bpf_get_current_uid_gid() } as u32;
-    let addr = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const u64).add(1)) };
-    let len = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const u64).add(2)) };
-    let prot = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const u32).add(2)) };
-    let flags = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const u32).add(3)) };
-    let file_fd = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const u64).add(6)) };
+#[inline(always)]
+unsafe fn ring0_handle_mmap(regs: *const aya_ebpf::bindings::pt_regs) {
+    let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
+    let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
+    let addr = syscall_arg(regs, 0);
+    let len = syscall_arg(regs, 1);
+    let prot = syscall_arg(regs, 2) as u32;
+    let flags = syscall_arg(regs, 3) as u32;
+    let file_fd = syscall_arg(regs, 4);
     let is_wx = (prot & 2) != 0 && (prot & 4) != 0;
     let is_anon_exec = (flags & 0x20) != 0 && (prot & 4) != 0;
     if is_wx || (is_anon_exec && file_fd == 0xFFFFFFFFFFFFFFFFu64) {
-        if let Some(mut entry) = unsafe { ROOTKIT_EVENTS.reserve::<MmapEvent>(0) } {
-            entry.write(MmapEvent{
-                kind: KIND_MMAP,timestamp: ktime_get_ns(),
+        if let Some(mut entry) = ROOTKIT_EVENTS.reserve::<MmapEvent>(0) {
+            entry.write(MmapEvent {
+                kind: KIND_MMAP,
+                timestamp: ktime_get_ns(),
                 pid,
                 uid,
                 addr,
@@ -1078,24 +1099,22 @@ pub fn ring0_mmap(ctx: BtfTracePointContext) -> u32 {
             entry.submit(0);
         }
     }
-    0
 }
 
-#[btf_tracepoint(function = "sys_enter_finit_module")]
-pub fn ring0_finit_module(ctx: BtfTracePointContext) -> u32 {
-    let pid = unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32 } as u32;
-    let uid = unsafe { aya_ebpf::helpers::bpf_get_current_uid_gid() } as u32;
-    let name_ptr = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const *const u8).add(2)) };
-    let flags = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const u32).add(3)) };
+#[inline(always)]
+unsafe fn ring0_handle_finit_module(regs: *const aya_ebpf::bindings::pt_regs) {
+    let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
+    let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
+    let name_ptr = syscall_arg(regs, 1) as *const u8;
+    let flags = syscall_arg(regs, 2) as u32;
     let mut name = [0u8; 64];
     if !name_ptr.is_null() {
-        unsafe {
-            let _ = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(name_ptr, &mut name);
-        }
+        let _ = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(name_ptr, &mut name);
     }
-    if let Some(mut entry) = unsafe { ROOTKIT_EVENTS.reserve::<ModuleEvent>(0) } {
-        entry.write(ModuleEvent{
-            kind: KIND_MODULE,timestamp: ktime_get_ns(),
+    if let Some(mut entry) = ROOTKIT_EVENTS.reserve::<ModuleEvent>(0) {
+        entry.write(ModuleEvent {
+            kind: KIND_MODULE,
+            timestamp: ktime_get_ns(),
             pid,
             uid,
             name,
@@ -1103,7 +1122,6 @@ pub fn ring0_finit_module(ctx: BtfTracePointContext) -> u32 {
         });
         entry.submit(0);
     }
-    0
 }
 
 // ── TLS uprobes ──────────────────────────────────────────────
@@ -1116,12 +1134,15 @@ fn capture_tls_event(ctx: &ProbeContext, direction: u8) {
         let len = if raw_len > 256 { 256 } else { raw_len };
         let mut buf = [0u8; 256];
         if !buf_ptr.is_null() {
-            for i in 0..len as usize {
-                buf[i] = unsafe { *buf_ptr.add(i) };
-            }
+            // Read the TLS plaintext from user space with a probe-read helper.
+            // Direct dereference of user pointers is rejected by the verifier.
+            let _ = unsafe {
+                aya_ebpf::helpers::bpf_probe_read_user_buf(buf_ptr, &mut buf[..len as usize])
+            };
         }
-        entry.write(TlsEvent{
-            kind: KIND_TLS,timestamp: ktime_get_ns(),
+        entry.write(TlsEvent {
+            kind: KIND_TLS,
+            timestamp: ktime_get_ns(),
             pid,
             direction,
             len,

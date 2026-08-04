@@ -29,16 +29,15 @@ fn main() -> Result<()> {
                 eprintln!("building all eBPF progs for {target}");
             }
 
+            let pkg_arg = match name {
+                Some(n) => format!("-p={n}"),
+                None => "-p=ring0-ebpf".to_string(),
+            };
             let status = Command::new("cargo")
-                .args(["build", "-Z", "build-std=core", "--target", &target])
+                .args(["build", "-Z", "build-std=core", "--target", target])
                 .env("CARGO_ENCODED_RUSTFLAGS", "-Cpanic=abort")
                 .env("RUSTUP_TOOLCHAIN", "nightly")
-                .arg(
-                    name.as_ref()
-                        .map(|n| format!("-p={n}"))
-                        .as_deref()
-                        .unwrap_or("-p=ring0-ebpf"),
-                )
+                .arg(pkg_arg)
                 .status()
                 .context("failed to run cargo build for eBPF")?;
 

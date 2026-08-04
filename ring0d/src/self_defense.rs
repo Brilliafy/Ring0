@@ -59,7 +59,7 @@ impl SelfDefense {
             syscall: format!("kill(pid={}, sig={})", target_pid, sig),
             blocked: true,
         };
-        self.events.write().push(evt.clone());
+        self.push_event(evt.clone());
         Some(evt)
     }
 
@@ -75,11 +75,22 @@ impl SelfDefense {
             syscall: format!("unlinkat({})", path),
             blocked: true,
         };
-        self.events.write().push(evt.clone());
+        self.push_event(evt.clone());
         Some(evt)
     }
 
     pub fn recent_events(&self) -> Vec<SelfDefenseEvent> {
         self.events.read().iter().rev().take(50).cloned().collect()
+    }
+
+    /// Push an event into the bounded history buffer.
+    fn push_event(&self, evt: SelfDefenseEvent) {
+        const MAX_EVENTS: usize = 2048;
+        let mut events = self.events.write();
+        if events.len() >= MAX_EVENTS {
+            let excess = events.len() - MAX_EVENTS + 1;
+            events.drain(0..excess);
+        }
+        events.push(evt);
     }
 }

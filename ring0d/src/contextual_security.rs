@@ -47,9 +47,8 @@ impl ContextualSecurity {
             let conn = zbus::Connection::session().await.ok();
             loop {
                 if let Some(conn) = &conn {
-                    match screen_locked_via_dbus(conn).await {
-                        Some(l) => locked.store(l, Ordering::Relaxed),
-                        None => {}
+                    if let Some(l) = screen_locked_via_dbus(conn).await {
+                        locked.store(l, Ordering::Relaxed);
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -119,9 +118,21 @@ impl ContextualSecurity {
 }
 async fn screen_locked_via_dbus(conn: &zbus::Connection) -> Option<bool> {
     for (bus, path, iface) in [
-        ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver"),
-        ("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver"),
-        ("org.kde.screensaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver"),
+        (
+            "org.gnome.ScreenSaver",
+            "/org/gnome/ScreenSaver",
+            "org.gnome.ScreenSaver",
+        ),
+        (
+            "org.freedesktop.ScreenSaver",
+            "/org/freedesktop/ScreenSaver",
+            "org.freedesktop.ScreenSaver",
+        ),
+        (
+            "org.kde.screensaver",
+            "/org/freedesktop/ScreenSaver",
+            "org.freedesktop.ScreenSaver",
+        ),
     ] {
         let Ok(proxy) = zbus::proxy::Proxy::new(conn, bus, path, iface).await else {
             continue;

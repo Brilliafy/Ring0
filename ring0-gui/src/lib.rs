@@ -1,4 +1,7 @@
 #![allow(overflowing_literals)]
+// The bridge methods intentionally use camelCase because they are exported to
+// QML through cxx-qt and QML/JS convention requires it.
+#![allow(non_snake_case)]
 
 pub mod notify;
 
@@ -41,6 +44,14 @@ pub mod qobject {
         fn reloadRules(self: Pin<&mut Ring0Bridge>);
         #[auto_wrap]
         #[qinvokable]
+        fn submitPromptDecision(
+            self: Pin<&mut Ring0Bridge>,
+            promptId: u64,
+            action: QString,
+            scope: QString,
+        );
+        #[auto_wrap]
+        #[qinvokable]
         fn shutdownDaemon(self: Pin<&mut Ring0Bridge>);
         #[auto_wrap]
         #[qinvokable]
@@ -75,7 +86,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use cxx_qt_lib::QString;
 use ring0_common::proto as capnp_schema;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -83,9 +93,12 @@ use tokio::net::UnixStream;
 use crate::notify::{DbusNotifier, Notification};
 
 const MAX_QUEUED_EVENTS: usize = 4096;
+// Reader polling interval used to make the reader thread responsive to
+// disconnects while it is blocked waiting for the next daemon frame.
+const READER_POLL_MS: u64 = 250;
 
 pub struct Ring0BridgeRust {
-    stream: Option<Arc<Mutex<UnixStream>>>,
+    stream: Option<Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>>,
     event_queue: Arc<Mutex<VecDeque<String>>>,
     reader_handle: Option<thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
@@ -150,8 +163,13 @@ impl Ring0BridgeRust {
                 return false;
             }
         };
+        // Split the stream: the reader thread owns the read half and the write
+        // half is shared for commands. (Previously both halves shared one
+        // Mutex<UnixStream>: the reader held the lock across read_exact, so
+        // every send_frame blocked until the next inbound event arrived.)
+        let (read_half, write_half) = stream.into_split();
         drop(rt);
-        let stream = Arc::new(Mutex::new(stream));
+        let stream = Arc::new(Mutex::new(write_half));
         this.stream = Some(stream.clone());
         this.running.store(true, Ordering::Relaxed);
         this.connected.store(true, Ordering::Relaxed);
@@ -163,33 +181,32 @@ impl Ring0BridgeRust {
             .spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async move {
+                    let mut reader = read_half;
                     let mut len_buf = [0u8; 4];
                     loop {
                         if !running.load(Ordering::Relaxed) {
                             break;
                         }
-                        let mut guard = match stream.lock() {
-                            Ok(g) => g,
-                            Err(_) => break,
-                        };
-                        match guard.read_exact(&mut len_buf).await {
-                            Ok(_) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                drop(guard);
-                                tokio::time::sleep(Duration::from_millis(1)).await;
-                                continue;
-                            }
-                            Err(_) => break,
+                        // Poll with a timeout so a disconnect (running=false) is
+                        // observed promptly even while blocked on the socket.
+                        let read = tokio::time::timeout(
+                            Duration::from_millis(READER_POLL_MS),
+                            reader.read_exact(&mut len_buf),
+                        )
+                        .await;
+                        match read {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(_)) => break,
+                            Err(_) => continue,
                         }
                         let msg_len = u32::from_le_bytes(len_buf) as usize;
                         if msg_len == 0 || msg_len > 1 << 20 {
                             break;
                         }
                         let mut msg_buf = vec![0u8; msg_len];
-                        if guard.read_exact(&mut msg_buf).await.is_err() {
+                        if reader.read_exact(&mut msg_buf).await.is_err() {
                             break;
                         }
-                        drop(guard);
                         if let Some(event_json) = deserialize_to_json(&msg_buf) {
                             if let Ok(mut q) = event_queue.lock() {
                                 if q.len() >= MAX_QUEUED_EVENTS {
@@ -199,8 +216,8 @@ impl Ring0BridgeRust {
                             }
                         }
                     }
+                    connected.store(false, Ordering::Relaxed);
                 });
-                connected.store(false, Ordering::Relaxed);
             })
             .unwrap();
         this.reader_handle = Some(handle);
@@ -211,6 +228,8 @@ impl Ring0BridgeRust {
         self.running.store(false, Ordering::Relaxed);
         self.connected.store(false, Ordering::Relaxed);
         if let Some(handle) = self.reader_handle.take() {
+            // The reader polls with a timeout, so it observes running=false
+            // within ~READER_POLL_MS and exits instead of hanging here.
             let _ = handle.join();
         }
         self.stream = None;
@@ -263,6 +282,18 @@ impl Ring0BridgeRust {
         self.send_frame(&frame);
     }
 
+    pub fn submitPromptDecision(
+        self: Pin<&mut Self>,
+        promptId: u64,
+        action: cxx_qt_lib::QString,
+        scope: cxx_qt_lib::QString,
+    ) {
+        let action: String = action.into();
+        let scope: String = scope.into();
+        let frame = build_prompt_decision_frame(promptId, &action, &scope);
+        self.send_frame(&frame);
+    }
+
     pub fn shutdownDaemon(self: Pin<&mut Self>) {
         let frame = build_command_frame(|cmd| cmd.setShutdown(()));
         self.send_frame(&frame);
@@ -280,7 +311,12 @@ impl Ring0BridgeRust {
         self.send_frame(&frame);
     }
 
-    pub fn sendDesktopNotification(self: Pin<&mut Self>, severity: u32, title: cxx_qt_lib::QString, message: cxx_qt_lib::QString) {
+    pub fn sendDesktopNotification(
+        self: Pin<&mut Self>,
+        severity: u32,
+        title: cxx_qt_lib::QString,
+        message: cxx_qt_lib::QString,
+    ) {
         let title: String = title.into();
         let message: String = message.into();
         let notifier = self.get_mut().dbus_notifier.clone();
@@ -386,20 +422,22 @@ fn deserialize_to_json(data: &[u8]) -> Option<String> {
             let mut filters: Vec<String> = Vec::new();
             if let Ok(list) = st.getActiveFilters() {
                 for f in list.iter() {
-                    filters.push(f.ok().and_then(|r| r.to_str().ok()).unwrap_or("").to_string());
+                    filters.push(
+                        f.ok()
+                            .and_then(|r| r.to_str().ok())
+                            .unwrap_or("")
+                            .to_string(),
+                    );
                 }
             }
             serde_json::json!({"type":"status","activeFilters":filters,"cpuUsagePercent":st.getCpuUsagePercent(),"ramUsageBytes":st.getRamUsageBytes(),"eventsPerSec":st.getEventsPerSec(),"blockedDomains":st.getBlockedDomains(),"blockedCidrs":st.getBlockedCidrs(),"blockedPorts":st.getBlockedPorts()})
         }
-        _ => return None,
     };
     Some(json.to_string())
 }
 
 fn text_or(t: Option<capnp::text::Reader<'_>>) -> String {
-    t.and_then(|r| r.to_str().ok())
-        .unwrap_or("")
-        .to_string()
+    t.and_then(|r| r.to_str().ok()).unwrap_or("").to_string()
 }
 
 fn format_ip(which: capnp_schema::ip_addr::WhichReader<'_>) -> String {
@@ -439,6 +477,23 @@ fn build_command_frame(f: impl FnOnce(&mut capnp_schema::daemon_command::Builder
     {
         let mut cmd = message.init_root::<capnp_schema::daemon_command::Builder>();
         f(&mut cmd);
+    }
+    let mut buf = Vec::new();
+    let _ = capnp::serialize::write_message(&mut buf, &message);
+    buf
+}
+
+/// Build a `submitPromptDecision` command frame. This needs an owned builder
+/// because the Cap'n Proto union accessor (`initSubmitPromptDecision`) consumes
+/// the enclosing builder.
+fn build_prompt_decision_frame(prompt_id: u64, action: &str, scope: &str) -> Vec<u8> {
+    let mut message = capnp::message::Builder::new_default();
+    {
+        let cmd = message.init_root::<capnp_schema::daemon_command::Builder>();
+        let mut pd = cmd.initSubmitPromptDecision();
+        pd.setPromptId(prompt_id);
+        pd.setAction(action);
+        pd.setScope(scope);
     }
     let mut buf = Vec::new();
     let _ = capnp::serialize::write_message(&mut buf, &message);

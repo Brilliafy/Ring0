@@ -6,6 +6,7 @@ use parking_lot::RwLock;
 use tracing::{info, warn};
 
 const CPU_CHECK_INTERVAL_SECS: u64 = 2;
+// Thresholds are in percent of a single CPU core used by the daemon.
 const NORMAL_THRESHOLD: f32 = 1.0;
 const ELEVATED_THRESHOLD: f32 = 3.0;
 
@@ -100,13 +101,37 @@ impl CpuGovernor {
     }
 
     fn measure_daemon_cpu(&self) -> f32 {
-        let mut sys = sysinfo::System::new_all();
-        let cpu_kind = sysinfo::CpuRefreshKind::nothing().with_cpu_usage();
-        sys.refresh_cpu_specifics(cpu_kind);
+        // Sample the daemon's own CPU usage from /proc/self/stat (utime+stime
+        // deltas) and return it as a percentage of a single core. The previous
+        // implementation measured *global* system CPU usage and mixed fractions
+        // with the percent thresholds, so the governor could never trigger.
+        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if clk_tck <= 0 {
+            return 0.0;
+        }
+        let clk_tck = clk_tck as f64;
+        let Some((u1, s1)) = Self::proc_self_ticks() else {
+            return 0.0;
+        };
         std::thread::sleep(std::time::Duration::from_millis(100));
-        sys.refresh_cpu_specifics(cpu_kind);
-        let usage = sys.global_cpu_usage() / 100.0;
-        usage
+        let Some((u2, s2)) = Self::proc_self_ticks() else {
+            return 0.0;
+        };
+        let delta = (u2.saturating_sub(u1) + s2.saturating_sub(s1)) as f64 / clk_tck;
+        let pct = delta / 0.1 * 100.0; // percent of one core over the 100ms window
+        pct as f32
+    }
+
+    /// Returns (utime, stime) ticks for the current process from /proc/self/stat.
+    fn proc_self_ticks() -> Option<(u64, u64)> {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        // The comm field (in parentheses) may contain spaces; start after it.
+        let end = stat.rfind(')')?;
+        // Fields after comm: 3=state ... 14=utime 15=stime (1-indexed).
+        let fields: Vec<&str> = stat[end + 1..].split_whitespace().collect();
+        let utime: u64 = fields.get(11)?.parse().ok()?;
+        let stime: u64 = fields.get(12)?.parse().ok()?;
+        Some((utime, stime))
     }
 
     fn measure_bpf_cpu(&self) -> f32 {

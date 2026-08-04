@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -64,6 +65,7 @@ impl IpcServer {
                         let cmd_tx = cmd_tx.clone();
                         let storage = storage.clone();
                         let client_count = client_count.clone();
+                        let peer_uid = peer_euid(&stream);
 
                         tokio::spawn(async move {
                             client_count.fetch_add(1, Ordering::Relaxed);
@@ -116,7 +118,17 @@ impl IpcServer {
                                             let _ = evt_tx_for_read.send(response);
                                         }
                                         Ok(cmd) => {
-                                            if cmd_tx.send(cmd).is_err() {
+                                            // The daemon runs as root; the socket is
+                                            // world-writable so the (unprivileged) GUI/CLI
+                                            // can connect. Destructive commands must be
+                                            // restricted to root callers, otherwise any
+                                            // local process can kill arbitrary processes
+                                            // or shut the daemon down.
+                                            if is_privileged_command(&cmd) && peer_uid != 0 {
+                                                warn!(
+                                                    "denied privileged command {cmd:?} from uid {peer_uid}"
+                                                );
+                                            } else if cmd_tx.send(cmd).is_err() {
                                                 break;
                                             }
                                         }
@@ -161,6 +173,50 @@ impl IpcServer {
         }
         let _ = self.evt_tx.send(data.to_vec());
     }
+}
+
+/// Effective uid of the peer on the other end of a Unix socket.
+fn peer_euid(stream: &tokio::net::UnixStream) -> u32 {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: u32::MAX,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        cred.uid
+    } else {
+        u32::MAX
+    }
+}
+
+/// Commands that can damage the system and are therefore restricted to root
+/// callers (the daemon runs as root; the socket is world-writable so the
+/// unprivileged GUI/CLI can connect for monitoring).
+fn is_privileged_command(cmd: &DaemonCmd) -> bool {
+    use DaemonCmd::*;
+    matches!(
+        cmd,
+        BlockIp(_)
+            | UnblockIp(_)
+            | KillProcess(_)
+            | BlockPort(_)
+            | UnblockPort(_)
+            | ReloadRules
+            | Quarantine(_)
+            | RunRootkitScan
+            | SyncIntelFeeds
+            | Shutdown
+    )
 }
 
 fn parse_command_frame(data: &[u8]) -> Result<DaemonCmd> {
@@ -254,13 +310,24 @@ fn build_query_response(results: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
         let mut alerts = resp.initAlerts(count);
         for (i, (_, v)) in results.iter().enumerate().take(count as usize) {
             let mut alert = alerts.reborrow().get(i as u32);
+            // Alert byte layout: [0..8] timestamp (BE), [8] severity,
+            // [9..13] rule id, [13] message length, [14..] message.
             if v.len() >= 8 {
                 let ts = u64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]);
                 alert.setTimestamp(ts);
             }
-            if v.len() > 8 {
-                alert.setSeverity(capnp_schema::Severity::High);
-                alert.setRuleId(v[8] as u32);
+            if v.len() > 13 {
+                let sev = match v[8] {
+                    1 => capnp_schema::Severity::Low,
+                    2 => capnp_schema::Severity::Med,
+                    3 => capnp_schema::Severity::High,
+                    _ => capnp_schema::Severity::Critical,
+                };
+                alert.setSeverity(sev);
+                alert.setRuleId(u32::from_be_bytes([v[9], v[10], v[11], v[12]]));
+                let ml = v[13] as usize;
+                let msg = String::from_utf8_lossy(&v[14..14 + ml.min(v.len().saturating_sub(14))]);
+                alert.setSignatureName(&msg);
             }
         }
     }

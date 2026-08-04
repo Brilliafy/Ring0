@@ -63,17 +63,32 @@ impl SyncReport {
 }
 
 const DNS_PROVIDERS: &[(&str, &str)] = &[
-    ("stevenblack", "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"),
+    (
+        "stevenblack",
+        "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+    ),
     ("oisd", "https://big.oisd.nl/domainswild2"),
-    ("firebog-tick", "https://v.firebog.net/hosts/lists?type=tick"),
+    (
+        "firebog-tick",
+        "https://v.firebog.net/hosts/lists?type=tick",
+    ),
     ("urlhaus", "https://urlhaus.abuse.ch/downloads/hostfile/"),
 ];
 
 const IP_PROVIDERS: &[(&str, &str)] = &[
-    ("feodo", "https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt"),
-    ("sslbl", "https://sslbl.abuse.ch/blacklist/sslipblacklist.txt"),
+    (
+        "feodo",
+        "https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt",
+    ),
+    (
+        "sslbl",
+        "https://sslbl.abuse.ch/blacklist/sslipblacklist.txt",
+    ),
     ("spamhaus-drop", "https://www.spamhaus.org/drop/drop.txt"),
-    ("et-compromised", "https://rules.emergingthreats.net/blockrules/compromised-ips.txt"),
+    (
+        "et-compromised",
+        "https://rules.emergingthreats.net/blockrules/compromised-ips.txt",
+    ),
 ];
 
 const SURICATA_RULESETS: &[(&str, &str)] = &[(
@@ -113,7 +128,10 @@ fn parse_hosts(text: &str, domains: &mut HashSet<String>) -> usize {
             line
         };
         let domain = candidate.trim_matches('.').to_lowercase();
-        if domain.contains('.') && !domain.chars().any(|c| c.is_whitespace() || c == '/' || c == ':')
+        if domain.contains('.')
+            && !domain
+                .chars()
+                .any(|c| c.is_whitespace() || c == '/' || c == ':')
         {
             domains.insert(registrable_domain(&domain));
             n += 1;
@@ -364,7 +382,8 @@ mod tests {
 
     #[test]
     fn parses_hosts_format() {
-        let text = "# comment\n0.0.0.0 evil.com\n127.0.0.1 tracker.example.org\n0.0.0.0 127.0.0.1\n";
+        let text =
+            "# comment\n0.0.0.0 evil.com\n127.0.0.1 tracker.example.org\n0.0.0.0 127.0.0.1\n";
         let mut domains = HashSet::new();
         parse_hosts(text, &mut domains);
         assert!(domains.contains("evil.com"));
@@ -378,13 +397,19 @@ mod tests {
         let mut cidrs = HashSet::new();
         let mut ports = HashSet::new();
         let mut domains = HashSet::new();
-        assert!(parse_suricata_rule(rule, &mut cidrs, &mut ports, &mut domains));
+        assert!(parse_suricata_rule(
+            rule,
+            &mut cidrs,
+            &mut ports,
+            &mut domains
+        ));
         assert!(domains.contains("malware-c2.example"));
     }
 
     #[test]
     fn parses_suricata_rule_ports() {
-        let rule = "alert tcp $HOME_NET any -> $EXTERNAL_NET 443,8443 (msg:\"test\"; sid:1; rev:1;)";
+        let rule =
+            "alert tcp $HOME_NET any -> $EXTERNAL_NET 443,8443 (msg:\"test\"; sid:1; rev:1;)";
         let mut cidrs = HashSet::new();
         let mut ports = HashSet::new();
         let mut domains = HashSet::new();

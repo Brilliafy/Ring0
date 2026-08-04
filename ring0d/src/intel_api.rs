@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
 const NEXDNS_API: &str = "https://api.nextdns.io/v1/domain";
 const VT_API: &str = "https://www.virustotal.com/api/v3/domains";
@@ -48,8 +48,8 @@ impl IntelApiClient {
         }
         info!(
             "IntelAPI: configured NextDNS={} VirusTotal={}",
-            self.nextdns_api_key.read().is_signal(),
-            self.vt_api_key.read().is_signal()
+            self.nextdns_api_key.read().is_some(),
+            self.vt_api_key.read().is_some()
         );
     }
 
@@ -73,13 +73,15 @@ impl IntelApiClient {
             is_malicious: false,
         };
 
-        if let Some(key) = self.nextdns_api_key.read().clone() {
+        let nextdns_key = self.nextdns_api_key.read().clone();
+        if let Some(key) = nextdns_key {
             if let Ok(r) = self.query_nextdns(domain, &key).await {
                 rep = r;
             }
         }
 
-        if let Some(key) = self.vt_api_key.read().clone() {
+        let vt_key = self.vt_api_key.read().clone();
+        if let Some(key) = vt_key {
             if let Ok(vt_rep) = self.query_virustotal(domain, &key).await {
                 if vt_rep.threat_score > rep.threat_score {
                     rep = vt_rep;
@@ -88,6 +90,14 @@ impl IntelApiClient {
         }
 
         let mut cache = self.cache.write();
+        if cache.len() >= 5000 {
+            // Keep the cache bounded: drop a small portion of the oldest entries.
+            let drop = cache.len() / 4;
+            let keys: Vec<String> = cache.keys().take(drop).cloned().collect();
+            for k in keys {
+                cache.remove(&k);
+            }
+        }
         cache.insert(domain.to_string(), rep.clone());
         Some(rep)
     }

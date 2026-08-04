@@ -95,9 +95,7 @@ fn make_channels() -> (
     let (rootkit_tx, _) = broadcast::channel(1024);
     let (canary_tx, _) = broadcast::channel(1024);
     let (privesc_tx, _) = broadcast::channel(1024);
-    (
-        ring_tx, tls_tx, lsm_tx, rootkit_tx, canary_tx, privesc_tx,
-    )
+    (ring_tx, tls_tx, lsm_tx, rootkit_tx, canary_tx, privesc_tx)
 }
 
 impl EbpfManager {
@@ -143,14 +141,16 @@ impl EbpfManager {
         canary_tx: broadcast::Sender<Vec<u8>>,
         privesc_tx: broadcast::Sender<Vec<u8>>,
     ) -> Result<Self> {
-        let path = find_bpf_object()
-            .context("eBPF object not found — run `cargo xtask build` first")?;
+        let path =
+            find_bpf_object().context("eBPF object not found — run `cargo xtask build` first")?;
         info!("loading eBPF object: {path}");
 
         let btf = aya::Btf::from_sys_fs().context("failed to load kernel BTF")?;
         let mut loader = EbpfLoader::new();
         loader.btf(Some(&btf));
-        let mut ebpf = loader.load_file(&path).context("failed to load BPF program")?;
+        let mut ebpf = loader
+            .load_file(&path)
+            .context("failed to load BPF program")?;
 
         // ── Attach XDP to the default interface ──
         if let Some(iface) = default_interface() {
@@ -171,17 +171,12 @@ impl EbpfManager {
         }
 
         // ── Attach BTF tracepoints (looked up by ELF section name) ──
-        for name in [
-            "tp_btf/sched_process_exec",
-            "tp_btf/sys_enter_openat",
-            "tp_btf/sys_enter_connect",
-            "tp_btf/sys_enter_kill",
-            "tp_btf/sys_enter_unlinkat",
-            "tp_btf/sys_enter_setuid",
-            "tp_btf/sys_enter_memfd_create",
-            "tp_btf/sys_enter_mmap",
-            "tp_btf/sys_enter_finit_module",
-        ] {
+        //
+        // Per-syscall `sys_enter_<name>` events are not real kernel tracepoints
+        // (they are dynamically layered on the generic `sys_enter` tracepoint),
+        // so raw/btf tracepoint programs can only attach to `sys_enter`. The
+        // eBPF program dispatches on the syscall number internally.
+        for name in ["tp_btf/sched_process_exec", "tp_btf/sys_enter"] {
             match attach_tracepoint(&mut ebpf, name) {
                 Ok(()) => {}
                 Err(e) => warn!("tracepoint {name} attach failed: {e}"),
@@ -212,7 +207,6 @@ impl EbpfManager {
         spawn_ring_reader(&mut ebpf, "RING_BUF", ring_tx.clone());
         spawn_ring_reader(&mut ebpf, "LSM_EVENTS", lsm_tx.clone());
         spawn_ring_reader(&mut ebpf, "ROOTKIT_EVENTS", rootkit_tx.clone());
-        spawn_ring_reader(&mut ebpf, "CANARY_EVENTS", canary_tx.clone());
         spawn_ring_reader(&mut ebpf, "PRIVESC_EVENTS", privesc_tx.clone());
 
         Ok(Self {
@@ -300,26 +294,6 @@ impl EbpfManager {
         Ok(())
     }
 
-    pub fn add_established_flow(
-        &self,
-        _src_ip: u32,
-        _dst_ip: u32,
-        _src_port: u16,
-        _dst_port: u16,
-        _protocol: u8,
-    ) -> Result<()> {
-        Ok(())
-    }
-    pub fn remove_established_flow(
-        &self,
-        _src_ip: u32,
-        _dst_ip: u32,
-        _src_port: u16,
-        _dst_port: u16,
-        _protocol: u8,
-    ) -> Result<()> {
-        Ok(())
-    }
     pub fn block_ip(&mut self, ip: IpAddr) -> Result<()> {
         if let IpAddr::V4(v4) = ip {
             let inserted = if let Some(ebpf) = self.ebpf.as_mut() {
@@ -625,16 +599,14 @@ fn spawn_ring_reader(ebpf: &mut Ebpf, map_name: &str, tx: broadcast::Sender<Vec<
     };
     std::thread::Builder::new()
         .name(format!("ring0-{map_name}-reader"))
-        .spawn(move || {
-            loop {
-                while let Some(item) = ring.next() {
-                    let bytes = item.to_vec();
-                    if tx.send(bytes).is_err() {
-                        return;
-                    }
+        .spawn(move || loop {
+            while let Some(item) = ring.next() {
+                let bytes = item.to_vec();
+                if tx.send(bytes).is_err() {
+                    return;
                 }
-                std::thread::sleep(Duration::from_millis(1));
             }
+            std::thread::sleep(Duration::from_millis(1));
         })
         .ok();
     info!("ring reader started for {map_name}");

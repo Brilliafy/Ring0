@@ -113,10 +113,71 @@ fn send_command(frame: &[u8]) -> Result<Vec<u8>> {
     Ok(resp)
 }
 
+/// Send a fire-and-forget command frame. The daemon does not send a reply for
+/// these commands, so we must NOT block waiting for a response frame (there may
+/// be none for a long time, which used to make every command hang for the read
+/// timeout even though the command had succeeded).
+fn send_command_no_response(frame: &[u8]) -> Result<()> {
+    let mut stream = connect_timeout()?;
+    let len = (frame.len() as u32).to_le_bytes();
+    stream.write_all(&len)?;
+    stream.write_all(frame)?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// Send the Status command and wait for the daemon's status broadcast event.
+fn send_status_command() -> Result<String> {
+    let mut message = capnp::message::Builder::new_default();
+    message
+        .init_root::<capnp_schema::daemon_command::Builder>()
+        .setStatus(());
+    let mut buf = Vec::new();
+    capnp::serialize::write_message(&mut buf, &message)?;
+
+    let mut stream = connect_timeout()?;
+    let len = (buf.len() as u32).to_le_bytes();
+    stream.write_all(&len)?;
+    stream.write_all(&buf)?;
+    stream.flush()?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+
+    let mut reader = std::io::BufReader::new(&stream);
+    // The daemon replies to Status with a broadcast status event; other events
+    // may interleave, so skip frames until one parses as a DaemonStatus.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for daemon status");
+        }
+        let mut len_buf = [0u8; 4];
+        if reader.read_exact(&mut len_buf).is_err() {
+            anyhow::bail!("disconnected while waiting for daemon status");
+        }
+        let msg_len = u32::from_le_bytes(len_buf) as usize;
+        if msg_len == 0 || msg_len > 65536 {
+            anyhow::bail!("invalid status frame length: {msg_len}");
+        }
+        let mut msg_buf = vec![0u8; msg_len];
+        if reader.read_exact(&mut msg_buf).is_err() {
+            anyhow::bail!("disconnected while reading daemon status");
+        }
+        if let Some(status) = format_status_capnp(&msg_buf) {
+            return Ok(status);
+        }
+    }
+}
+
 fn cmd_status() -> Result<()> {
-    match connect_timeout() {
-        Ok(_) => println!("{}", "Daemon: Connected".green().bold()),
-        Err(_) => println!("{}", "Daemon: Disconnected".red().bold()),
+    match send_status_command() {
+        Ok(status) => {
+            println!("{}", "Daemon: Connected".green().bold());
+            println!("{status}");
+        }
+        Err(e) => {
+            println!("{}", "Daemon: Disconnected".red().bold());
+            eprintln!("{e:#}");
+        }
     }
     Ok(())
 }
@@ -131,7 +192,7 @@ fn cmd_block(ip: &str) -> Result<()> {
         .setBlockIp(ip);
     let mut buf = Vec::new();
     capnp::serialize::write_message(&mut buf, &message)?;
-    send_command(&buf)?;
+    send_command_no_response(&buf)?;
     println!("{} {ip}", "Blocked:".red().bold());
     Ok(())
 }
@@ -146,7 +207,7 @@ fn cmd_unblock(ip: &str) -> Result<()> {
         .setUnblockIp(ip);
     let mut buf = Vec::new();
     capnp::serialize::write_message(&mut buf, &message)?;
-    send_command(&buf)?;
+    send_command_no_response(&buf)?;
     println!("{} {ip}", "Unblocked:".green().bold());
     Ok(())
 }
@@ -158,7 +219,7 @@ fn cmd_kill(pid: u32) -> Result<()> {
         .setKillProcess(pid);
     let mut buf = Vec::new();
     capnp::serialize::write_message(&mut buf, &message)?;
-    send_command(&buf)?;
+    send_command_no_response(&buf)?;
     println!("{} PID {pid}", "Killed:".red().bold());
     Ok(())
 }
@@ -259,12 +320,16 @@ fn cmd_doctor() -> Result<()> {
             "Kernel >= 5.8",
             Box::new(|| {
                 let k = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-                k.trim()
-                    .split('.')
+                let mut parts = k.trim().split('.');
+                let major = parts
                     .next()
                     .and_then(|s| s.parse::<u32>().ok())
-                    .unwrap_or(0)
-                    >= 5
+                    .unwrap_or(0);
+                let minor = parts
+                    .next()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0);
+                (major, minor) >= (5, 8)
             }),
         ),
         (
@@ -300,7 +365,7 @@ fn cmd_flatpak_list() -> Result<()> {
         .setFlatpakList(());
     let mut buf = Vec::new();
     capnp::serialize::write_message(&mut buf, &message)?;
-    send_command(&buf)?;
+    send_command_no_response(&buf)?;
     println!("{}", "Flatpak list requested".cyan().bold());
     Ok(())
 }
@@ -312,7 +377,7 @@ fn cmd_power_status() -> Result<()> {
         .setPowerStatus(());
     let mut buf = Vec::new();
     capnp::serialize::write_message(&mut buf, &message)?;
-    send_command(&buf)?;
+    send_command_no_response(&buf)?;
     println!("{}", "Power status requested".cyan().bold());
     Ok(())
 }
@@ -391,4 +456,43 @@ fn format_severity(s: capnp_schema::Severity) -> colored::ColoredString {
         capnp_schema::Severity::High => "HIGH".red(),
         capnp_schema::Severity::Critical => "CRITICAL".red().bold(),
     }
+}
+
+/// Parse a ring0 event frame as a DaemonStatus and format it for display.
+/// Returns None if the frame is a different event type.
+fn format_status_capnp(data: &[u8]) -> Option<String> {
+    let mut data_mut = data;
+    let reader = capnp::serialize::read_message_from_flat_slice(
+        &mut data_mut,
+        capnp::message::ReaderOptions::new(),
+    )
+    .ok()?;
+    let event = reader
+        .get_root::<capnp_schema::ring0_event::Reader>()
+        .ok()?;
+    let status = match event.which().ok()? {
+        capnp_schema::ring0_event::Which::Status(st) => st.ok()?,
+        _ => return None,
+    };
+    let filters: Vec<String> = status
+        .getActiveFilters()
+        .ok()?
+        .iter()
+        .map(|f| {
+            f.ok()
+                .and_then(|r| r.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    Some(format!(
+        "  CPU: {:.1}%   RAM: {:.1} MiB   Events/s: {:.1}\n  Blocked domains: {}   CIDRs: {}   Ports: {}\n  Active filters: {}",
+        status.getCpuUsagePercent(),
+        status.getRamUsageBytes() as f64 / (1024.0 * 1024.0),
+        status.getEventsPerSec(),
+        status.getBlockedDomains(),
+        status.getBlockedCidrs(),
+        status.getBlockedPorts(),
+        filters.join(", ")
+    ))
 }

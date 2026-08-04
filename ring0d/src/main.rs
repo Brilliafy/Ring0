@@ -1,4 +1,4 @@
-#![allow(dead_code, static_mut_refs)]
+#![allow(dead_code)]
 pub mod baseline;
 pub mod containment;
 pub mod contextual_security;
@@ -14,6 +14,9 @@ pub mod forensics;
 pub mod governor;
 pub mod hotswap;
 pub mod intel;
+// NextDNS/VirusTotal domain-reputation client. Parsed/compiled but not yet
+// wired into the event pipeline (see IntelApiClient).
+pub mod intel_api;
 pub mod ipc;
 pub mod power;
 pub mod privesc;
@@ -134,8 +137,12 @@ impl Daemon {
         self_defense.lock_ebpf_maps();
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let _telemetry = telemetry::TelemetryEngine::new();
-        let ipc = ipc::IpcServer::bind(&ring0_common::socket_path(), storage.clone(), cmd_tx.clone())
-            .await?;
+        let ipc = ipc::IpcServer::bind(
+            &ring0_common::socket_path(),
+            storage.clone(),
+            cmd_tx.clone(),
+        )
+        .await?;
 
         let lsm_attached = ebpf.lsm_available();
         if lsm_attached {
@@ -167,8 +174,7 @@ impl Daemon {
 
         let governor = governor::CpuGovernor::new();
         let trust = trust::TrustEngine::new();
-        let mut fastpath = fastpath::FastPathManager::new();
-        fastpath.set_ebpf(&ebpf);
+        let fastpath = fastpath::FastPathManager::new();
         let prompt = prompt::PromptEngine::new(cmd_tx.clone(), &rules_path);
         let reassembly = reassembly::ReassemblyEngine::new();
         let enrichment = enrichment::EnrichmentEngine::new();
@@ -295,7 +301,8 @@ impl Daemon {
     }
 
     async fn on_raw_event(&self, raw: &[u8]) {
-        self.event_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.event_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if raw.len() < 16 {
             return;
         }
@@ -323,15 +330,13 @@ impl Daemon {
         let proto = raw[28];
         let pid = u32::from_le_bytes(raw[32..36].try_into().unwrap_or([0; 4]));
         let action = raw[36];
-        let evt = ipc::build_packet_event(
-            ts, src_ip, dst_ip, src_port, dst_port, proto, pid, action,
-        );
+        let evt =
+            ipc::build_packet_event(ts, src_ip, dst_ip, src_port, dst_port, proto, pid, action);
         self.storage.write_raw(&evt);
         self.ipc.broadcast_raw(&evt).await;
         self.pcap_buffer.push(raw, ts);
         let binary = if pid > 0 {
-            crate::process::ProcessResolver::binary_path(pid)
-                .unwrap_or_else(|| "unknown".into())
+            crate::process::ProcessResolver::binary_path(pid).unwrap_or_else(|| "unknown".into())
         } else {
             "kernel".into()
         };
@@ -339,9 +344,14 @@ impl Daemon {
             let a = build_alert_bytes_rule(
                 4000,
                 3,
-                &format!("blocked port traffic {}.{}.{}.{}:{}",
-                    (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF,
-                    (dst_ip >> 8) & 0xFF, dst_ip & 0xFF, dst_port),
+                &format!(
+                    "blocked port traffic {}.{}.{}.{}:{}",
+                    (dst_ip >> 24) & 0xFF,
+                    (dst_ip >> 16) & 0xFF,
+                    (dst_ip >> 8) & 0xFF,
+                    dst_ip & 0xFF,
+                    dst_port
+                ),
             );
             self.storage.write_alert(&a);
             self.ipc.broadcast_raw(&a).await;
@@ -354,10 +364,15 @@ impl Daemon {
             return;
         }
         let pid = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
-        let ppid = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
+        let event_ppid = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
         let uid = u32::from_le_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
+        // The sched_process_exec tracepoint does not expose the parent pid, so
+        // prefer the real /proc value over the (zero) event field.
+        let ppid = crate::process::ProcessResolver::ppid(pid).unwrap_or(event_ppid);
         let comm = if raw[28..44].iter().position(|b| *b == 0).unwrap_or(16) > 0 {
-            String::from_utf8_lossy(&raw[28..44]).trim_end_matches('\0').to_string()
+            String::from_utf8_lossy(&raw[28..44])
+                .trim_end_matches('\0')
+                .to_string()
         } else {
             String::new()
         };
@@ -461,8 +476,14 @@ impl Daemon {
             let a = build_alert_bytes_rule(
                 4003,
                 2,
-                &format!("Contextual block: {}.{}.{}.{}:{} by PID {pid}",
-                    (dip >> 24) & 0xFF, (dip >> 16) & 0xFF, (dip >> 8) & 0xFF, dip & 0xFF, dp),
+                &format!(
+                    "Contextual block: {}.{}.{}.{}:{} by PID {pid}",
+                    (dip >> 24) & 0xFF,
+                    (dip >> 16) & 0xFF,
+                    (dip >> 8) & 0xFF,
+                    dip & 0xFF,
+                    dp
+                ),
             );
             self.storage.write_alert(&a);
             self.ipc.broadcast_raw(&a).await;
@@ -545,7 +566,8 @@ impl Daemon {
     }
 
     async fn on_tls_event(&self, raw: &[u8]) {
-        self.event_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.event_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if raw.len() < 24 {
             return;
         }
@@ -558,16 +580,20 @@ impl Daemon {
     }
 
     async fn on_lsm_event(&self, raw: &[u8]) {
-        self.event_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.event_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if raw.len() < 132 {
             return;
         }
         let event_type = raw[24];
         let denied = raw[25];
         let pid = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
-        let path_end = raw[28..124].iter().position(|b| *b == 0).unwrap_or(96);
+        // LsmEvent layout: kind(0), ts(8..16), pid(16..20), uid(20..24),
+        // event_type(24), denied(25), path(26..122), dst_ip(124..128),
+        // dst_port(128..130). Note the path starts at byte 26.
+        let path_end = raw[26..122].iter().position(|b| *b == 0).unwrap_or(96);
         let path = if path_end > 0 {
-            String::from_utf8_lossy(&raw[28..28 + path_end]).to_string()
+            String::from_utf8_lossy(&raw[26..26 + path_end]).to_string()
         } else {
             String::new()
         };
@@ -625,7 +651,8 @@ impl Daemon {
     }
 
     async fn on_privesc_event(&self, raw: &[u8]) {
-        self.event_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.event_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if raw.len() < 28 {
             return;
         }
@@ -642,11 +669,16 @@ impl Daemon {
                 );
                 self.storage.write_alert(&a);
                 self.ipc.broadcast_raw(&a).await;
+                // A real uid escalation is the clearest privilege-escalation signal;
+                // contain the process. (Informational capable/ptrace events do not
+                // trigger containment — freezing processes for those is destructive.)
+                containment::ContainmentManager::quarantine_pid(pid);
             }
             ebpf::KIND_PTRACE => {
                 let target = u32::from_le_bytes(raw[28..32].try_into().unwrap_or([0; 4]));
                 self.privesc.ingest_ptrace_attempt(pid, uid, target);
-                let a = build_alert_bytes_rule(2002, 4, &format!("ptrace PID {} -> {}", pid, target));
+                let a =
+                    build_alert_bytes_rule(2002, 4, &format!("ptrace PID {} -> {}", pid, target));
                 self.storage.write_alert(&a);
                 self.ipc.broadcast_raw(&a).await;
             }
@@ -663,11 +695,11 @@ impl Daemon {
             }
             _ => {}
         }
-        containment::ContainmentManager::quarantine_pid(pid);
     }
 
     async fn on_rootkit_event(&self, raw: &[u8]) {
-        self.event_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.event_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if raw.len() < 60 {
             return;
         }
@@ -738,7 +770,7 @@ impl Daemon {
 
     fn tick_rootkit_scan(&self) {
         let findings = self.rootkit.scan_hidden_pids();
-        for finding in findings {
+        for finding in &findings {
             let desc = format!("[{}] {}", finding.alert_type, finding.description);
             let severity = if finding.hidden { 4u8 } else { 2u8 };
             let a = build_alert_bytes_rule(7004, severity, &desc);
@@ -747,7 +779,7 @@ impl Daemon {
         }
         info!(
             "Rootkit scan complete: {} findings, {} total scans",
-            "see above",
+            findings.len(),
             self.rootkit.scan_count()
         );
     }
@@ -804,15 +836,6 @@ impl Daemon {
             let bytes = build_correlation_alert_bytes(&alert);
             self.storage.write_alert(&bytes);
             self.ipc.broadcast_raw(&bytes).await;
-            let _event_json = serde_json::json!({
-                "pattern_id": alert.pattern_id,
-                "pattern_name": alert.pattern_name,
-                "severity": alert.severity,
-                "description": alert.description,
-                "root_pid": alert.root_pid,
-                "mitre_technique": alert.mitre_technique,
-            })
-            .to_string();
             if alert.severity >= 3 {
                 containment::ContainmentManager::quarantine_pid(alert.root_pid);
                 self.forensics.trigger_export(
@@ -825,19 +848,6 @@ impl Daemon {
                 );
             }
         }
-    }
-
-    fn enrich_event(&self, raw: &[u8]) -> Vec<u8> {
-        if raw.len() < 30 {
-            return raw.to_vec();
-        }
-        let dip = u32::from_be_bytes([raw[12], raw[13], raw[14], raw[15]]);
-        let dp = u16::from_be_bytes([raw[18], raw[19]]);
-        let mut evt = raw.to_vec();
-        if let Some(pid) = crate::process::ProcessResolver::lookup_socket(dip, dp) {
-            evt[20..24].copy_from_slice(&pid.to_le_bytes());
-        }
-        evt
     }
 
     fn apply_blocklist_payload(&mut self) {
@@ -969,7 +979,8 @@ impl Daemon {
                 let domains = self.ebpf.blocked_domain_count() as u32;
                 let cidrs = filters.len() as u32;
                 let ports = self.ebpf.blocked_port_count() as u32;
-                let status = ipc::build_status_event(&filters, cpu, ram, eps, domains, cidrs, ports);
+                let status =
+                    ipc::build_status_event(&filters, cpu, ram, eps, domains, cidrs, ports);
                 self.ipc.broadcast_sync(&status);
             }
         }

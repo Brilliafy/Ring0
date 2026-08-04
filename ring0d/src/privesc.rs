@@ -3,8 +3,6 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tracing::info;
 
-use crate::containment;
-
 #[derive(Debug, Clone)]
 pub struct PrivEscAttempt {
     pub timestamp: u64,
@@ -22,8 +20,19 @@ pub struct PrivEscDetector {
 impl PrivEscDetector {
     pub fn new() -> Self {
         Self {
-            log: Arc::new(RwLock::new(Vec::with_capacity(1024))),
+            log: Arc::new(RwLock::new(Vec::with_capacity(256))),
         }
+    }
+
+    /// Push an attempt into the bounded history buffer.
+    fn push_attempt(&self, attempt: PrivEscAttempt) {
+        const MAX_ATTEMPTS: usize = 4096;
+        let mut log = self.log.write();
+        if log.len() >= MAX_ATTEMPTS {
+            let excess = log.len() - MAX_ATTEMPTS + 1;
+            log.drain(0..excess);
+        }
+        log.push(attempt);
     }
 
     pub fn ingest_ptrace_attempt(
@@ -45,8 +54,7 @@ impl PrivEscDetector {
             description: desc.clone(),
             blocked: true,
         };
-        containment::ContainmentManager::quarantine_pid(pid);
-        self.log.write().push(attempt.clone());
+        self.push_attempt(attempt.clone());
         info!("[PRIVESC] {desc}");
         Some(attempt)
     }
@@ -69,10 +77,9 @@ impl PrivEscDetector {
             blocked,
         };
         if blocked {
-            containment::ContainmentManager::quarantine_pid(pid);
             info!("[PRIVESC_BLOCKED] {desc}");
         }
-        self.log.write().push(attempt.clone());
+        self.push_attempt(attempt.clone());
         Some(attempt)
     }
 
@@ -97,10 +104,9 @@ impl PrivEscDetector {
             blocked,
         };
         if blocked {
-            containment::ContainmentManager::quarantine_pid(pid);
             info!("[PRIVESC_BLOCKED] {desc}");
         }
-        self.log.write().push(attempt.clone());
+        self.push_attempt(attempt.clone());
         Some(attempt)
     }
 
