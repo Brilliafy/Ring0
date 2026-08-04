@@ -3,6 +3,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import Qt.labs.platform 1.1
+import "components"
 
 ApplicationWindow {
     id: appWindow
@@ -320,7 +321,7 @@ ApplicationWindow {
         if (promptWindow) {
             promptWindow.close()
         }
-        var component = Qt.createComponent("qml/components/ConnectionPrompt.qml")
+        var component = Qt.createComponent("components/ConnectionPrompt.qml")
         if (component.status === Component.Ready) {
             promptWindow = component.createObject(appWindow, {
                 promptId: evt.promptId,
