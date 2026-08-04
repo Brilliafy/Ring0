@@ -4,13 +4,12 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use parking_lot::RwLock;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 const PCAP_BUFFER_SIZE: usize = 100 * 1024 * 1024;
 const PCAP_WINDOW_SECS: u64 = 30;
@@ -18,7 +17,7 @@ const FORENSICS_DIR: &str = "/var/log/ring0/forensics";
 
 static NEXT_CASE_ID: AtomicU64 = AtomicU64::new(1);
 
-struct PacketFrame {
+pub struct PacketFrame {
     timestamp_ns: u64,
     data: Vec<u8>,
 }
@@ -213,7 +212,7 @@ impl ForensicExporter {
             let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
             header.set_size(manifest_bytes.len() as u64);
             header.set_cksum();
-            encoder.write_all(&header.as_bytes())?;
+            encoder.write_all(header.as_bytes())?;
             encoder.write_all(&manifest_bytes)?;
         }
 
@@ -223,7 +222,7 @@ impl ForensicExporter {
             let pcap_bytes = Self::build_pcap(frames);
             header.set_size(pcap_bytes.len() as u64);
             header.set_cksum();
-            encoder.write_all(&header.as_bytes())?;
+            encoder.write_all(header.as_bytes())?;
             encoder.write_all(&pcap_bytes)?;
         }
 
@@ -234,7 +233,7 @@ impl ForensicExporter {
             let snapshot_bytes = snapshot.as_bytes();
             header.set_size(snapshot_bytes.len() as u64);
             header.set_cksum();
-            encoder.write_all(&header.as_bytes())?;
+            encoder.write_all(header.as_bytes())?;
             encoder.write_all(snapshot_bytes)?;
         }
 
@@ -253,7 +252,7 @@ impl ForensicExporter {
             snaplen: 65535,
             network: 1,
         };
-        buf.extend_from_slice(&header.as_bytes());
+        buf.extend_from_slice(&header.as_bytes()[..]);
         for frame in frames {
             let orig_len = frame.data.len() as u32;
             buf.extend_from_slice(&pcap_packet_header(frame.timestamp_ns, orig_len));

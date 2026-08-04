@@ -1,7 +1,6 @@
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use lru_cache::LruCache;
 use parking_lot::RwLock;
@@ -14,7 +13,7 @@ const GEO_DB_PATH: &str = "/usr/share/GeoIP/GeoLite2-Country.mmdb";
 pub struct EnrichmentEngine {
     geo_reader: Option<maxminddb::Reader<Vec<u8>>>,
     rdns_cache: Arc<RwLock<LruCache<u32, RdnsEntry>>>,
-    resolver: Option<tokio::sync::Mutex<hickory_resolver::TokioAsyncResolver>>,
+    resolver: Option<tokio::sync::Mutex<hickory_resolver::TokioResolver>>,
 }
 
 struct RdnsEntry {
@@ -35,8 +34,14 @@ impl EnrichmentEngine {
             }
         };
 
-        let resolver = match hickory_resolver::TokioAsyncResolver::tokio_from_system_conf() {
-            Ok(r) => Some(tokio::sync::Mutex::new(r)),
+        let resolver = match hickory_resolver::TokioResolver::builder_tokio() {
+            Ok(builder) => match builder.build() {
+                Ok(r) => Some(tokio::sync::Mutex::new(r)),
+                Err(e) => {
+                    warn!("Enrichment: DNS resolver build failed: {e}");
+                    None
+                }
+            },
             Err(e) => {
                 warn!("Enrichment: DNS resolver init failed: {e}");
                 None
@@ -53,21 +58,15 @@ impl EnrichmentEngine {
     pub fn lookup_country(&self, ip: u32) -> (String, String) {
         let ip_addr = IpAddr::V4(std::net::Ipv4Addr::from(ip));
         match &self.geo_reader {
-            Some(reader) => match reader.lookup::<maxminddb::geoip2::Country>(ip_addr) {
-                Ok(country) => {
-                    let code = country
-                        .country
-                        .and_then(|c| c.iso_code)
-                        .unwrap_or("XX")
-                        .to_string();
-                    let name = country
-                        .country
-                        .and_then(|c| c.names)
-                        .and_then(|n| n.get("en").cloned())
-                        .unwrap_or("Unknown")
-                        .to_string();
-                    (code, name)
-                }
+            Some(reader) => match reader.lookup(ip_addr) {
+                Ok(result) => match result.decode::<maxminddb::geoip2::Country>() {
+                    Ok(Some(country)) => {
+                        let code = country.country.iso_code.unwrap_or("XX").to_string();
+                        let name = country.country.names.english.unwrap_or("Unknown").to_string();
+                        (code, name)
+                    }
+                    _ => ("XX".into(), "Unknown".into()),
+                },
                 Err(_) => ("XX".into(), "Unknown".into()),
             },
             None => ("XX".into(), "Unknown".into()),
@@ -90,8 +89,9 @@ impl EnrichmentEngine {
         let hostname = match &self.resolver {
             Some(resolver) => {
                 let resolver = resolver.lock().await;
-                match resolver.reverse_lookup(ip_addr.into()).await {
+                match resolver.reverse_lookup(ip_addr).await {
                     Ok(lookup) => lookup
+                        .answers()
                         .iter()
                         .next()
                         .map(|n| n.to_string().trim_end_matches('.').to_string())

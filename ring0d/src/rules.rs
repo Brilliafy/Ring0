@@ -1,12 +1,10 @@
-use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use serde::Deserialize;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RuleConfig {
@@ -141,7 +139,7 @@ impl RuleEngine {
         self.signatures.read().clone()
     }
 
-    pub fn check_file_access(&self, file_path: &str, pid: u32, write_flag: bool) -> Vec<u32> {
+    pub fn check_file_access(&self, file_path: &str, _pid: u32, write_flag: bool) -> Vec<u32> {
         let config = self.config.read();
         let mut alerts = Vec::new();
         for rule in &config.rules.file {

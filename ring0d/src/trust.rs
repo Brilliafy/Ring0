@@ -2,12 +2,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 
-use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 const TRUSTED_PATHS: &[&str] = &[
     "/usr/bin/",
@@ -104,7 +102,12 @@ impl TrustEngine {
         status
     }
 
-    fn check_binary_status(&self, binary_path: &str, pid: u32, binary_bytes: &[u8]) -> TrustStatus {
+    fn check_binary_status(
+        &self,
+        binary_path: &str,
+        pid: u32,
+        _binary_bytes: &[u8],
+    ) -> TrustStatus {
         let binary_name = Path::new(binary_path)
             .file_name()
             .and_then(|n| n.to_str())

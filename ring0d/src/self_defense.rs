@@ -2,11 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use tracing::{error, info, warn};
-
-use crate::ipc;
-
-const DAEMON_PID: u32 = std::process::id();
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub struct SelfDefenseEvent {
@@ -25,11 +21,12 @@ pub struct SelfDefense {
 
 impl SelfDefense {
     pub fn new() -> Self {
-        info!("SelfDefense active for PID {DAEMON_PID}");
+        let daemon_pid = std::process::id();
+        info!("SelfDefense active for PID {daemon_pid}");
         Self {
             locked: AtomicBool::new(false),
             events: Arc::new(RwLock::new(Vec::with_capacity(256))),
-            daemon_pid: DAEMON_PID,
+            daemon_pid,
         }
     }
 

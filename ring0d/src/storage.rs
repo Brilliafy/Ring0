@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use rocksdb::{
-    BlockBasedOptions, ColumnFamilyDescriptor, Direction, IteratorMode, Options, ReadOptions,
-    WAOptions, DB,
+    BlockBasedOptions, ColumnFamilyDescriptor, Direction, IteratorMode, Options, ReadOptions, DB,
 };
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -23,10 +22,8 @@ impl RocksManager {
         opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
         opts.set_level_zero_file_num_compaction_trigger(4);
 
-        let mut wal_opts = WAOptions::default();
-        wal_opts.set_wal_size_limit_mb(1024);
-        wal_opts.set_wal_ttl_seconds(3600);
-        opts.set_wal_options(wal_opts);
+        opts.set_wal_size_limit_mb(1024);
+        opts.set_wal_ttl_seconds(3600);
 
         let mut bb_opts = BlockBasedOptions::default();
         bb_opts.set_block_size(16 * 1024);
@@ -40,6 +37,9 @@ impl RocksManager {
             ColumnFamilyDescriptor::new("events", Options::default()),
             ColumnFamilyDescriptor::new("alerts", Options::default()),
             ColumnFamilyDescriptor::new("metrics", Options::default()),
+            ColumnFamilyDescriptor::new("baseline", Options::default()),
+            ColumnFamilyDescriptor::new("fim_baseline", Options::default()),
+            ColumnFamilyDescriptor::new("intel", Options::default()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, path, cfs)
@@ -93,7 +93,8 @@ impl RocksManager {
         let start_key = start_timestamp.to_be_bytes();
         let end_key = end_timestamp.to_be_bytes();
         let mut ro = ReadOptions::default();
-        ro.set_iterate_range(start_key.as_slice()..=end_key.as_slice());
+        ro.set_iterate_lower_bound(start_key.as_slice());
+        ro.set_iterate_upper_bound(end_key.as_slice());
 
         let iter = self.db.iterator_cf_opt(
             &cf,
@@ -121,7 +122,8 @@ impl RocksManager {
         let iter = self.db.iterator_cf(&cf, IteratorMode::End);
         iter.take(limit.saturating_mul(2))
             .filter_map(|r| {
-                r.map_err(|e| warn!("RocksDB alert iteration error: {e}"))
+                r.map(|(k, v)| (k.to_vec(), v.to_vec()))
+                    .map_err(|e| warn!("RocksDB alert iteration error: {e}"))
                     .ok()
             })
             .filter(|(_, v)| v.len() > 5 && v[4] >= severity_threshold)

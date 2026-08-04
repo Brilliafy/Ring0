@@ -42,7 +42,7 @@ impl PrivEscDetector {
             pid,
             uid,
             event_type: "ptrace_attach".into(),
-            description: desc,
+            description: desc.clone(),
             blocked: true,
         };
         containment::ContainmentManager::quarantine_pid(pid);
@@ -65,7 +65,7 @@ impl PrivEscDetector {
             pid,
             uid,
             event_type: "capable".into(),
-            description: desc,
+            description: desc.clone(),
             blocked,
         };
         if blocked {
@@ -93,7 +93,7 @@ impl PrivEscDetector {
             pid,
             uid: old_uid,
             event_type: "setuid".into(),
-            description: desc,
+            description: desc.clone(),
             blocked,
         };
         if blocked {

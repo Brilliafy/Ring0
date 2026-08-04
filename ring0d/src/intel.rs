@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -8,7 +7,7 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 const FEED_URLS: &[(&str, &str)] = &[
     (
@@ -25,6 +24,7 @@ const FEED_URLS: &[(&str, &str)] = &[
 const YARA_DIR: &str = "/etc/ring0/yara";
 const INTEL_DB_CF: &str = "intel";
 
+#[derive(Debug, Clone)]
 pub struct IntelFeedState {
     pub feed_name: String,
     pub entries_added: u32,
@@ -47,17 +47,16 @@ impl IntelManager {
     pub fn new(db: Arc<rocksdb::DB>) -> Self {
         let (sync_tx, _sync_rx) = watch::channel(false);
         let _ = db.cf_handle(INTEL_DB_CF).or_else(|| {
-            db.create_cf(INTEL_DB_CF, &rocksdb::Options::default()).ok();
+            warn!("Intel DB CF not found at runtime — column families must be created at DB open");
             db.cf_handle(INTEL_DB_CF)
         });
 
         Self {
             yara_compiled: ArcSwap::new(Arc::new(None)),
-            yara_rules_count: Arc::new(RwLock::new(0)),
+            yara_rules_count: RwLock::new(0),
             ip_blocklist: ArcSwap::new(Arc::new(Vec::new())),
-            feed_states: Arc::new(RwLock::new(Vec::new())),
+            feed_states: RwLock::new(Vec::new()),
             sync_tx,
-            sync_rx,
             db,
         }
     }

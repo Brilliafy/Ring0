@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use parking_lot::RwLock;
-use tracing::{error, info, warn};
+use tracing::warn;
 
 pub struct RootkitDetector {
     hidden_scan_interval: Duration,

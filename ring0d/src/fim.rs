@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 const FIM_DIRS: &[&str] = &[
     "/usr/bin",
@@ -26,12 +26,13 @@ impl FimEngine {
     pub fn new(db: Arc<rocksdb::DB>) -> Self {
         let engine = Self {
             baseline: Arc::new(RwLock::new(HashMap::new())),
-            db,
+            db: db.clone(),
             enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let _ = db.cf_handle("fim_baseline").or_else(|| {
-            db.create_cf("fim_baseline", &rocksdb::Options::default())
-                .ok();
+            warn!(
+                "FIM baseline CF not found at runtime — column families must be created at DB open"
+            );
             db.cf_handle("fim_baseline")
         });
         engine.load_persisted_baseline();

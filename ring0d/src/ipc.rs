@@ -1,19 +1,18 @@
-use std::collections::HashSet;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
-use ring0_common::{DaemonCommand, LogQuery, QueryResponse, Ring0Event};
 use ring0_common::proto as capnp_schema;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 use tracing::{error, warn};
 
 use crate::storage::RocksManager;
 
 #[derive(Debug, Clone)]
-pub enum DaemonCommand {
+pub enum DaemonCmd {
     BlockIp(IpAddr),
     UnblockIp(IpAddr),
     KillProcess(u32),
@@ -32,7 +31,6 @@ pub enum DaemonCommand {
 }
 
 pub struct IpcServer {
-    _listener: UnixListener,
     evt_tx: broadcast::Sender<Vec<u8>>,
     _accept_handle: tokio::task::JoinHandle<()>,
 }
@@ -41,46 +39,37 @@ impl IpcServer {
     pub async fn bind(
         path: &str,
         storage: Arc<RocksManager>,
-    ) -> Result<(Self, tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>)> {
+        cmd_tx: tokio::sync::mpsc::UnboundedSender<DaemonCmd>,
+    ) -> Result<Self> {
         let _ = std::fs::remove_file(path);
         let listener =
             UnixListener::bind(path).map_err(|e| anyhow::anyhow!("failed to bind {path}: {e}"))?;
         let (evt_tx, _) = broadcast::channel(4096);
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let evt_tx_for_struct = evt_tx.clone();
 
         let accept_handle = tokio::spawn(async move {
-            let clients: Arc<Mutex<HashSet<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>> =
-                Arc::new(Mutex::new(HashSet::new()));
+            let listener = listener;
+            let client_count = Arc::new(AtomicUsize::new(0));
 
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
-                        let evt_tx = evt_tx.clone();
-                        let clients = clients.clone();
+                        let evt_tx: tokio::sync::broadcast::Sender<Vec<u8>> = evt_tx.clone();
                         let cmd_tx = cmd_tx.clone();
                         let storage = storage.clone();
+                        let client_count = client_count.clone();
 
                         tokio::spawn(async move {
+                            client_count.fetch_add(1, Ordering::Relaxed);
                             let (reader, writer) = stream.into_split();
-                            let (client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel();
-
-                            {
-                                let mut guard = match clients.lock().await {
-                                    Ok(g) => g,
-                                    Err(e) => {
-                                        error!("IPC mutex poisoned: {e}");
-                                        return;
-                                    }
-                                };
-                                guard.insert(client_tx.clone());
-                            }
+                            let evt_tx_for_read = evt_tx.clone();
 
                             let write_handle = tokio::spawn(async move {
                                 let mut writer = writer;
                                 let mut rx = evt_tx.subscribe();
                                 loop {
-                                    tokio::select! {
-                                        Ok(data) = rx.recv() => {
+                                    match rx.recv().await {
+                                        Ok(data) => {
                                             let len = (data.len() as u32).to_le_bytes();
                                             if writer.write_all(&len).await.is_err() {
                                                 break;
@@ -89,16 +78,7 @@ impl IpcServer {
                                                 break;
                                             }
                                         }
-                                        Some(msg) = client_rx.recv() => {
-                                            let len = (msg.len() as u32).to_le_bytes();
-                                            if writer.write_all(&len).await.is_err() {
-                                                break;
-                                            }
-                                            if writer.write_all(&msg).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                        else => break,
+                                        Err(_) => break,
                                     }
                                 }
                             });
@@ -108,7 +88,7 @@ impl IpcServer {
                                 let mut len_buf = [0u8; 4];
                                 loop {
                                     match reader.read_exact(&mut len_buf).await {
-                                        Ok(()) => {}
+                                        Ok(_) => {}
                                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                             continue;
                                         }
@@ -124,12 +104,10 @@ impl IpcServer {
                                         break;
                                     }
                                     match parse_command_frame(&msg_buf) {
-                                        Ok(DaemonCommand::QueryLogs(start, end, sev, limit)) => {
+                                        Ok(DaemonCmd::QueryLogs(_start, _end, sev, limit)) => {
                                             let results = storage.query_alerts(sev, limit as usize);
                                             let response = build_query_response(&results);
-                                            if client_tx.send(response).is_err() {
-                                                break;
-                                            }
+                                            let _ = evt_tx_for_read.send(response);
                                         }
                                         Ok(cmd) => {
                                             if cmd_tx.send(cmd).is_err() {
@@ -147,15 +125,7 @@ impl IpcServer {
                                 _ = write_handle => {},
                                 _ = read_handle => {},
                             }
-
-                            match clients.lock().await {
-                                Ok(mut guard) => {
-                                    guard.remove(&client_tx);
-                                }
-                                Err(e) => {
-                                    error!("IPC mutex poisoned during cleanup: {e}");
-                                }
-                            }
+                            client_count.fetch_sub(1, Ordering::Relaxed);
                         });
                     }
                     Err(e) => {
@@ -166,14 +136,10 @@ impl IpcServer {
             }
         });
 
-        Ok((
-            Self {
-                _listener: listener,
-                evt_tx,
-                _accept_handle: accept_handle,
-            },
-            cmd_rx,
-        ))
+        Ok(Self {
+            evt_tx: evt_tx_for_struct,
+            _accept_handle: accept_handle,
+        })
     }
 
     pub async fn broadcast_raw(&self, data: &[u8]) {
@@ -184,10 +150,13 @@ impl IpcServer {
     }
 }
 
-fn parse_command_frame(data: &[u8]) -> Result<DaemonCommand> {
-    let reader =
-        capnp::serialize::read_message_from_flat_slice(data, capnp::message::ReaderOptions::new())
-            .map_err(|e| anyhow::anyhow!("capnp parse error: {e}"))?;
+fn parse_command_frame(data: &[u8]) -> Result<DaemonCmd> {
+    let mut data_mut = data;
+    let reader = capnp::serialize::read_message_from_flat_slice(
+        &mut data_mut,
+        capnp::message::ReaderOptions::new(),
+    )
+    .map_err(|e| anyhow::anyhow!("capnp parse error: {e}"))?;
     let cmd = reader
         .get_root::<capnp_schema::daemon_command::Reader>()
         .map_err(|e| anyhow::anyhow!("capnp root error: {e}"))?;
@@ -198,50 +167,65 @@ fn parse_command_frame(data: &[u8]) -> Result<DaemonCommand> {
     {
         Which::BlockIp(ip) => {
             let ip_str = ip.map_err(|e| anyhow::anyhow!("capnp text error: {e}"))?;
+            let ip_str = ip_str
+                .to_str()
+                .map_err(|e| anyhow::anyhow!("invalid utf8: {e}"))?;
             let addr: IpAddr = ip_str
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid IP: {e}"))?;
-            Ok(DaemonCommand::BlockIp(addr))
+            Ok(DaemonCmd::BlockIp(addr))
         }
         Which::UnblockIp(ip) => {
             let ip_str = ip.map_err(|e| anyhow::anyhow!("capnp text error: {e}"))?;
+            let ip_str = ip_str
+                .to_str()
+                .map_err(|e| anyhow::anyhow!("invalid utf8: {e}"))?;
             let addr: IpAddr = ip_str
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid IP: {e}"))?;
-            Ok(DaemonCommand::UnblockIp(addr))
+            Ok(DaemonCmd::UnblockIp(addr))
         }
-        Which::KillProcess(pid) => Ok(DaemonCommand::KillProcess(pid)),
-        Which::ReloadFilters(()) => Ok(DaemonCommand::ReloadFilters),
-        Which::ReloadRules(()) => Ok(DaemonCommand::ReloadRules),
-        Which::Shutdown(()) => Ok(DaemonCommand::Shutdown),
+        Which::KillProcess(pid) => Ok(DaemonCmd::KillProcess(pid)),
+        Which::ReloadFilters(()) => Ok(DaemonCmd::ReloadFilters),
+        Which::ReloadRules(()) => Ok(DaemonCmd::ReloadRules),
+        Which::Shutdown(()) => Ok(DaemonCmd::Shutdown),
         Which::QueryLogs(query) => {
             let q = query.map_err(|e| anyhow::anyhow!("capnp query error: {e}"))?;
-            Ok(DaemonCommand::QueryLogs(
+            Ok(DaemonCmd::QueryLogs(
                 q.getStartTimestamp(),
                 q.getEndTimestamp(),
                 q.getSeverityThreshold(),
                 q.getLimit(),
             ))
         }
-        Which::Quarantine(pid) => Ok(DaemonCommand::Quarantine(pid)),
-        Which::RunRootkitScan(()) => Ok(DaemonCommand::RunRootkitScan),
-        Which::SyncIntelFeeds(()) => Ok(DaemonCommand::SyncIntelFeeds),
+        Which::Quarantine(pid) => Ok(DaemonCmd::Quarantine(pid)),
+        Which::RunRootkitScan(()) => Ok(DaemonCmd::RunRootkitScan),
+        Which::SyncIntelFeeds(()) => Ok(DaemonCmd::SyncIntelFeeds),
         Which::SubmitPromptDecision(pd) => {
             let d = pd.map_err(|e| anyhow::anyhow!("capnp prompt error: {e}"))?;
-            Ok(DaemonCommand::SubmitPromptDecision(
+            Ok(DaemonCmd::SubmitPromptDecision(
                 d.getPromptId(),
-                d.getAction().map_err(|e| anyhow::anyhow!("action: {e}"))?.to_string(),
-                d.getScope().map_err(|e| anyhow::anyhow!("scope: {e}"))?.to_string(),
+                d.getAction()
+                    .map_err(|e| anyhow::anyhow!("action: {e}"))?
+                    .to_str()
+                    .unwrap_or("")
+                    .to_string(),
+                d.getScope()
+                    .map_err(|e| anyhow::anyhow!("scope: {e}"))?
+                    .to_str()
+                    .unwrap_or("")
+                    .to_string(),
             ))
         }
-        Which::FlatpakList(()) => Ok(DaemonCommand::FlatpakList),
-        Which::PowerStatus(()) => Ok(DaemonCommand::PowerStatus),
+        Which::FlatpakList(()) => Ok(DaemonCmd::FlatpakList),
+        Which::PowerStatus(()) => Ok(DaemonCmd::PowerStatus),
         Which::UpdateSettings(json) => {
             let s = json.map_err(|e| anyhow::anyhow!("capnp settings error: {e}"))?;
-            Ok(DaemonCommand::UpdateSettings(s.to_string()))
+            Ok(DaemonCmd::UpdateSettings(
+                s.to_str().unwrap_or("").to_string(),
+            ))
         }
-        Which::RunDoctor(()) => Ok(DaemonCommand::RunDoctor),
-        _ => Err(anyhow::anyhow!("unhandled command variant")),
+        Which::RunDoctor(()) => Ok(DaemonCmd::RunDoctor),
     }
 }
 
@@ -265,7 +249,7 @@ fn build_query_response(results: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
         }
     }
     let mut buf = Vec::new();
-    let _ = capnp::serialize::write_message(&mut buf, &msg);
+    let _ = capnp::serialize::write_message(&mut buf, &message);
     buf
 }
 
@@ -284,7 +268,7 @@ pub fn build_connection_prompt_event(
     timeout_secs: u32,
 ) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
-    let mut evt = msg.init_root::<capnp_schema::ring0_event::Builder>();
+    let evt = msg.init_root::<capnp_schema::ring0_event::Builder>();
     let mut p = evt.initConnectionPrompt();
     p.setPromptId(prompt_id);
     p.setPid(pid);
@@ -311,9 +295,9 @@ pub fn build_process_exec_event(
     cmdline: &str,
 ) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
-    let mut evt = msg.init_root::<capnp_schema::ring0_event::Builder>();
+    let evt = msg.init_root::<capnp_schema::ring0_event::Builder>();
     let mut p = evt.initProcessExec();
-    p.setTimestamp(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    p.setTimestamp(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64);
     p.setPid(pid);
     p.setPpid(ppid);
     p.setUid(uid);
@@ -326,9 +310,9 @@ pub fn build_process_exec_event(
 
 pub fn build_file_access_event(pid: u32, uid: u32, binary: &str, path: &str) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
-    let mut evt = msg.init_root::<capnp_schema::ring0_event::Builder>();
+    let evt = msg.init_root::<capnp_schema::ring0_event::Builder>();
     let mut f = evt.initFileAccess();
-    f.setTimestamp(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    f.setTimestamp(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64);
     f.setPid(pid);
     f.setUid(uid);
     f.setBinaryPath(binary);
@@ -347,14 +331,16 @@ pub fn build_connect_event(
     proto: u8,
 ) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
-    let mut evt = msg.init_root::<capnp_schema::ring0_event::Builder>();
+    let evt = msg.init_root::<capnp_schema::ring0_event::Builder>();
     let mut c = evt.initConnect();
-    c.setTimestamp(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    c.setTimestamp(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64);
     c.setPid(pid);
     c.setUid(uid);
     c.setBinaryPath(binary);
-    let mut ip = c.getDstIp();
-    ip.setV4(dst_ip);
+    {
+        let mut ip = c.reborrow().getDstIp().unwrap();
+        ip.setV4(dst_ip);
+    }
     c.setDstPort(dst_port);
     c.setProtocol(if proto == 17 {
         capnp_schema::Protocol::Udp

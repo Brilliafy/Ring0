@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::info;
 
-use crate::ipc::DaemonCommand;
+use crate::ipc::DaemonCmd;
 
 const PROMPT_TIMEOUT_SECS: u64 = 15;
 const MAX_PENDING_PROMPTS: usize = 256;
@@ -59,12 +59,12 @@ pub struct PromptEngine {
     pending: Arc<RwLock<HashMap<u64, ConnectionPrompt>>>,
     decision_tx: mpsc::UnboundedSender<PromptDecision>,
     decision_rx: Arc<RwLock<Option<mpsc::UnboundedReceiver<PromptDecision>>>>,
-    cmd_tx: mpsc::UnboundedSender<DaemonCommand>,
+    cmd_tx: mpsc::UnboundedSender<DaemonCmd>,
     rules_path: String,
 }
 
 impl PromptEngine {
-    pub fn new(cmd_tx: mpsc::UnboundedSender<DaemonCommand>, rules_path: &str) -> Self {
+    pub fn new(cmd_tx: mpsc::UnboundedSender<DaemonCmd>, rules_path: &str) -> Self {
         let (decision_tx, decision_rx) = mpsc::unbounded_channel();
         Self {
             pending: Arc::new(RwLock::new(HashMap::new())),
@@ -149,7 +149,7 @@ impl PromptEngine {
                 self.synthesize_rule(&prompt, &decision, true)?;
             }
             PromptAction::Block => {
-                let cmd = DaemonCommand::BlockIp(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                let cmd = DaemonCmd::BlockIp(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
                     prompt.dst_ip,
                 )));
                 let _ = self.cmd_tx.send(cmd);
@@ -165,7 +165,7 @@ impl PromptEngine {
     fn synthesize_rule(
         &self,
         prompt: &ConnectionPrompt,
-        decision: &PromptDecision,
+        _decision: &PromptDecision,
         allow: bool,
     ) -> Result<()> {
         let dip_str = format!(
@@ -213,7 +213,7 @@ impl PromptEngine {
         let updated = if existing.trim().ends_with("rules:") || existing.trim().is_empty() {
             format!("rules:\n  network:\n{}\n", rule_yaml)
         } else if let Some(pos) = existing.rfind("  network:") {
-            let before = &existing[..=pos];
+            let _before = &existing[..=pos];
             let after = &existing[pos + 10..];
             let end_marker = after.rfind("\n  ");
             let insertion_point = match end_marker {

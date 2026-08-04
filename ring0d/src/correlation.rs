@@ -5,7 +5,6 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use tracing::{info, warn};
 
 const WINDOW_NS: u64 = 30_000_000_000;
 const WINDOW_EXEC_NS: u64 = 10_000_000_000;
@@ -71,7 +70,7 @@ impl CorrelationEngine {
 
     pub fn push_exec(&self, pid: u32, ppid: u32, binary: &str, cmdline: &str) {
         self.proc_tree.write().insert(pid, ppid);
-        let now = Instant::now();
+        let _now = Instant::now();
         self.execs.entry(pid).or_default().push(ExecRecord {
             timestamp: nano_now(),
             pid,
@@ -167,8 +166,8 @@ impl CorrelationEngine {
                     ),
                     timestamp: now,
                 };
-                results.push(alert);
                 self.alerts.write().push(alert.clone());
+                results.push(alert);
             }
         }
 
@@ -212,8 +211,8 @@ impl CorrelationEngine {
                     ),
                     timestamp: now,
                 };
-                results.push(alert);
                 self.alerts.write().push(alert.clone());
+                results.push(alert);
             }
         }
 

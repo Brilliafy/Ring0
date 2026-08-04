@@ -8,9 +8,17 @@ members = [
     "ring0ctl",
     "ring0-redteam",
 ]
+default-members = [
+    "xtask",
+    "ring0-common",
+    "ring0d",
+    "ring0ctl",
+    "ring0-redteam",
+]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+

@@ -100,16 +100,13 @@ impl CpuGovernor {
     }
 
     fn measure_daemon_cpu(&self) -> f32 {
-        if let Ok(mut sys) = sysinfo::System::new() {
-            sys.refresh_cpu();
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            sys.refresh_cpu();
-            let global = sys.global_cpu_info();
-            let usage = global.cpu_usage() / 100.0;
-            usage
-        } else {
-            0.0
-        }
+        let mut sys = sysinfo::System::new_all();
+        let cpu_kind = sysinfo::CpuRefreshKind::nothing().with_cpu_usage();
+        sys.refresh_cpu_specifics(cpu_kind);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        sys.refresh_cpu_specifics(cpu_kind);
+        let usage = sys.global_cpu_usage() / 100.0;
+        usage
     }
 
     fn measure_bpf_cpu(&self) -> f32 {
