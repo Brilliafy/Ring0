@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -44,6 +45,8 @@ impl IpcServer {
         let _ = std::fs::remove_file(path);
         let listener =
             UnixListener::bind(path).map_err(|e| anyhow::anyhow!("failed to bind {path}: {e}"))?;
+        // Allow any local user to talk to the daemon (CLI, GUI, scripts).
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
         let (evt_tx, _) = broadcast::channel(4096);
         let evt_tx_for_struct = evt_tx.clone();
 
