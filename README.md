@@ -28,11 +28,26 @@ High-performance NIDS/HIDS with live threat response.
 # Build eBPF programs
 cargo xtask build
 
-# Run daemon (requires root + CAP_BPF)
-sudo cargo xtask run
+# Build daemon, CLI, GUI
+cargo build -p ring0d -p ring0ctl
+cmake -S ring0-gui -B ring0-gui/build && cmake --build ring0-gui/build
+```
 
-# Build GUI
-cargo build -p ring0-gui
+## Run
+
+> `cargo` lives in `~/.cargo/bin`, which root's `secure_path` excludes — so `sudo cargo` fails.
+> Build as your user, then run the binary directly as root (it is self-contained):
+
+```bash
+# Run daemon (requires root + CAP_BPF)
+cargo build -p ring0d
+sudo env RUST_LOG=info ./target/debug/ring0d
+
+# GUI (connect daemon first)
+./ring0-gui/build/ring0-gui
+
+# CLI
+./target/debug/ring0ctl status
 ```
 
 ## Crates
