@@ -7,3 +7,5 @@ target/
 .idea/
 *.rs.bk
 Cargo.lock
+ring0-gui/build/
+ring0-gui/.qmlls.ini

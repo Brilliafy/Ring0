@@ -9,14 +9,19 @@ pub mod qobject {
         #[qobject]
         type Ring0Bridge = super::Ring0BridgeRust;
 
+        #[auto_wrap]
         #[qinvokable]
         fn connectDaemon(self: Pin<&mut Ring0Bridge>, socket_path: String) -> bool;
+        #[auto_wrap]
         #[qinvokable]
         fn blockIp(self: Pin<&mut Ring0Bridge>, ip: String);
+        #[auto_wrap]
         #[qinvokable]
         fn killProcess(self: Pin<&mut Ring0Bridge>, pid: u32);
+        #[auto_wrap]
         #[qinvokable]
         fn pollEvents(self: Pin<&mut Ring0Bridge>) -> String;
+        #[auto_wrap]
         #[qinvokable]
         fn sendDesktopNotification(
             self: Pin<&mut Ring0Bridge>,
@@ -24,6 +29,7 @@ pub mod qobject {
             title: String,
             message: String,
         );
+        #[auto_wrap]
         #[qinvokable]
         fn initDbusNotifications(self: Pin<&mut Ring0Bridge>);
 
@@ -37,14 +43,19 @@ pub mod qobject {
         #[qobject]
         type PacketLogModel = super::PacketLogModelRust;
 
+        #[auto_wrap]
         #[qinvokable]
         fn appendPackets(self: Pin<&mut PacketLogModel>, packets: Vec<PacketRecord>);
+        #[auto_wrap]
         #[qinvokable]
         fn clearPackets(self: Pin<&mut PacketLogModel>);
+        #[auto_wrap]
         #[qinvokable]
         fn packetCount(self: Pin<&mut PacketLogModel>) -> i32;
+        #[auto_wrap]
         #[qinvokable]
         fn packetAt(self: Pin<&mut PacketLogModel>, index: i32) -> PacketRecord;
+        #[auto_wrap]
         #[qinvokable]
         fn removeOlderThan(self: Pin<&mut PacketLogModel>, max_count: i32);
     }
@@ -53,14 +64,19 @@ pub mod qobject {
         #[qobject]
         type ProcessListModel = super::ProcessListModelRust;
 
+        #[auto_wrap]
         #[qinvokable]
         fn appendProcess(self: Pin<&mut ProcessListModel>, proc: ProcessRecord);
+        #[auto_wrap]
         #[qinvokable]
         fn clearProcesses(self: Pin<&mut ProcessListModel>);
+        #[auto_wrap]
         #[qinvokable]
         fn processCount(self: Pin<&mut ProcessListModel>) -> i32;
+        #[auto_wrap]
         #[qinvokable]
         fn processAt(self: Pin<&mut ProcessListModel>, index: i32) -> ProcessRecord;
+        #[auto_wrap]
         #[qinvokable]
         fn removeOlderThan(self: Pin<&mut ProcessListModel>, max_count: i32);
     }
@@ -69,14 +85,19 @@ pub mod qobject {
         #[qobject]
         type TopologyModel = super::TopologyModelRust;
 
+        #[auto_wrap]
         #[qinvokable]
         fn setNodes(self: Pin<&mut TopologyModel>, nodes: Vec<TopologyNode>);
+        #[auto_wrap]
         #[qinvokable]
         fn addEdge(self: Pin<&mut TopologyModel>, edge: TopologyEdge);
+        #[auto_wrap]
         #[qinvokable]
         fn nodeCount(self: Pin<&mut TopologyModel>) -> i32;
+        #[auto_wrap]
         #[qinvokable]
         fn edgeCount(self: Pin<&mut TopologyModel>) -> i32;
+        #[auto_wrap]
         #[qinvokable]
         fn clearGraph(self: Pin<&mut TopologyModel>);
     }
@@ -170,7 +191,7 @@ impl Drop for Ring0BridgeRust {
 }
 
 impl Ring0BridgeRust {
-    pub fn connect_daemon(self: Pin<&mut Self>, socket_path: String) -> bool {
+    pub fn connectDaemon(self: Pin<&mut Self>, socket_path: String) -> bool {
         let this = self.get_mut();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let stream = match rt.block_on(UnixStream::connect(&socket_path)) {
@@ -201,7 +222,7 @@ impl Ring0BridgeRust {
                             Err(_) => break,
                         };
                         match guard.read_exact(&mut len_buf).await {
-                            Ok(()) => {}
+                            Ok(_) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                 drop(guard);
                                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -234,10 +255,10 @@ impl Ring0BridgeRust {
         true
     }
 
-    pub fn block_ip(self: Pin<&mut Self>, ip: String) {
+    pub fn blockIp(self: Pin<&mut Self>, ip: String) {
         if let Some(stream) = &self.get_mut().stream {
             let frame = build_command_frame(|cmd| cmd.setBlockIp(&ip));
-            if let Ok(guard) = stream.lock() {
+            if let Ok(mut guard) = stream.lock() {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
                     let len = (frame.len() as u32).to_le_bytes();
@@ -248,10 +269,10 @@ impl Ring0BridgeRust {
         }
     }
 
-    pub fn kill_process(self: Pin<&mut Self>, pid: u32) {
+    pub fn killProcess(self: Pin<&mut Self>, pid: u32) {
         if let Some(stream) = &self.get_mut().stream {
             let frame = build_command_frame(|cmd| cmd.setKillProcess(pid));
-            if let Ok(guard) = stream.lock() {
+            if let Ok(mut guard) = stream.lock() {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
                     let len = (frame.len() as u32).to_le_bytes();
@@ -262,7 +283,7 @@ impl Ring0BridgeRust {
         }
     }
 
-    pub fn poll_events(self: Pin<&mut Self>) -> String {
+    pub fn pollEvents(self: Pin<&mut Self>) -> String {
         let mut buf = String::new();
         if let Ok(mut q) = self.get_mut().event_queue.lock() {
             while let Some(evt) = q.pop_front() {
@@ -275,7 +296,7 @@ impl Ring0BridgeRust {
         buf
     }
 
-    pub fn send_desktop_notification(
+    pub fn sendDesktopNotification(
         self: Pin<&mut Self>,
         severity: u32,
         title: String,
@@ -304,14 +325,14 @@ impl Ring0BridgeRust {
         });
     }
 
-    pub fn init_dbus_notifications(self: Pin<&mut Self>) {
+    pub fn initDbusNotifications(self: Pin<&mut Self>) {
         let notifier = self.get_mut().dbus_notifier.clone();
         tokio::spawn(async move {
             let mut n = DbusNotifier::new();
-            match n.0.connect().await {
+            match n.connect().await {
                 Ok(true) => {
                     let mut guard = notifier.lock().await;
-                    *guard = Some(n.0);
+                    *guard = Some(n);
                 }
                 _ => {}
             }
@@ -360,14 +381,13 @@ fn deserialize_to_json(data: &[u8]) -> Option<String> {
     Some(json.to_string())
 }
 
-fn text_or(t: Option<Result<capnp::text::Reader<'_>, capnp::NotInSchema>>) -> String {
-    t.and_then(|r| r.ok())
-        .and_then(|r| r.to_str().ok())
+fn text_or(t: Option<capnp::text::Reader<'_>>) -> String {
+    t.and_then(|r| r.to_str().ok())
         .unwrap_or("")
         .to_string()
 }
 
-fn format_ip(which: capnp_schema::ip_addr::Which<'_>) -> String {
+fn format_ip(which: capnp_schema::ip_addr::WhichReader<'_>) -> String {
     match which {
         capnp_schema::ip_addr::Which::V4(v) => std::net::Ipv4Addr::from(v).to_string(),
         _ => "::".into(),
@@ -423,7 +443,7 @@ impl Default for PacketLogModelRust {
     }
 }
 impl PacketLogModelRust {
-    pub fn append_packets(self: Pin<&mut Self>, new_packets: Vec<crate::qobject::PacketRecord>) {
+    pub fn appendPackets(self: Pin<&mut Self>, new_packets: Vec<crate::qobject::PacketRecord>) {
         let this = self.get_mut();
         for p in new_packets {
             if this.packets.len() >= this.max_size {
@@ -432,13 +452,13 @@ impl PacketLogModelRust {
             this.packets.push_back(p);
         }
     }
-    pub fn clear_packets(self: Pin<&mut Self>) {
+    pub fn clearPackets(self: Pin<&mut Self>) {
         self.get_mut().packets.clear();
     }
-    pub fn packet_count(self: Pin<&mut Self>) -> i32 {
+    pub fn packetCount(self: Pin<&mut Self>) -> i32 {
         self.get_mut().packets.len() as i32
     }
-    pub fn packet_at(self: Pin<&mut Self>, index: i32) -> crate::qobject::PacketRecord {
+    pub fn packetAt(self: Pin<&mut Self>, index: i32) -> crate::qobject::PacketRecord {
         let this = self.get_mut();
         if index >= 0 && (index as usize) < this.packets.len() {
             this.packets[index as usize].clone()
@@ -455,9 +475,9 @@ impl PacketLogModelRust {
             }
         }
     }
-    pub fn remove_older_than(self: Pin<&mut Self>, max_count: i32) {
-        while self.get_mut().packets.len() > max_count as usize {
-            self.get_mut().packets.pop_front();
+    pub fn removeOlderThan(mut self: Pin<&mut Self>, max_count: i32) {
+        while self.as_mut().get_mut().packets.len() > max_count as usize {
+            self.as_mut().get_mut().packets.pop_front();
         }
     }
 }
@@ -475,20 +495,20 @@ impl Default for ProcessListModelRust {
     }
 }
 impl ProcessListModelRust {
-    pub fn append_process(self: Pin<&mut Self>, proc: crate::qobject::ProcessRecord) {
+    pub fn appendProcess(self: Pin<&mut Self>, proc: crate::qobject::ProcessRecord) {
         let this = self.get_mut();
         if this.processes.len() >= this.max_size {
             this.processes.pop_front();
         }
         this.processes.push_back(proc);
     }
-    pub fn clear_processes(self: Pin<&mut Self>) {
+    pub fn clearProcesses(self: Pin<&mut Self>) {
         self.get_mut().processes.clear();
     }
-    pub fn process_count(self: Pin<&mut Self>) -> i32 {
+    pub fn processCount(self: Pin<&mut Self>) -> i32 {
         self.get_mut().processes.len() as i32
     }
-    pub fn process_at(self: Pin<&mut Self>, index: i32) -> crate::qobject::ProcessRecord {
+    pub fn processAt(self: Pin<&mut Self>, index: i32) -> crate::qobject::ProcessRecord {
         let this = self.get_mut();
         if index >= 0 && (index as usize) < this.processes.len() {
             this.processes[index as usize].clone()
@@ -501,9 +521,9 @@ impl ProcessListModelRust {
             }
         }
     }
-    pub fn remove_older_than(self: Pin<&mut Self>, max_count: i32) {
-        while self.get_mut().processes.len() > max_count as usize {
-            self.get_mut().processes.pop_front();
+    pub fn removeOlderThan(mut self: Pin<&mut Self>, max_count: i32) {
+        while self.as_mut().get_mut().processes.len() > max_count as usize {
+            self.as_mut().get_mut().processes.pop_front();
         }
     }
 }
@@ -525,7 +545,7 @@ impl Default for TopologyModelRust {
     }
 }
 impl TopologyModelRust {
-    pub fn set_nodes(self: Pin<&mut Self>, new_nodes: Vec<crate::qobject::TopologyNode>) {
+    pub fn setNodes(self: Pin<&mut Self>, new_nodes: Vec<crate::qobject::TopologyNode>) {
         let this = self.get_mut();
         this.nodes.clear();
         for n in new_nodes {
@@ -535,20 +555,20 @@ impl TopologyModelRust {
             this.nodes.push_back(n);
         }
     }
-    pub fn add_edge(self: Pin<&mut Self>, edge: crate::qobject::TopologyEdge) {
+    pub fn addEdge(self: Pin<&mut Self>, edge: crate::qobject::TopologyEdge) {
         let this = self.get_mut();
         if this.edges.len() >= this.max_edges {
             this.edges.pop_front();
         }
         this.edges.push_back(edge);
     }
-    pub fn node_count(self: Pin<&mut Self>) -> i32 {
+    pub fn nodeCount(self: Pin<&mut Self>) -> i32 {
         self.get_mut().nodes.len() as i32
     }
-    pub fn edge_count(self: Pin<&mut Self>) -> i32 {
+    pub fn edgeCount(self: Pin<&mut Self>) -> i32 {
         self.get_mut().edges.len() as i32
     }
-    pub fn clear_graph(self: Pin<&mut Self>) {
+    pub fn clearGraph(self: Pin<&mut Self>) {
         let this = self.get_mut();
         this.nodes.clear();
         this.edges.clear();

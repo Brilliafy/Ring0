@@ -265,15 +265,14 @@ ApplicationWindow {
 
     function processEvent(evt) {
         if (evt.type === "packet") {
-            eventList.model.insert(0, {
-                timestamp: new Date(evt.timestamp / 1000000).toLocaleTimeString(),
-                src: intToIp(evt.src_ip),
-                dst: intToIp(evt.dst_ip),
-                proto: evt.protocol,
-                pid: evt.pid.toString(),
-                action: evt.action
-            })
-            if (eventList.model.count > 500) eventList.model.remove(500, eventList.model.count - 500)
+            eventList.appendPacket(
+                new Date(evt.timestamp / 1000000).toLocaleTimeString(),
+                intToIp(evt.src_ip),
+                intToIp(evt.dst_ip),
+                evt.protocol,
+                evt.pid.toString(),
+                evt.action
+            )
             ppsLabel.text = (parseInt(ppsLabel.text) + 1).toString()
         } else if (evt.type === "alert") {
             alertCount++
@@ -355,7 +354,6 @@ ApplicationWindow {
     onDoKillProcess: { bridge.killProcess(pid) }
 
     Component.onCompleted: {
-        var bridge = cxx_qt.create("ring0_bridge");
         if (bridge) {
             daemonConnected = bridge.connectDaemon("/run/ring0d.sock");
             bridge.initDbusNotifications();

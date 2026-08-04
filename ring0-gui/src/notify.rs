@@ -1,5 +1,3 @@
-use std::pin::Pin;
-
 pub struct Notification {
     pub summary: String,
     pub body: String,
@@ -7,25 +5,21 @@ pub struct Notification {
     pub actions: Vec<(String, String)>,
 }
 
-pub struct DbusNotifier(pub DbusNotifierInner);
-
-pub struct DbusNotifierInner {
-    _conn: zbus::Connection,
+pub struct DbusNotifier {
+    _conn: Option<zbus::Connection>,
 }
 
 impl DbusNotifier {
     pub fn new() -> Self {
-        DbusNotifier(DbusNotifierInner {
-            _conn: zbus::Connection::new(),
-        })
+        Self { _conn: None }
     }
-}
 
-impl DbusNotifierInner {
-    pub async fn connect(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+    pub async fn connect(
+        &mut self,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         match zbus::Connection::session().await {
             Ok(conn) => {
-                self._conn = conn;
+                self._conn = Some(conn);
                 Ok(true)
             }
             Err(_) => Ok(false),
