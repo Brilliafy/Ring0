@@ -15,7 +15,6 @@ pub mod governor;
 pub mod hotswap;
 pub mod intel;
 pub mod ipc;
-pub mod lsm;
 pub mod power;
 pub mod privesc;
 pub mod process;
@@ -94,7 +93,6 @@ struct Daemon {
     ipc: ipc::IpcServer,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<ipc::DaemonCmd>,
     shutdown: Arc<Notify>,
-    lsm: lsm::LsmManager,
     baseline: baseline::BaselineEngine,
     forensics: forensics::ForensicExporter,
     pcap_buffer: Arc<forensics::RollingPacketBuffer>,
@@ -115,14 +113,17 @@ struct Daemon {
     desktop_sandbox: desktop_sandbox::DesktopSandbox,
     hotswap: hotswap::HotswapManager,
     power: power::PowerGovernor,
+    event_count: std::sync::atomic::AtomicU64,
+    last_status: parking_lot::Mutex<Option<(u64, std::time::Instant)>>,
 }
 
 impl Daemon {
     async fn new(shutdown: Arc<Notify>) -> Result<Self> {
-        let ebpf = ebpf::EbpfManager::load()?;
-        let storage = Arc::new(storage::RocksManager::open(ring0_common::DB_PATH)?);
+        let mut ebpf = ebpf::EbpfManager::load()?;
+        let storage = Arc::new(storage::RocksManager::open(&ring0_common::db_path())?);
         let dpi = dpi::DpiEngine::new()?;
-        let rules = rules::RuleEngine::load("/etc/ring0/rules.yaml").unwrap_or_else(|e| {
+        let rules_path = bundled_config_path("rules.yaml");
+        let rules = rules::RuleEngine::load(&rules_path).unwrap_or_else(|e| {
             warn!("no rules file: {e:?}");
             rules::RuleEngine::empty()
         });
@@ -131,13 +132,12 @@ impl Daemon {
         self_defense.lock_ebpf_maps();
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let _telemetry = telemetry::TelemetryEngine::new();
-        let ipc = ipc::IpcServer::bind(ring0_common::SOCKET_PATH, storage.clone(), cmd_tx.clone())
+        let ipc = ipc::IpcServer::bind(&ring0_common::socket_path(), storage.clone(), cmd_tx.clone())
             .await?;
 
-        let mut lsm = lsm::LsmManager::new();
-        let lsm_attached = lsm.load_and_attach().unwrap_or(false);
+        let lsm_attached = ebpf.lsm_available();
         if lsm_attached {
-            lsm.enable_enforcement();
+            ebpf.enable_lsm_enforcement();
             info!("eBPF LSM inline prevention active");
         } else {
             warn!("eBPF LSM not available — using XDP/tracepoint fallback enforcement");
@@ -167,12 +167,12 @@ impl Daemon {
         let trust = trust::TrustEngine::new();
         let mut fastpath = fastpath::FastPathManager::new();
         fastpath.set_ebpf(&ebpf);
-        let prompt = prompt::PromptEngine::new(cmd_tx.clone(), "/etc/ring0/rules.yaml");
+        let prompt = prompt::PromptEngine::new(cmd_tx.clone(), &rules_path);
         let reassembly = reassembly::ReassemblyEngine::new();
         let enrichment = enrichment::EnrichmentEngine::new();
         let dns_inspector = dns_inspector::DnsInspector::new();
         let threat_blocklist = threat_blocklist::ThreatBlocklist::new();
-        threat_blocklist.load_local_file("/etc/ring0/threat_domains.txt");
+        threat_blocklist.load_local_file(&bundled_config_path("threat_domains.txt"));
         info!(
             "ThreatBlocklist: {} domains loaded",
             threat_blocklist.domain_count()
@@ -190,6 +190,9 @@ impl Daemon {
         let mut power = power::PowerGovernor::new();
         power.start_dbus_monitor();
 
+        let event_count = std::sync::atomic::AtomicU64::new(0);
+        let last_status = parking_lot::Mutex::new(None);
+
         Ok(Self {
             ebpf,
             storage,
@@ -201,7 +204,6 @@ impl Daemon {
             ipc,
             cmd_rx,
             shutdown,
-            lsm,
             baseline,
             forensics,
             pcap_buffer,
@@ -222,13 +224,15 @@ impl Daemon {
             desktop_sandbox,
             hotswap,
             power,
+            event_count,
+            last_status,
         })
     }
 
     async fn run(&mut self) -> Result<()> {
         let mut ring_rx = self.ebpf.subscribe();
         let mut tls_rx = self.ebpf.subscribe_tls();
-        let mut lsm_rx = self.lsm.subscribe();
+        let mut lsm_rx = self.ebpf.subscribe_lsm();
         let mut rootkit_rx = self.ebpf.subscribe_rootkit();
         let mut privesc_rx = self.ebpf.subscribe_privesc();
         let mut corr_tick = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -265,93 +269,76 @@ impl Daemon {
     }
 
     async fn on_raw_event(&self, raw: &[u8]) {
-        if raw.len() < 8 {
+        self.event_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if raw.len() < 16 {
             return;
         }
-        let evt_type = raw[0] & 0x07;
-        match evt_type {
-            0 => {
-                self.on_packet(raw).await;
-            }
-            1 => {
-                self.on_process_exec(raw).await;
-            }
-            2 => {
-                self.on_file_access(raw).await;
-            }
-            3 => {
-                self.on_connect(raw).await;
-            }
-            4 => {
-                self.on_kill_event(raw).await;
-            }
-            5 => {
-                self.on_unlink_event(raw).await;
-            }
+        match raw[0] {
+            0 => self.on_packet(raw).await,
+            1 => self.on_process_exec(raw).await,
+            2 => self.on_file_access(raw).await,
+            3 => self.on_connect(raw).await,
+            4 => self.on_kill_event(raw).await,
+            5 => self.on_unlink_event(raw).await,
+            6 => self.on_tls_event(raw).await,
             _ => {}
         }
     }
 
     async fn on_packet(&self, raw: &[u8]) {
-        let eb = self.enrich_event(raw);
-        self.storage.write_raw(&eb);
-        self.ipc.broadcast_raw(&eb).await;
-        let ts = u64::from_be_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+        if raw.len() < 40 {
+            return;
+        }
+        let ts = u64::from_le_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
+        let src_ip = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
+        let dst_ip = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
+        let src_port = u16::from_le_bytes(raw[24..26].try_into().unwrap_or([0; 2]));
+        let dst_port = u16::from_le_bytes(raw[26..28].try_into().unwrap_or([0; 2]));
+        let proto = raw[28];
+        let pid = u32::from_le_bytes(raw[32..36].try_into().unwrap_or([0; 4]));
+        let action = raw[36];
+        let evt = ipc::build_packet_event(
+            ts, src_ip, dst_ip, src_port, dst_port, proto, pid, action,
+        );
+        self.storage.write_raw(&evt);
+        self.ipc.broadcast_raw(&evt).await;
         self.pcap_buffer.push(raw, ts);
-        if raw.len() >= 24 && raw[22] == 6 {
-            let src_ip = u32::from_be_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
-            let dst_ip = u32::from_be_bytes(raw[12..16].try_into().unwrap_or([0; 4]));
-            let src_port = u16::from_be_bytes(raw[16..18].try_into().unwrap_or([0; 2]));
-            let dst_port = u16::from_be_bytes(raw[18..20].try_into().unwrap_or([0; 2]));
-            let key = reassembly::FlowKey5 {
-                src_ip,
-                dst_ip,
-                src_port,
-                dst_port,
-                protocol: 6,
-            };
-            let seq = u32::from_be_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
-            let payload = if raw.len() > 28 { &raw[28..] } else { &[] };
-            self.reassembly
-                .ingest_tcp_segment(&key, seq, payload, 0, false, &self.dpi);
+        let binary = if pid > 0 {
+            crate::process::ProcessResolver::binary_path(pid)
+                .unwrap_or_else(|| "unknown".into())
+        } else {
+            "kernel".into()
+        };
+        if self.threat_blocklist.check_ports(src_port, dst_port) {
+            let a = build_alert_bytes_rule(
+                4000,
+                3,
+                &format!("blocked port traffic {}.{}.{}.{}:{}",
+                    (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF,
+                    (dst_ip >> 8) & 0xFF, dst_ip & 0xFF, dst_port),
+            );
+            self.storage.write_alert(&a);
+            self.ipc.broadcast_raw(&a).await;
         }
-        let src_port = u16::from_be_bytes(raw[16..18].try_into().unwrap_or([0; 2]));
-        let dst_port = u16::from_be_bytes(raw[18..20].try_into().unwrap_or([0; 2]));
-        let _dst_ip = u32::from_be_bytes(raw[12..16].try_into().unwrap_or([0; 4]));
-        if src_port == 53 || dst_port == 53 {
-            let dns_data = raw;
-            if let Some(query) = dns_inspector::DnsInspector::parse_dns_query(dns_data) {
-                if self.threat_blocklist.check_domain(&query.qname) {
-                    let a = build_alert_bytes_rule(
-                        4001,
-                        3,
-                        &format!("DNS threat: {} QTYPE={}", query.qname, query.qtype),
-                    );
-                    self.storage.write_alert(&a);
-                    self.ipc.broadcast_raw(&a).await;
-                    info!("[DNS_THREAT] blocked domain: {}", query.qname);
-                }
-                let _ = self.threat_blocklist.check_domain(&query.qname);
-            }
-            if let Some(resp) = dns_inspector::DnsInspector::parse_dns_response(dns_data) {
-                let chain = dns_inspector::DnsInspector::extract_cname_chain(&resp);
-                for record in &chain {
-                    let a = build_alert_bytes_rule(4002, 2, &format!("CNAME chain: {record}"));
-                    self.storage.write_alert(&a);
-                    info!("[DNS_CNAME] {record}");
-                }
-            }
-        }
+        let _ = (src_ip, proto, action, binary);
     }
 
     async fn on_process_exec(&self, raw: &[u8]) {
-        let pid = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
-        let uid = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]);
+        if raw.len() < 44 {
+            return;
+        }
+        let pid = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
+        let ppid = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
+        let uid = u32::from_le_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
+        let comm = if raw[28..44].iter().position(|b| *b == 0).unwrap_or(16) > 0 {
+            String::from_utf8_lossy(&raw[28..44]).trim_end_matches('\0').to_string()
+        } else {
+            String::new()
+        };
         let binary =
-            crate::process::ProcessResolver::binary_path(pid).unwrap_or_else(|| "unknown".into());
+            crate::process::ProcessResolver::binary_path(pid).unwrap_or_else(|| comm.clone());
         let cmdline =
             crate::process::ProcessResolver::cmdline(pid).unwrap_or_else(|| "unknown".into());
-        let ppid = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]);
         let parent_binary = crate::process::ProcessResolver::binary_path(ppid);
         if let Some(ref pb) = parent_binary {
             self.baseline.record_exec(&binary, Some(pb));
@@ -374,38 +361,51 @@ impl Daemon {
                 self.ipc.broadcast_raw(&a).await;
             }
         }
-        let evt = ipc::build_process_exec_event(pid, uid, uid, &binary, &cmdline);
+        if self.ebpf.binary_blocked(&binary) {
+            let a = build_alert_bytes_rule(9001, 4, &format!("blocked binary executed: {binary}"));
+            self.storage.write_alert(&a);
+            self.ipc.broadcast_raw(&a).await;
+            let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+        let evt = ipc::build_process_exec_event(pid, ppid, uid, &binary, &cmdline);
         self.storage.write_raw(&evt);
         self.ipc.broadcast_raw(&evt).await;
     }
 
     async fn on_file_access(&self, raw: &[u8]) {
-        let pid = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
-        let binary =
-            crate::process::ProcessResolver::binary_path(pid).unwrap_or_else(|| "unknown".into());
+        if raw.len() < 92 {
+            return;
+        }
+        let pid = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
+        let uid = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
         let mut fnbuf = String::new();
-        if raw.len() > 20 {
-            let end = raw[20..84].iter().position(|b| *b == 0).unwrap_or(64);
-            if let Ok(s) = std::str::from_utf8(&raw[20..20 + end]) {
+        if let Some(end) = raw[24..88].iter().position(|b| *b == 0) {
+            if let Ok(s) = std::str::from_utf8(&raw[24..24 + end]) {
                 fnbuf = s.to_string();
             }
         }
+        let binary =
+            crate::process::ProcessResolver::binary_path(pid).unwrap_or_else(|| "unknown".into());
         self.correlation.push_file(pid, &fnbuf);
         for rid in self.rules.check_file_access(&fnbuf, pid, true) {
             let a = build_alert_bytes_hids(rid, &binary, &fnbuf);
             self.storage.write_alert(&a);
             self.ipc.broadcast_raw(&a).await;
         }
-        let evt = ipc::build_file_access_event(pid, 0, &binary, &fnbuf);
+        let evt = ipc::build_file_access_event(pid, uid, &binary, &fnbuf);
         self.storage.write_raw(&evt);
         self.ipc.broadcast_raw(&evt).await;
     }
 
     async fn on_connect(&self, raw: &[u8]) {
-        let pid = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
-        let dip = u32::from_be_bytes([raw[16], raw[17], raw[18], raw[19]]);
-        let dp = u16::from_be_bytes([raw[20], raw[21]]);
-        let proto = raw[22];
+        if raw.len() < 32 {
+            return;
+        }
+        let pid = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
+        let uid = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
+        let dip = u32::from_le_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
+        let dp = u16::from_le_bytes(raw[28..30].try_into().unwrap_or([0; 2]));
+        let proto = raw[30];
         crate::process::ProcessResolver::push_socket(pid, dip, dp, proto);
         self.correlation.push_connect(pid, dip, dp);
         self.baseline.record_connection(dip, dp);
@@ -425,7 +425,7 @@ impl Daemon {
             self.ipc.broadcast_raw(&a).await;
             info!("[SANDBOX] {}", anomaly.description);
         }
-        let evt = ipc::build_connect_event(pid, 0, &binary, dip, dp, proto);
+        let evt = ipc::build_connect_event(pid, uid, &binary, dip, dp, proto);
         self.storage.write_raw(&evt);
         self.ipc.broadcast_raw(&evt).await;
 
@@ -435,7 +435,8 @@ impl Daemon {
             let a = build_alert_bytes_rule(
                 4003,
                 2,
-                &format!("Contextual block: {}:{} by PID {pid}", dip, dp),
+                &format!("Contextual block: {}.{}.{}.{}:{} by PID {pid}",
+                    (dip >> 24) & 0xFF, (dip >> 16) & 0xFF, (dip >> 8) & 0xFF, dip & 0xFF, dp),
             );
             self.storage.write_alert(&a);
             self.ipc.broadcast_raw(&a).await;
@@ -443,13 +444,7 @@ impl Daemon {
         }
         match trust_status {
             trust::TrustStatus::TrustedSystemPackage | trust::TrustStatus::TrustedBinary => {
-                let _ = self.fastpath.mark_flow_safe(
-                    u32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]),
-                    dip,
-                    0,
-                    dp,
-                    proto,
-                );
+                let _ = self.fastpath.mark_flow_safe(pid, dip, 0, dp, proto);
                 info!("TrustEngine: PID {pid} {binary} trusted — flow offloaded");
             }
             trust::TrustStatus::Untrusted => {
@@ -492,9 +487,12 @@ impl Daemon {
     }
 
     async fn on_kill_event(&self, raw: &[u8]) {
-        let attacker = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
-        let target = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]);
-        let sig = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]);
+        if raw.len() < 28 {
+            return;
+        }
+        let attacker = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
+        let target = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
+        let sig = u32::from_le_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
         if let Some(evt) = self.self_defense.ingest_kill_attempt(attacker, target, sig) {
             let alert = build_self_defense_alert(&evt);
             self.storage.write_alert(&alert);
@@ -503,11 +501,13 @@ impl Daemon {
     }
 
     async fn on_unlink_event(&self, raw: &[u8]) {
-        let pid = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+        if raw.len() < 120 {
+            return;
+        }
+        let pid = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
         let mut path = String::new();
-        if raw.len() > 12 {
-            let end = raw[12..108].iter().position(|b| *b == 0).unwrap_or(96);
-            if let Ok(s) = std::str::from_utf8(&raw[12..12 + end]) {
+        if let Some(end) = raw[24..120].iter().position(|b| *b == 0) {
+            if let Ok(s) = std::str::from_utf8(&raw[24..24 + end]) {
                 path = s.to_string();
             }
         }
@@ -519,11 +519,11 @@ impl Daemon {
     }
 
     async fn on_tls_event(&self, raw: &[u8]) {
-        let payload = if raw.len() > 24 {
-            &raw[24..]
-        } else {
+        self.event_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if raw.len() < 24 {
             return;
-        };
+        }
+        let payload = if raw.len() > 28 { &raw[28..] } else { &[] };
         for m in self.dpi.scan_payload(payload) {
             let alert = build_alert_bytes_rule(m.rule_id, m.severity, &m.signature_name);
             self.storage.write_alert(&alert);
@@ -532,21 +532,21 @@ impl Daemon {
     }
 
     async fn on_lsm_event(&self, raw: &[u8]) {
-        if raw.len() < 32 {
+        self.event_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if raw.len() < 132 {
             return;
         }
         let event_type = raw[24];
         let denied = raw[25];
-        let _ts = u64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
-        let pid = u32::from_le_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
-        let path_end = raw[26..122].iter().position(|b| *b == 0).unwrap_or(96);
+        let pid = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
+        let path_end = raw[28..124].iter().position(|b| *b == 0).unwrap_or(96);
         let path = if path_end > 0 {
-            String::from_utf8_lossy(&raw[26..26 + path_end]).to_string()
+            String::from_utf8_lossy(&raw[28..28 + path_end]).to_string()
         } else {
             String::new()
         };
-        let dst_ip = u32::from_be_bytes(raw[122..126].try_into().unwrap_or([0; 4]));
-        let dst_port = u16::from_be_bytes(raw[126..128].try_into().unwrap_or([0; 2]));
+        let dst_ip = u32::from_le_bytes(raw[124..128].try_into().unwrap_or([0; 4]));
+        let dst_port = u16::from_le_bytes(raw[128..130].try_into().unwrap_or([0; 2]));
 
         let event_name = match event_type {
             0 => "file_open",
@@ -599,31 +599,33 @@ impl Daemon {
     }
 
     async fn on_privesc_event(&self, raw: &[u8]) {
-        if raw.len() < 24 {
+        self.event_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if raw.len() < 28 {
             return;
         }
-        let pid = u32::from_le_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
-        let uid = u32::from_le_bytes(raw[12..16].try_into().unwrap_or([0; 4]));
-        if raw.len() >= 32 {
-            let new_uid = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
-            self.privesc.ingest_setuid_event(pid, uid, new_uid);
-            let a = build_alert_bytes_rule(
-                2001,
-                4,
-                &format!("setuid escalation PID {} {}->{}", pid, uid, new_uid),
-            );
-            self.storage.write_alert(&a);
-            self.ipc.broadcast_raw(&a).await;
-        } else {
-            let capability = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
-            let target = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
-            if target > 0 {
-                self.privesc.ingest_ptrace_attempt(pid, uid, target);
-                let a =
-                    build_alert_bytes_rule(2002, 4, &format!("ptrace PID {} -> {}", pid, target));
+        let pid = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
+        let uid = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
+        match raw[0] {
+            ebpf::KIND_SETUID => {
+                let new_uid = u32::from_le_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
+                self.privesc.ingest_setuid_event(pid, uid, new_uid);
+                let a = build_alert_bytes_rule(
+                    2001,
+                    4,
+                    &format!("setuid escalation PID {} {}->{}", pid, uid, new_uid),
+                );
                 self.storage.write_alert(&a);
                 self.ipc.broadcast_raw(&a).await;
-            } else {
+            }
+            ebpf::KIND_PTRACE => {
+                let target = u32::from_le_bytes(raw[28..32].try_into().unwrap_or([0; 4]));
+                self.privesc.ingest_ptrace_attempt(pid, uid, target);
+                let a = build_alert_bytes_rule(2002, 4, &format!("ptrace PID {} -> {}", pid, target));
+                self.storage.write_alert(&a);
+                self.ipc.broadcast_raw(&a).await;
+            }
+            ebpf::KIND_CAP => {
+                let capability = u32::from_le_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
                 self.privesc.ingest_capable_check(pid, uid, capability);
                 let a = build_alert_bytes_rule(
                     2003,
@@ -633,22 +635,26 @@ impl Daemon {
                 self.storage.write_alert(&a);
                 self.ipc.broadcast_raw(&a).await;
             }
+            _ => {}
         }
         containment::ContainmentManager::quarantine_pid(pid);
     }
 
     async fn on_rootkit_event(&self, raw: &[u8]) {
-        if raw.len() < 16 {
+        self.event_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if raw.len() < 60 {
             return;
         }
-        let _ts = u64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
-        let pid = u32::from_le_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
-        let _uid = u32::from_le_bytes(raw[12..16].try_into().unwrap_or([0; 4]));
-        let _evt_type = match raw.len() {
-            48.. => {
-                let prot = u32::from_le_bytes(raw[32..36].try_into().unwrap_or([0; 4]));
-                let flags = u32::from_le_bytes(raw[36..40].try_into().unwrap_or([0; 4]));
-                let len = u64::from_le_bytes(raw[24..32].try_into().unwrap_or([0; 8]));
+        let pid = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
+        let _uid = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
+        match raw[0] {
+            ebpf::KIND_MMAP => {
+                if raw.len() < 56 {
+                    return;
+                }
+                let prot = u32::from_le_bytes(raw[40..44].try_into().unwrap_or([0; 4]));
+                let flags = u32::from_le_bytes(raw[44..48].try_into().unwrap_or([0; 4]));
+                let len = u64::from_le_bytes(raw[32..40].try_into().unwrap_or([0; 8]));
                 if let Some(finding) = self.rootkit.ingest_wx_mmap_event(pid, prot, flags, len) {
                     let desc = finding.description.clone();
                     let a = build_alert_bytes_rule(7001, 3, &desc);
@@ -656,9 +662,11 @@ impl Daemon {
                     self.ipc.broadcast_raw(&a).await;
                     info!("[ROOTKIT] {desc}");
                 }
-                return;
             }
-            40.. => {
+            ebpf::KIND_MODULE => {
+                if raw.len() < 92 {
+                    return;
+                }
                 let name_end = raw[24..88].iter().position(|b| *b == 0).unwrap_or(64);
                 let name = if name_end > 0 {
                     String::from_utf8_lossy(&raw[24..24 + name_end]).to_string()
@@ -673,16 +681,15 @@ impl Daemon {
                     self.ipc.broadcast_raw(&a).await;
                     info!("[ROOTKIT] {desc}");
                 }
-                return;
             }
-            _ => {
-                let name_end = raw[20..52].iter().position(|b| *b == 0).unwrap_or(32);
+            ebpf::KIND_MEMFD => {
+                let name_end = raw[28..60].iter().position(|b| *b == 0).unwrap_or(32);
                 let name = if name_end > 0 {
-                    String::from_utf8_lossy(&raw[20..20 + name_end]).to_string()
+                    String::from_utf8_lossy(&raw[28..28 + name_end]).to_string()
                 } else {
                     String::new()
                 };
-                let flags = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
+                let flags = u32::from_le_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
                 if let Some(finding) = self.rootkit.ingest_memfd_event(pid, &name, flags) {
                     let desc = finding.description.clone();
                     let a = build_alert_bytes_rule(7000, 3, &desc);
@@ -699,7 +706,8 @@ impl Daemon {
                     }
                 }
             }
-        };
+            _ => {}
+        }
     }
 
     fn tick_rootkit_scan(&self) {
@@ -819,6 +827,18 @@ impl Daemon {
                     error!("unblock_ip: {e:?}")
                 }
             }
+            BlockPort(port) => {
+                if let Err(e) = self.ebpf.block_port(port) {
+                    error!("block_port: {e:?}")
+                }
+                self.threat_blocklist.block_port(port);
+            }
+            UnblockPort(port) => {
+                if let Err(e) = self.ebpf.unblock_port(port) {
+                    error!("unblock_port: {e:?}")
+                }
+                self.threat_blocklist.unblock_port(port);
+            }
             KillProcess(pid) => {
                 let r = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
                 if r == 0 {
@@ -884,14 +904,67 @@ impl Daemon {
             ),
             UpdateSettings(json) => info!("Settings: {json}"),
             RunDoctor => info!("Doctor requested"),
+            Status => {
+                let total = self.event_count.load(std::sync::atomic::Ordering::Relaxed);
+                let mut last = self.last_status.lock();
+                let now = std::time::Instant::now();
+                let eps = match *last {
+                    Some((prev, prev_at)) => {
+                        let dt = now.duration_since(prev_at).as_secs_f64();
+                        if dt > 0.0 {
+                            (total.saturating_sub(prev)) as f64 / dt
+                        } else {
+                            0.0
+                        }
+                    }
+                    None => 0.0,
+                };
+                *last = Some((total, now));
+                let cpu = self.governor.daemon_cpu_pct();
+                let ram = read_vm_rss();
+                let filters = self.ebpf.blocked_ips();
+                let status = ipc::build_status_event(&filters, cpu, ram, eps);
+                self.ipc.broadcast_sync(&status);
+            }
         }
     }
     fn cleanup(&mut self) {
         self.ebpf.detach();
-        self.lsm.detach();
         self.storage.flush();
-        std::fs::remove_file(ring0_common::SOCKET_PATH).ok();
+        std::fs::remove_file(ring0_common::socket_path()).ok();
     }
+}
+
+/// Resolve a config file path: prefer the system path, fall back to the bundled
+/// config directory shipped with the repo.
+fn bundled_config_path(name: &str) -> String {
+    let system = format!("/etc/ring0/{name}");
+    if std::path::Path::new(&system).exists() {
+        return system;
+    }
+    let bundled = format!("{}/config/{name}", env!("CARGO_MANIFEST_DIR"));
+    if std::path::Path::new(&bundled).exists() {
+        return bundled;
+    }
+    system
+}
+
+fn read_vm_rss() -> u64 {
+    let status = match std::fs::read_to_string("/proc/self/status") {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            return kb * 1024;
+        }
+    }
+    0
 }
 
 fn build_alert_bytes_hids(rid: u32, binary: &str, path: &str) -> Vec<u8> {

@@ -168,7 +168,18 @@ Rectangle {
                 text: "Save Settings"
                 highlighted: true
                 onClicked: {
-                    /* save via bridge */
+                    var cfg = {
+                        syslogEndpoint: syslogEndpoint.text,
+                        syslogPort: syslogPort.value,
+                        syslogTls: syslogTls.checked,
+                        slackWebhook: slackWebhook.text,
+                        discordWebhook: discordWebhook.text,
+                        cpuThreshold: cpuSlider.value,
+                        dgaSensitivity: entropySlider.value,
+                        darkMode: settingsRoot.darkMode
+                    }
+                    bridge.updateSettings(JSON.stringify(cfg))
+                    settingsStatus.text = "Saved"
                 }
             }
             Button {

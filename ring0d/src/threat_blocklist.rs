@@ -31,6 +31,7 @@ pub struct ThreatBlocklist {
     ac_matcher: Arc<RwLock<Option<AhoCorasick>>>,
     feed_stats: Arc<RwLock<HashMap<String, FeedStat>>>,
     last_sync: Arc<RwLock<String>>,
+    ports: Arc<RwLock<HashSet<u16>>>,
 }
 
 struct FeedStat {
@@ -46,7 +47,25 @@ impl ThreatBlocklist {
             ac_matcher: Arc::new(RwLock::new(None)),
             feed_stats: Arc::new(RwLock::new(HashMap::new())),
             last_sync: Arc::new(RwLock::new("Never".into())),
+            ports: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    pub fn check_ports(&self, src: u16, dst: u16) -> bool {
+        let ports = self.ports.read();
+        ports.contains(&src) || ports.contains(&dst)
+    }
+
+    pub fn block_port(&self, port: u16) {
+        self.ports.write().insert(port);
+    }
+
+    pub fn unblock_port(&self, port: u16) {
+        self.ports.write().remove(&port);
+    }
+
+    pub fn port_count(&self) -> usize {
+        self.ports.read().len()
     }
 
     pub async fn sync_all_feeds(&self) -> usize {

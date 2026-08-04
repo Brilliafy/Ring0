@@ -15,6 +15,16 @@ pub const SOCKET_PATH: &str = "/run/ring0d.sock";
 pub const DB_PATH: &str = "/var/lib/ring0";
 pub const BPF_RINGBUF_SIZE: u32 = 256 * 1024;
 
+/// Resolve the daemon Unix socket path (override with `RING0_SOCKET`).
+pub fn socket_path() -> String {
+    std::env::var("RING0_SOCKET").unwrap_or_else(|_| SOCKET_PATH.to_string())
+}
+
+/// Resolve the RocksDB path (override with `RING0_DB`).
+pub fn db_path() -> String {
+    std::env::var("RING0_DB").unwrap_or_else(|_| DB_PATH.to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     Packet,

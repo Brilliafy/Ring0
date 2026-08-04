@@ -86,8 +86,26 @@ pub struct QosRateVal {
     pub last_update_ns: u64,
 }
 
+// Event kinds (first byte of every ring buffer entry)
+pub const KIND_PACKET: u8 = 0;
+pub const KIND_PROCESS_EXEC: u8 = 1;
+pub const KIND_FILE_ACCESS: u8 = 2;
+pub const KIND_CONNECT: u8 = 3;
+pub const KIND_KILL: u8 = 4;
+pub const KIND_UNLINK: u8 = 5;
+pub const KIND_TLS: u8 = 6;
+pub const KIND_LSM: u8 = 10;
+pub const KIND_CANARY: u8 = 11;
+pub const KIND_SETUID: u8 = 12;
+pub const KIND_CAP: u8 = 13;
+pub const KIND_PTRACE: u8 = 14;
+pub const KIND_MEMFD: u8 = 20;
+pub const KIND_MMAP: u8 = 21;
+pub const KIND_MODULE: u8 = 22;
+
 #[repr(C)]
 pub struct PacketEvent {
+    pub kind: u8,
     pub timestamp: u64,
     pub src_ip: u32,
     pub dst_ip: u32,
@@ -100,6 +118,7 @@ pub struct PacketEvent {
 
 #[repr(C)]
 pub struct ProcessExecEvent {
+    pub kind: u8,
     pub timestamp: u64,
     pub pid: u32,
     pub ppid: u32,
@@ -109,6 +128,7 @@ pub struct ProcessExecEvent {
 
 #[repr(C)]
 pub struct FileAccessEvent {
+    pub kind: u8,
     pub timestamp: u64,
     pub pid: u32,
     pub uid: u32,
@@ -118,6 +138,7 @@ pub struct FileAccessEvent {
 
 #[repr(C)]
 pub struct ConnectEvent {
+    pub kind: u8,
     pub timestamp: u64,
     pub pid: u32,
     pub uid: u32,
@@ -128,6 +149,7 @@ pub struct ConnectEvent {
 
 #[repr(C)]
 pub struct KillEvent {
+    pub kind: u8,
     pub timestamp: u64,
     pub attacker_pid: u32,
     pub target_pid: u32,
@@ -136,6 +158,7 @@ pub struct KillEvent {
 
 #[repr(C)]
 pub struct UnlinkEvent {
+    pub kind: u8,
     pub timestamp: u64,
     pub pid: u32,
     pub uid: u32,
@@ -144,6 +167,7 @@ pub struct UnlinkEvent {
 
 #[repr(C)]
 pub struct LsmEvent {
+    pub kind: u8,
     pub timestamp: u64,
     pub pid: u32,
     pub uid: u32,
@@ -156,6 +180,7 @@ pub struct LsmEvent {
 
 #[repr(C)]
 pub struct SetuidEvent {
+    pub kind: u8,
     pub timestamp: u64,
     pub pid: u32,
     pub old_uid: u32,
@@ -164,14 +189,17 @@ pub struct SetuidEvent {
 
 #[repr(C)]
 pub struct CapEvent {
+    pub kind: u8,
     pub timestamp: u64,
     pub pid: u32,
     pub uid: u32,
     pub capability: u32,
+    pub target: u32,
 }
 
 #[repr(C)]
 pub struct MemfdEvent {
+    pub kind: u8,
     pub timestamp: u64,
     pub pid: u32,
     pub uid: u32,
@@ -181,6 +209,7 @@ pub struct MemfdEvent {
 
 #[repr(C)]
 pub struct MmapEvent {
+    pub kind: u8,
     pub timestamp: u64,
     pub pid: u32,
     pub uid: u32,
@@ -193,6 +222,7 @@ pub struct MmapEvent {
 
 #[repr(C)]
 pub struct ModuleEvent {
+    pub kind: u8,
     pub timestamp: u64,
     pub pid: u32,
     pub uid: u32,
@@ -202,6 +232,7 @@ pub struct ModuleEvent {
 
 #[repr(C)]
 pub struct CanaryEvent {
+    pub kind: u8,
     pub timestamp: u64,
     pub pid: u32,
     pub uid: u32,
@@ -212,6 +243,7 @@ pub struct CanaryEvent {
 
 #[repr(C)]
 pub struct TlsEvent {
+    pub kind: u8,
     pub timestamp: u64,
     pub pid: u32,
     pub direction: u8,
@@ -316,8 +348,8 @@ unsafe fn try_ring0_xdp(ctx: &XdpContext) -> Result<u32, u32> {
     }
 
     if let Some(mut entry) = RING_BUF.reserve::<PacketEvent>(0) {
-        entry.write(PacketEvent {
-            timestamp: ktime_get_ns(),
+        entry.write(PacketEvent{
+            kind: KIND_PACKET,timestamp: ktime_get_ns(),
             src_ip,
             dst_ip,
             src_port: sp,
@@ -404,8 +436,8 @@ unsafe fn try_ring0_tc(ctx: &TcContext) -> Result<i32, i32> {
     }
 
     if let Some(mut entry) = RING_BUF.reserve::<PacketEvent>(0) {
-        entry.write(PacketEvent {
-            timestamp: ktime_get_ns(),
+        entry.write(PacketEvent{
+            kind: KIND_PACKET,timestamp: ktime_get_ns(),
             src_ip,
             dst_ip,
             src_port: sp,
@@ -427,8 +459,8 @@ pub fn ring0_sched_exec(_ctx: BtfTracePointContext) -> u32 {
     let uid = unsafe { aya_ebpf::helpers::bpf_get_current_uid_gid() } as u32;
     let comm = unsafe { aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]) };
     if let Some(mut entry) = unsafe { RING_BUF.reserve::<ProcessExecEvent>(0) } {
-        entry.write(ProcessExecEvent {
-            timestamp: ktime_get_ns(),
+        entry.write(ProcessExecEvent{
+            kind: KIND_PROCESS_EXEC,timestamp: ktime_get_ns(),
             pid,
             ppid: 0,
             uid,
@@ -453,8 +485,8 @@ pub fn ring0_openat(ctx: BtfTracePointContext) -> u32 {
     }
     if path_matches_blocklist(&filename) && uid != 0 {
         if let Some(mut entry) = unsafe { RING_BUF.reserve::<FileAccessEvent>(0) } {
-            entry.write(FileAccessEvent {
-                timestamp: ktime_get_ns(),
+            entry.write(FileAccessEvent{
+                kind: KIND_FILE_ACCESS,timestamp: ktime_get_ns(),
                 pid,
                 uid,
                 filename,
@@ -501,8 +533,8 @@ pub fn ring0_connect(ctx: BtfTracePointContext) -> u32 {
     let port = unsafe { u16::from_be(ptr::read_unaligned((addr_ptr.add(2)) as *const u16)) };
     let ip = unsafe { ptr::read_unaligned((addr_ptr.add(4)) as *const u32) };
     if let Some(mut entry) = unsafe { RING_BUF.reserve::<ConnectEvent>(0) } {
-        entry.write(ConnectEvent {
-            timestamp: ktime_get_ns(),
+        entry.write(ConnectEvent{
+            kind: KIND_CONNECT,timestamp: ktime_get_ns(),
             pid,
             uid,
             dst_ip: ip,
@@ -521,8 +553,8 @@ pub fn ring0_kill(ctx: BtfTracePointContext) -> u32 {
     let sig = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const u32).add(2)) };
     if (sig == 9 || sig == 15) && target_pid > 0 {
         if let Some(mut entry) = unsafe { RING_BUF.reserve::<KillEvent>(0) } {
-            entry.write(KillEvent {
-                timestamp: ktime_get_ns(),
+            entry.write(KillEvent{
+                kind: KIND_KILL,timestamp: ktime_get_ns(),
                 attacker_pid: attacker,
                 target_pid,
                 sig,
@@ -567,8 +599,8 @@ pub fn ring0_unlinkat(ctx: BtfTracePointContext) -> u32 {
     }
     if uid != 0 && (path_matches_daemon(&path) || path_matches_socket(&path)) {
         if let Some(mut entry) = unsafe { RING_BUF.reserve::<UnlinkEvent>(0) } {
-            entry.write(UnlinkEvent {
-                timestamp: ktime_get_ns(),
+            entry.write(UnlinkEvent{
+                kind: KIND_UNLINK,timestamp: ktime_get_ns(),
                 pid,
                 uid,
                 path,
@@ -629,8 +661,8 @@ pub fn ring0_lsm_file_open(ctx: LsmContext) -> i32 {
         return 0;
     }
     if path_matches_protected(&path_buf) {
-        let evt = LsmEvent {
-            timestamp: ktime_get_ns(),
+        let evt = LsmEvent{
+            kind: KIND_LSM,timestamp: ktime_get_ns(),
             pid,
             uid,
             event_type: 0,
@@ -671,8 +703,8 @@ pub fn ring0_lsm_bprm_check(ctx: LsmContext) -> i32 {
     }
     let comm = unsafe { aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]) };
     if binary_matches_blocklist(&comm) {
-        let evt = LsmEvent {
-            timestamp: ktime_get_ns(),
+        let evt = LsmEvent{
+            kind: KIND_LSM,timestamp: ktime_get_ns(),
             pid,
             uid,
             event_type: 1,
@@ -713,8 +745,8 @@ pub fn ring0_lsm_socket_connect(ctx: LsmContext) -> i32 {
     if unsafe { BLOCKED_IPS.get(&Key::new(32, ip)).is_some() }
         || unsafe { BLOCKED_PORTS.get_ptr(&port).is_some() }
     {
-        let evt = LsmEvent {
-            timestamp: ktime_get_ns(),
+        let evt = LsmEvent{
+            kind: KIND_LSM,timestamp: ktime_get_ns(),
             pid,
             uid: 0,
             event_type: 2,
@@ -758,8 +790,8 @@ pub fn ring0_canary_unlinkat(ctx: BtfTracePointContext) -> u32 {
     let comm = unsafe { aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]) };
     if is_canary_inode(0) {
         if let Some(mut buf) = unsafe { CANARY_EVENTS.reserve::<CanaryEvent>(0) } {
-            buf.write(CanaryEvent {
-                timestamp: ktime_get_ns(),
+            buf.write(CanaryEvent{
+                kind: KIND_CANARY,timestamp: ktime_get_ns(),
                 pid,
                 uid,
                 inode: 0,
@@ -782,11 +814,12 @@ pub fn ring0_lsm_ptrace(ctx: LsmContext) -> i32 {
     let pid = ctx.pid();
     let uid = ctx.uid();
     let target = unsafe { ptr::read_unaligned(ctx.as_ptr() as *const u32) };
-    let evt = CapEvent {
-        timestamp: ktime_get_ns(),
+    let evt = CapEvent{
+        kind: KIND_PTRACE,timestamp: ktime_get_ns(),
         pid,
         uid,
-        capability: target,
+        capability: 0,
+        target,
     };
     if let Some(mut buf) = unsafe { PRIVESC_EVENTS.reserve::<CapEvent>(0) } {
         buf.write(evt);
@@ -804,11 +837,12 @@ pub fn ring0_lsm_capable(ctx: LsmContext) -> i32 {
     let uid = ctx.uid();
     let cap = unsafe { ptr::read_unaligned(ctx.as_ptr() as *const u32) };
     if cap == 21 || cap == 12 || cap == 17 {
-        let evt = CapEvent {
-            timestamp: ktime_get_ns(),
+        let evt = CapEvent{
+            kind: KIND_CAP,timestamp: ktime_get_ns(),
             pid,
             uid,
             capability: cap,
+            target: 0,
         };
         if let Some(mut buf) = unsafe { PRIVESC_EVENTS.reserve::<CapEvent>(0) } {
             buf.write(evt);
@@ -825,8 +859,8 @@ pub fn ring0_setuid(ctx: BtfTracePointContext) -> u32 {
     let uid = unsafe { aya_ebpf::helpers::bpf_get_current_uid_gid() } as u32;
     let new_uid = unsafe { ptr::read_unaligned((ctx.as_ptr() as *const u32).add(1)) };
     if new_uid == 0 && uid != 0 {
-        let evt = SetuidEvent {
-            timestamp: ktime_get_ns(),
+        let evt = SetuidEvent{
+            kind: KIND_SETUID,timestamp: ktime_get_ns(),
             pid,
             old_uid: uid,
             new_uid,
@@ -854,8 +888,8 @@ pub fn ring0_memfd_create(ctx: BtfTracePointContext) -> u32 {
         }
     }
     if let Some(mut entry) = unsafe { ROOTKIT_EVENTS.reserve::<MemfdEvent>(0) } {
-        entry.write(MemfdEvent {
-            timestamp: ktime_get_ns(),
+        entry.write(MemfdEvent{
+            kind: KIND_MEMFD,timestamp: ktime_get_ns(),
             pid,
             uid,
             flags,
@@ -879,8 +913,8 @@ pub fn ring0_mmap(ctx: BtfTracePointContext) -> u32 {
     let is_anon_exec = (flags & 0x20) != 0 && (prot & 4) != 0;
     if is_wx || (is_anon_exec && file_fd == 0xFFFFFFFFFFFFFFFFu64) {
         if let Some(mut entry) = unsafe { ROOTKIT_EVENTS.reserve::<MmapEvent>(0) } {
-            entry.write(MmapEvent {
-                timestamp: ktime_get_ns(),
+            entry.write(MmapEvent{
+                kind: KIND_MMAP,timestamp: ktime_get_ns(),
                 pid,
                 uid,
                 addr,
@@ -908,8 +942,8 @@ pub fn ring0_finit_module(ctx: BtfTracePointContext) -> u32 {
         }
     }
     if let Some(mut entry) = unsafe { ROOTKIT_EVENTS.reserve::<ModuleEvent>(0) } {
-        entry.write(ModuleEvent {
-            timestamp: ktime_get_ns(),
+        entry.write(ModuleEvent{
+            kind: KIND_MODULE,timestamp: ktime_get_ns(),
             pid,
             uid,
             name,
@@ -934,8 +968,8 @@ fn capture_tls_event(ctx: &ProbeContext, direction: u8) {
                 buf[i] = unsafe { *buf_ptr.add(i) };
             }
         }
-        entry.write(TlsEvent {
-            timestamp: ktime_get_ns(),
+        entry.write(TlsEvent{
+            kind: KIND_TLS,timestamp: ktime_get_ns(),
             pid,
             direction,
             len,
