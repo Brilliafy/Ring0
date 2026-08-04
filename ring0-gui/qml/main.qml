@@ -2,6 +2,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
+import Qt.labs.platform 1.1
 
 ApplicationWindow {
     id: appWindow
@@ -25,7 +26,7 @@ ApplicationWindow {
     SystemTrayIcon {
         id: trayIcon
         visible: true
-        iconSource: protectionStatus === 0 ? "qrc:/icons/shield_green.png" :
+        icon.source: protectionStatus === 0 ? "qrc:/icons/shield_green.png" :
                      protectionStatus === 1 ? "qrc:/icons/shield_yellow.png" :
                      "qrc:/icons/shield_red.png"
         tooltip: "RingZero — " + (protectionStatus === 0 ? "Protected" :
