@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -16,6 +17,12 @@ const FIM_DIRS: &[&str] = &[
     "/etc/security",
 ];
 
+/// Files larger than this are skipped by the baseline scan: hashing a
+/// multi-hundred-MB shared library adds little detection value while making
+/// the startup scan take minutes.
+const MAX_FIM_FILE_SIZE: u64 = 256 * 1024 * 1024;
+
+#[derive(Clone)]
 pub struct FimEngine {
     baseline: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     db: Arc<rocksdb::DB>,
@@ -62,17 +69,46 @@ impl FimEngine {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_file() {
-                    if let Ok(data) = fs::read(&path) {
-                        let hash = Sha256::digest(&data).to_vec();
-                        let path_str = path.display().to_string();
-                        baseline.insert(path_str, hash);
-                        count += 1;
-                    }
+                // Follow nothing: `d_type` from the directory entry (skips
+                // symlinks, which would duplicate the target's hash).
+                let is_regular = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+                if !is_regular {
+                    continue;
                 }
+                // Skip oversized files (e.g. huge shared libraries).
+                if entry
+                    .metadata()
+                    .map(|m| m.len() > MAX_FIM_FILE_SIZE)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let hash = match Self::sha256_file(&path) {
+                    Some(h) => h,
+                    None => continue,
+                };
+                let path_str = path.display().to_string();
+                baseline.insert(path_str, hash);
+                count += 1;
             }
         }
         count
+    }
+
+    /// SHA-256 of a file, computed with a streaming reader (bounded memory).
+    fn sha256_file(path: &Path) -> Option<Vec<u8>> {
+        let file = fs::File::open(path).ok()?;
+        let mut reader = std::io::BufReader::with_capacity(128 * 1024, file);
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 128 * 1024];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(_) => return None,
+            }
+        }
+        Some(hasher.finalize().to_vec())
     }
 
     fn persist_baseline(&self, baseline: &HashMap<String, Vec<u8>>) {
@@ -107,8 +143,7 @@ impl FimEngine {
         let baseline = self.baseline.read();
         let stored_hash = baseline.get(path)?;
 
-        let current_data = fs::read(path).ok()?;
-        let current_hash = Sha256::digest(&current_data).to_vec();
+        let current_hash = Self::sha256_file(Path::new(path))?;
 
         if current_hash != *stored_hash {
             let msg = format!("FIM: file {path} has been modified — hash mismatch");

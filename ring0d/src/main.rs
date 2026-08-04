@@ -189,8 +189,16 @@ impl Daemon {
         contextual.start_dbus_monitor();
         let qos = qos::QosManager::new();
         let fim = fim::FimEngine::new(rocksdb_inner.clone());
-        let fim_count = fim.scan_and_baseline();
-        info!("FIM: baselined {fim_count} system files");
+        // Hash the system directories in the background: /usr/lib64 alone can
+        // be several GB, and a synchronous scan would leave the daemon
+        // unresponsive (no IPC, no event processing) for minutes at startup.
+        {
+            let fim_bg = fim.clone();
+            tokio::task::spawn_blocking(move || {
+                let count = fim_bg.scan_and_baseline();
+                info!("FIM: background baseline complete — {count} system files");
+            });
+        }
         let privesc = privesc::PrivEscDetector::new();
         let desktop_sandbox = desktop_sandbox::DesktopSandbox::new();
         let hotswap = hotswap::HotswapManager::new();
@@ -288,7 +296,18 @@ impl Daemon {
                 _ = baseline_tick.tick() => { self.tick_baseline().await; }
                 _ = forensics_tick.tick() => { self.tick_forensics(); }
                 _ = rootkit_tick.tick() => { self.tick_rootkit_scan(); }
-                _ = intel_tick.tick() => { self.tick_intel_sync().await; }
+                _ = intel_tick.tick() => {
+                    // Feed sync performs blocking network I/O (3 feeds, up to
+                    // ~90s of timeouts); it must not run on the main select
+                    // loop or it starves IPC command handling and event
+                    // processing for the whole duration.
+                    let intel = self.intel.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = intel.sync_feeds().await {
+                            warn!("periodic intel feed sync failed: {e:?}");
+                        }
+                    });
+                }
                 _ = governor_tick.tick() => { self.tick_governor(); }
                 _ = fastpath_tick.tick() => { self.fastpath.purge_idle_flows(); }
                 _ = prompt_tick.tick() => { self.prompt.check_timeouts(); }
@@ -782,35 +801,6 @@ impl Daemon {
             findings.len(),
             self.rootkit.scan_count()
         );
-    }
-
-    async fn tick_intel_sync(&self) {
-        info!("Starting periodic threat intel feed sync...");
-        match self.intel.sync_feeds().await {
-            Ok(states) => {
-                for state in &states {
-                    if state.success {
-                        info!(
-                            "Intel feed {}: {} new entries",
-                            state.feed_name, state.entries_added
-                        );
-                    } else {
-                        warn!(
-                            "Intel feed {} sync failed: {}",
-                            state.feed_name, state.error_message
-                        );
-                    }
-                }
-                let total: u32 = states.iter().map(|s| s.entries_added).sum();
-                info!(
-                    "Intel sync complete: {total} new entries across {} feeds",
-                    states.len()
-                );
-            }
-            Err(e) => {
-                warn!("Intel feed sync failed: {e:?}");
-            }
-        }
     }
 
     fn tick_governor(&self) {
