@@ -602,6 +602,29 @@ pub fn build_packet_event(
     buf
 }
 
+/// Serialize a rule alert as a capnp `ring0_event::Alert` frame for the IPC
+/// broadcast stream. Alerts are ALSO persisted as the compact `AlertRecord`
+/// binary format (see `storage.write_alert`); the broadcast must use the capnp
+/// schema so every subscriber (GUI, ring0ctl tail, …) can decode it with the
+/// same `ring0_event` parser instead of special-casing a second format.
+pub fn build_alert_event(rid: u32, sev: u8, msg: &str) -> Vec<u8> {
+    let mut msg_b = capnp::message::Builder::new_default();
+    let evt = msg_b.init_root::<capnp_schema::ring0_event::Builder>();
+    let mut a = evt.initAlert();
+    a.setTimestamp(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64);
+    a.setRuleId(rid);
+    a.setSeverity(match sev {
+        4 => capnp_schema::Severity::Critical,
+        3 => capnp_schema::Severity::High,
+        2 => capnp_schema::Severity::Med,
+        _ => capnp_schema::Severity::Low,
+    });
+    a.setSignatureName(msg);
+    let mut buf = Vec::new();
+    let _ = capnp::serialize::write_message(&mut buf, &msg_b);
+    buf
+}
+
 pub fn build_connection_prompt_event(
     prompt_id: u64,
     pid: u32,
