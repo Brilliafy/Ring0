@@ -84,6 +84,15 @@ impl FimEngine {
                 {
                     continue;
                 }
+                // /usr/bin, /usr/sbin, /usr/lib64, /usr/lib contain mostly
+                // data (locales, icons, gconv, …) that has no integrity
+                // value and made the baseline hash GBs of it. Restrict those
+                // trees to ELF binaries; the /etc config trees stay fully
+                // tracked. (The baseline's other consumer — exec anomaly
+                // checks — only ever compares executed binaries.)
+                if !dir.starts_with("/etc") && !Self::is_elf_file(&path) {
+                    continue;
+                }
                 let hash = match Self::sha256_file(&path) {
                     Some(h) => h,
                     None => continue,
@@ -107,6 +116,17 @@ impl FimEngine {
             }
         }
         count
+    }
+
+    /// True when `path` starts with the ELF magic bytes (\x7fELF).
+    fn is_elf_file(path: &Path) -> bool {
+        use std::io::Read;
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut magic = [0u8; 4];
+        f.read_exact(&mut magic).is_ok() && &magic == b"\x7fELF"
     }
 
     /// SHA-256 of a file, computed with a streaming reader (bounded memory).
