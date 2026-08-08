@@ -161,6 +161,12 @@ pub struct DpiEngine {
     scratch: hyperscan::Scratch,
     /// Parallel to the compiled pattern ids: (rule_id, name, severity).
     ids: Vec<(u32, &'static str, u8)>,
+    /// Dynamic Suricata-derived signature set (fed by sucadara). Compiled into
+    /// its own database so a bad batch never corrupts the built-in one; a
+    /// failed recompile keeps the previous set.
+    dyn_db: Option<hyperscan::BlockDatabase>,
+    dyn_scratch: Option<hyperscan::Scratch>,
+    dyn_ids: Vec<(u32, String, u8)>,
     /// 1-second sliding bucket for the scan rate limit.
     scan_bucket: AtomicU64,
     scan_count: AtomicU64,
@@ -200,6 +206,9 @@ impl DpiEngine {
             db,
             scratch,
             ids,
+            dyn_db: None,
+            dyn_scratch: None,
+            dyn_ids: Vec::new(),
             scan_bucket: AtomicU64::new(0),
             scan_count: AtomicU64::new(0),
         })
@@ -216,6 +225,60 @@ impl DpiEngine {
             .iter()
             .find(|s| s.rule_id == rule_id)
             .map(|s| s.name)
+    }
+
+    /// Replace the dynamic (Suricata-derived) signature set. Patterns arrive
+    /// as hyperscan-ready strings (already escaped; `(?i)` inline for nocase)
+    /// with (sid, severity). A failed compile keeps the previous set and the
+    /// batch is logged — a poisoned feed must not disable detection.
+    pub fn set_dynamic_patterns(&mut self, patterns: Vec<(u32, String, u8)>) {
+        use hyperscan::prelude::*;
+        if patterns.is_empty() {
+            self.dyn_db = None;
+            self.dyn_scratch = None;
+            self.dyn_ids.clear();
+            info!(
+                "DPI: dynamic signature set cleared ({} patterns)",
+                patterns.len()
+            );
+            return;
+        }
+        let mut compiled = Vec::with_capacity(patterns.len());
+        let mut skipped = 0usize;
+        for (i, (sid, pat, sev)) in patterns.iter().enumerate() {
+            match Pattern::new(pat) {
+                Ok(mut p) => {
+                    p.id = Some(i);
+                    compiled.push(p);
+                    self.dyn_ids.push((*sid, pat.clone(), *sev));
+                }
+                Err(e) => {
+                    warn!("DPI: suricata pattern {pat:?} (sid {sid}) failed to compile: {e}");
+                    skipped += 1;
+                }
+            }
+        }
+        let build_result: Result<hyperscan::BlockDatabase, _> = Patterns(compiled).build();
+        match build_result {
+            Ok(db) => match db.alloc_scratch() {
+                Ok(scratch) => {
+                    self.dyn_db = Some(db);
+                    self.dyn_scratch = Some(scratch);
+                    info!(
+                        "DPI: {} dynamic (suricata) signatures compiled ({} skipped)",
+                        self.dyn_ids.len(),
+                        skipped
+                    );
+                }
+                Err(e) => warn!("DPI: dynamic scratch alloc failed: {e}"),
+            },
+            Err(e) => {
+                warn!(
+                    "DPI: dynamic signature compile failed ({e}) — keeping previous set of {}",
+                    self.dyn_ids.len()
+                );
+            }
+        }
     }
 
     fn scan_allowed(&self) -> bool {
@@ -244,22 +307,34 @@ impl DpiEngine {
             return Vec::new();
         }
         let ids = &self.ids;
+        let dyn_ids = &self.dyn_ids;
         let mut matches: Vec<DpiMatch> = Vec::new();
+        let mut push_match = |rule_id: u32, name: String, sev: u8| {
+            if !matches.iter().any(|m: &DpiMatch| m.rule_id == rule_id) {
+                matches.push(DpiMatch {
+                    rule_id,
+                    signature_name: name,
+                    severity: sev,
+                });
+            }
+        };
         // Ignore scan errors: hyperscan only fails on invalid scratch/limits,
         // which cannot happen here; a failed scan should not disrupt the loop.
         let _ = self.db.scan(payload, &self.scratch, |id, _from, _to, _| {
             if let Some((rule_id, name, sev)) = ids.get(id as usize) {
-                // Dedupe: the same signature may match multiple offsets.
-                if !matches.iter().any(|m: &DpiMatch| m.rule_id == *rule_id) {
-                    matches.push(DpiMatch {
-                        rule_id: *rule_id,
-                        signature_name: name.to_string(),
-                        severity: *sev,
-                    });
-                }
+                push_match(*rule_id, name.to_string(), *sev);
             }
             hyperscan::Matching::Continue
         });
+        // Dynamic (Suricata) set, when compiled.
+        if let (Some(db), Some(scratch)) = (&self.dyn_db, &self.dyn_scratch) {
+            let _ = db.scan(payload, scratch, |id, _from, _to, _| {
+                if let Some((sid, name, sev)) = dyn_ids.get(id as usize) {
+                    push_match(*sid, name.clone(), *sev);
+                }
+                hyperscan::Matching::Continue
+            });
+        }
         matches
     }
 }
@@ -291,6 +366,28 @@ mod tests {
         assert!(hits.iter().any(|m| m.rule_id == 5004), "{:?}", hits);
         let hits = engine.scan_payload(b"AKIA0123456789ABCDEF");
         assert!(hits.iter().any(|m| m.rule_id == 5012), "{:?}", hits);
+    }
+
+    #[test]
+    fn dpi_dynamic_suricata_patterns_match() {
+        let mut engine = DpiEngine::new().unwrap();
+        // Simulates what sucadara pushes: (sid, escaped-regex pattern, sev).
+        engine.set_dynamic_patterns(vec![
+            (2024242, r"(?i)malware-c2\.example".to_string(), 2),
+            (2025555, "GET /cgi-bin/".to_string(), 3),
+        ]);
+        let hits = engine.scan_payload(b"POST https://malware-c2.example/beacon HTTP/1.1");
+        assert!(
+            hits.iter().any(|m| m.rule_id == 2024242),
+            "dynamic suricata pattern should match: {:?}",
+            hits
+        );
+        let hits = engine.scan_payload(b"GET /cgi-bin/cmd.php");
+        assert!(hits.iter().any(|m| m.rule_id == 2025555), "{:?}", hits);
+        // Clearing the set must remove dynamic matches.
+        engine.set_dynamic_patterns(Vec::new());
+        let hits = engine.scan_payload(b"POST https://malware-c2.example/beacon HTTP/1.1");
+        assert!(!hits.iter().any(|m| m.rule_id == 2024242));
     }
 
     #[test]
