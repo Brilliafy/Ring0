@@ -31,8 +31,6 @@ pub static BLOCKED_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(65536, 0);
 pub static BLOCKED_PORTS: HashMap<u16, u32> = HashMap::with_max_entries(256, 0);
 
 #[map]
-pub static DNS_DOMAIN_BLOCK: HashMap<u64, u8> = HashMap::with_max_entries(200000, 0);
-
 #[map]
 pub static RING_BUF: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
@@ -75,8 +73,6 @@ pub static PRIVESC_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 // (emits a DPI event and passes the packet, never interrupting the flow).
 
 #[map]
-pub static DPI_PATTERNS: HashMap<u32, DpiPattern> = HashMap::with_max_entries(64, 0);
-
 #[map]
 pub static DPI_MODE: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
 
@@ -101,7 +97,7 @@ pub struct QosRateVal {
 // Event kinds (first byte of every ring buffer entry) — shared with the
 // userspace daemon via the ring0-abi crate; do NOT redefine locally.
 use ring0_abi::{
-    KIND_CAP, KIND_CONNECT, KIND_DPI, KIND_FILE_ACCESS, KIND_KILL, KIND_LSM, KIND_MEMFD, KIND_MMAP,
+    KIND_CAP, KIND_CONNECT, KIND_FILE_ACCESS, KIND_KILL, KIND_LSM, KIND_MEMFD, KIND_MMAP,
     KIND_MODULE, KIND_PACKET, KIND_PROCESS_EXEC, KIND_PTRACE, KIND_SETUID, KIND_TLS, KIND_UNLINK,
 };
 
@@ -242,24 +238,6 @@ pub struct TlsEvent {
     pub buf: [u8; 256],
 }
 
-#[repr(C)]
-pub struct DpiPattern {
-    pub len: u8,
-    pub data: [u8; 32],
-}
-
-#[repr(C)]
-pub struct DpiEvent {
-    pub kind: u8,
-    pub timestamp: u64,
-    pub pid: u32,
-    pub rule_id: u32,
-    pub src_ip: u32,
-    pub dst_ip: u32,
-    pub dst_port: u16,
-    pub protocol: u8,
-}
-
 // ── Helper functions ─────────────────────────────────────────
 
 #[inline(always)]
@@ -298,40 +276,15 @@ fn check_blocked(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16) -> u32 
 
 // ── DNS domain hash blocklist ──────────────────────────────
 
-const FNV_OFFSET: u64 = 14695981039346656037;
-const FNV_PRIME: u64 = 1099511628211;
-
-#[inline(always)]
-fn fnv1a(mut h: u64, b: u8) -> u64 {
-    h ^= b as u64;
-    h.wrapping_mul(FNV_PRIME)
-}
-
-#[inline(always)]
-fn lowercase(b: u8) -> u8 {
-    if (b'A'..=b'Z').contains(&b) {
-        b + 32
-    } else {
-        b
-    }
-}
-
 trait PktData {
-    fn data(&self) -> usize;
     fn data_end(&self) -> usize;
 }
 impl PktData for XdpContext {
-    fn data(&self) -> usize {
-        self.data()
-    }
     fn data_end(&self) -> usize {
         self.data_end()
     }
 }
 impl PktData for TcContext {
-    fn data(&self) -> usize {
-        self.data()
-    }
     fn data_end(&self) -> usize {
         self.data_end()
     }
@@ -381,144 +334,6 @@ unsafe fn l3_info<T: PktData>(ctx: &T, eth: usize) -> (usize, u16) {
         l3 += 4;
     }
     (l3, ethertype)
-}
-
-/// Parse the DNS query name at `qname_off` and check its hash (full name and
-/// registrable last-two/last-three labels) against the kernel domain blocklist.
-/// Returns true when the query should be dropped.
-///
-/// MUST produce byte streams identical to the userspace `fnv1a_hash` in
-/// `ring0d/src/sucadara.rs` (which hashes the plain string, e.g. `evil.com`).
-/// DNS wire names are length-prefixed (`\x03evil\x03com\0`) with NO literal
-/// `.` bytes, so a `.` is synthesized between labels — exactly once per label
-/// boundary (previously it was inserted before every byte, producing
-/// `e.v.i.l.c.o.m`, so the kernel hashes never matched and the whole DNS
-/// blocklist was silently inert).
-unsafe fn dns_query_blocked<T: PktData>(ctx: &T, qname_off: usize) -> bool {
-    let mut off = qname_off;
-    let mut n_labels = 0usize;
-    let mut name_len = 0usize;
-    // Rolling label hashes so the last-1/2/3 labels are tracked in O(1) space:
-    // h1 = hash of the most recent label, h2 = last two labels, h3 = last three.
-    let mut h_full = FNV_OFFSET;
-    let mut h1 = FNV_OFFSET;
-    let mut h2 = FNV_OFFSET;
-    let mut h3 = FNV_OFFSET;
-
-    while off < ctx.data_end() {
-        let len = *(ctx.data() as *const u8).add(off) as usize;
-        if len == 0 {
-            break; // root terminator
-        }
-        // DNS name limits; names exceeding them are simply not matched.
-        if len > 63 || name_len + len + 1 > 255 {
-            return false;
-        }
-        if off + 1 + len > ctx.data_end() {
-            return false;
-        }
-
-        // Full name: '.' between labels, then the label bytes (lowercased) —
-        // identical byte stream to userspace fnv1a_hash("www.evil.com").
-        if n_labels > 0 {
-            h_full = fnv1a(h_full, b'.');
-        }
-        for i in 0..len {
-            let b = lowercase(*(ctx.data() as *const u8).add(off + 1 + i));
-            h_full = fnv1a(h_full, b);
-        }
-
-        // Shift the trailing-label window: old last-2 becomes last-3, old
-        // last-1 becomes last-2, then append '.' + this label to both.
-        let old_h1 = h1;
-        let old_h2 = h2;
-        h3 = old_h2;
-        h2 = old_h1;
-        h3 = fnv1a(h3, b'.');
-        h2 = fnv1a(h2, b'.');
-        for i in 0..len {
-            let b = lowercase(*(ctx.data() as *const u8).add(off + 1 + i));
-            h3 = fnv1a(h3, b);
-            h2 = fnv1a(h2, b);
-        }
-        // h1 = this label alone (for the next shift).
-        h1 = FNV_OFFSET;
-        for i in 0..len {
-            let b = lowercase(*(ctx.data() as *const u8).add(off + 1 + i));
-            h1 = fnv1a(h1, b);
-        }
-
-        n_labels += 1;
-        name_len += len + 1;
-        off += 1 + len;
-    }
-
-    if DNS_DOMAIN_BLOCK.get(&h_full).is_some() {
-        return true;
-    }
-    if n_labels >= 2 && DNS_DOMAIN_BLOCK.get(&h2).is_some() {
-        return true;
-    }
-    if n_labels >= 3 && DNS_DOMAIN_BLOCK.get(&h3).is_some() {
-        return true;
-    }
-    false
-}
-
-// ── DPI fast-path pattern scan ────────────────────────────────
-//
-// Scans the first SCAN_WINDOW bytes of a packet payload for the literal
-// patterns in DPI_PATTERNS. Pure observation — never touches the flow other
-// than optionally dropping in enforce mode.
-
-#[inline(always)]
-unsafe fn dpi_scan_packet(ctx: &XdpContext, data: usize, payload_off: usize) -> u32 {
-    const MAX_PATTERNS: u32 = 10;
-    const SCAN_WINDOW: usize = 8;
-
-    // Sentinel: NO_MATCH must not collide with pattern index 0 — the kernel
-    // DPI_PATTERNS map is keyed by sequential index 0..N, so index 0 is a
-    // valid match (rule 5001 "/bin/sh"). Using 0 as the no-match sentinel
-    // made pattern 0 permanently dead.
-    const NO_MATCH: u32 = u32::MAX;
-
-    let mut rule_id = NO_MATCH;
-    let mut idx = 0u32;
-    while idx < MAX_PATTERNS {
-        if let Some(pat) = DPI_PATTERNS.get_ptr(&idx) {
-            let plen = (*pat).len as usize;
-            if plen > 0 && plen <= 32 {
-                // Compare at payload offset 0 only. A sliding-window scan
-                // (positions x pattern bytes) blows the verifier's state
-                // budget ("BPF program is too large"); single-position keeps
-                // the fast path verifier-safe while still matching payload
-                // prefixes (e.g. a shell command or beacon banner at the
-                // start of the stream).
-                let mut matched = true;
-                let mut k = 0usize;
-                while k < plen {
-                    // data is the packet base; payload_off is a pure scalar.
-                    let pos = data + payload_off + k;
-                    if pos >= ctx.data_end() {
-                        matched = false;
-                        break;
-                    }
-                    let pat_byte = *(core::ptr::addr_of!((*pat).data) as *const u8).add(k);
-                    if *(pos as *const u8) != pat_byte {
-                        matched = false;
-                        break;
-                    }
-                    k += 1;
-                }
-                if matched {
-                    rule_id = idx;
-                    break;
-                }
-            }
-        }
-        idx += 1;
-    }
-    rule_id
 }
 
 /// Per-packet event sampling: suppressed while the governor has written
@@ -775,8 +590,6 @@ unsafe fn syscall_arg(regs: *const aya_ebpf::bindings::pt_regs, n: usize) -> u64
 }
 
 #[inline(always)]
-#[inline(never)]
-#[inline(always)]
 unsafe fn ring0_handle_openat(regs: *const aya_ebpf::bindings::pt_regs) {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
     let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
@@ -829,8 +642,6 @@ fn path_matches_blocklist(filename: &[u8; 64]) -> bool {
     false
 }
 
-#[inline(always)]
-#[inline(never)]
 #[inline(always)]
 unsafe fn ring0_handle_connect(regs: *const aya_ebpf::bindings::pt_regs) {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
@@ -888,8 +699,6 @@ unsafe fn bpf_probe_read_user_u16(ptr: *const u8) -> u16 {
 }
 
 #[inline(always)]
-#[inline(never)]
-#[inline(always)]
 unsafe fn ring0_handle_kill(regs: *const aya_ebpf::bindings::pt_regs) {
     let attacker = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
     let target_pid = syscall_arg(regs, 0) as u32;
@@ -934,8 +743,6 @@ fn path_matches_socket(path: &[u8; 96]) -> bool {
     true
 }
 
-#[inline(always)]
-#[inline(never)]
 #[inline(always)]
 unsafe fn ring0_handle_unlinkat(regs: *const aya_ebpf::bindings::pt_regs) {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
@@ -1179,8 +986,6 @@ pub fn ring0_lsm_capable(ctx: LsmContext) -> i32 {
 }
 
 #[inline(always)]
-#[inline(never)]
-#[inline(always)]
 unsafe fn ring0_handle_setuid(regs: *const aya_ebpf::bindings::pt_regs) {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
     let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
@@ -1200,8 +1005,6 @@ unsafe fn ring0_handle_setuid(regs: *const aya_ebpf::bindings::pt_regs) {
     }
 }
 
-#[inline(always)]
-#[inline(never)]
 #[inline(always)]
 unsafe fn ring0_handle_memfd(regs: *const aya_ebpf::bindings::pt_regs) {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
@@ -1225,8 +1028,6 @@ unsafe fn ring0_handle_memfd(regs: *const aya_ebpf::bindings::pt_regs) {
     }
 }
 
-#[inline(always)]
-#[inline(never)]
 #[inline(always)]
 unsafe fn ring0_handle_mmap(regs: *const aya_ebpf::bindings::pt_regs) {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
@@ -1256,8 +1057,6 @@ unsafe fn ring0_handle_mmap(regs: *const aya_ebpf::bindings::pt_regs) {
     }
 }
 
-#[inline(always)]
-#[inline(never)]
 #[inline(always)]
 unsafe fn ring0_handle_finit_module(regs: *const aya_ebpf::bindings::pt_regs) {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
