@@ -334,9 +334,11 @@ impl Daemon {
                             warn!("periodic intel feed sync failed: {e:?}");
                         }
                     });
-                    // Reap spent per-connection TLS scan budgets so the kernel
-                    // map cannot fill with finished connections.
+                    // Reap spent per-connection TLS scan budgets and pid
+                    // overrides so the kernel maps cannot fill with finished
+                    // connections / exited processes.
                     self.ebpf.clear_tls_budgets();
+                    self.ebpf.clear_pid_budgets();
                 }
                 _ = governor_tick.tick() => {
                     self.tick_governor();
@@ -592,6 +594,18 @@ impl Daemon {
         // Trust verification runs on a blocking thread (whole-file hash + rpm
         // subprocess) so a slow disk/rpm cannot stall the event pipeline.
         let trust_status = self.trust.verify_binary_async(&binary, pid).await;
+        // Per-process TLS scan budget from the trust verdict: untrusted /
+        // unverifiable processes (script hosts, /tmp binaries) get a 4x
+        // larger inspection window because any network activity from them is
+        // high-risk; trusted high-throughput apps get a tighter window.
+        use trust::TrustStatus;
+        let tls_budget = match trust_status {
+            TrustStatus::TrustedSystemPackage | TrustStatus::TrustedBinary => 4096,
+            TrustStatus::Untrusted | TrustStatus::Unknown => {
+                ebpf::EbpfManager::TLS_UNTRUSTED_BUDGET
+            }
+        };
+        self.ebpf.set_pid_budget(pid, tls_budget);
         if self.contextual.should_block_connection(pid, &binary) {
             info!("ContextualSecurity: dropping connection from PID {pid} ({binary})");
             let a = build_alert_bytes_rule(
@@ -739,8 +753,14 @@ impl Daemon {
             return;
         }
         let payload = if raw.len() > 28 { &raw[28..] } else { &[] };
+        let tpid = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
         for m in self.dpi.scan_payload(payload) {
-            let alert = build_alert_bytes_rule(m.rule_id, m.severity, &m.signature_name);
+            // Surface the process that triggered the match — in consumer
+            // security the WHO matters as much as the bytes.
+            let binary = crate::process::ProcessResolver::binary_path(tpid)
+                .unwrap_or_else(|| "unknown".into());
+            let msg = format!("{} [pid {}: {}]", m.signature_name, tpid, binary);
+            let alert = build_alert_bytes_rule(m.rule_id, m.severity, &msg);
             self.storage.write_alert(&alert);
             self.broadcast_alert_record(&alert).await;
         }

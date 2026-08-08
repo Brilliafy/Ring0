@@ -709,6 +709,34 @@ impl EbpfManager {
     /// forever (fresh connections would stop being scanned). A reset costs
     /// each live connection one more ~8KB of re-inspection per hour — a
     /// bounded, negligible re-scan of ongoing flows.
+    /// Budget override for untrusted/suspicious processes (script hosts,
+    /// /tmp binaries, unsigned builds). Must match TLS_UNTRUSTED_BUDGET in
+    /// ring0-ebpf/src/main.rs.
+    pub const TLS_UNTRUSTED_BUDGET: u32 = 32768;
+
+    pub fn set_pid_budget(&mut self, pid: u32, budget: u32) {
+        if let Some(ebpf) = self.ebpf.as_mut() {
+            if let Some(map) = ebpf.map_mut("TLS_PID_BUDGET") {
+                if let Ok(mut map) = HashMap::<&mut MapData, u32, u32>::try_from(map) {
+                    let _ = map.insert(pid, budget, 0);
+                }
+            }
+        }
+    }
+
+    pub fn clear_pid_budgets(&mut self) {
+        if let Some(ebpf) = self.ebpf.as_mut() {
+            if let Some(map) = ebpf.map_mut("TLS_PID_BUDGET") {
+                if let Ok(mut map) = HashMap::<&mut MapData, u32, u32>::try_from(map) {
+                    let keys: Vec<u32> = map.keys().filter_map(Result::ok).collect();
+                    for k in keys {
+                        let _ = map.remove(&k);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn clear_tls_budgets(&mut self) {
         if let Some(ebpf) = self.ebpf.as_mut() {
             if let Some(map) = ebpf.map_mut("TLS_FLOW_BUDGET") {
