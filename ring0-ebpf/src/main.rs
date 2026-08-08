@@ -302,14 +302,13 @@ fn check_blocked(
     dst_ip: u32,
     src_port: u16,
     dst_port: u16,
+    proto: u8,
     is_wireguard: bool,
 ) -> u32 {
     let drop = xdp_action::XDP_DROP;
     // WireGuard tunnel packets are end-to-end encrypted UDP; the fast path
     // cannot inspect them, and feed/port drops would silently kill the user's
-    // VPN (the tunnel server's INBOUND responses match feed CIDRs all the
-    // time - commercial VPNs live on hosting ranges). Only an EXPLICIT user
-    // destination block applies to tunnel traffic.
+    // VPN. Only an EXPLICIT user destination block applies to tunnel traffic.
     if is_wireguard {
         if unsafe {
             USER_BLOCKED_IPS
@@ -320,21 +319,25 @@ fn check_blocked(
         }
         return xdp_action::XDP_PASS;
     }
-    // Inbound: drop traffic FROM feed-listed + user-blocked sources.
-    if unsafe {
-        BLOCKED_IPS
-            .get(&Key::new(32, u32::from_be(src_ip)))
-            .is_some()
-    } || unsafe { BLOCKED_PORTS.get_ptr(&src_port).is_some() }
-        || unsafe { BLOCKED_PORTS.get_ptr(&dst_port).is_some() }
-        // Outbound: only USER-initiated destination blocks (never feed
-        // CIDRs) so VPN tunnels / legitimate hosts on listed ranges work.
-        || unsafe {
-            USER_BLOCKED_IPS
-                .get(&Key::new(32, u32::from_be(dst_ip)))
+    // Feed CIDRs are inbound-scanner lists: they only ever drop TCP (the
+    // classic scan/exfiltration protocol). UDP (DNS, WireGuard, QUIC,
+    // VoIP, gaming) is never feed-dropped - a VPN server living on a listed
+    // hosting range must not take the user's whole tunnel down.
+    let feed_src_blocked = proto == 6
+        && unsafe {
+            BLOCKED_IPS
+                .get(&Key::new(32, u32::from_be(src_ip)))
                 .is_some()
-        }
-    {
+        };
+    let ports_blocked = unsafe { BLOCKED_PORTS.get_ptr(&src_port).is_some() }
+        || unsafe { BLOCKED_PORTS.get_ptr(&dst_port).is_some() };
+    // Outbound: only USER-initiated destination blocks.
+    let user_dst_blocked = unsafe {
+        USER_BLOCKED_IPS
+            .get(&Key::new(32, u32::from_be(dst_ip)))
+            .is_some()
+    };
+    if feed_src_blocked || ports_blocked || user_dst_blocked {
         return drop;
     }
     xdp_action::XDP_PASS
@@ -507,7 +510,7 @@ unsafe fn try_ring0_xdp(ctx: &XdpContext) -> Result<u32, u32> {
 
     let l4 = if proto == 6 || proto == 17 { ip + 20 } else { 0 };
     let is_wg = l4 != 0 && unsafe { is_wireguard_packet(ctx, ip, proto, l4) };
-    if check_blocked(src_ip, dst_ip, sp, dp, is_wg) == xdp_action::XDP_DROP {
+    if check_blocked(src_ip, dst_ip, sp, dp, proto, is_wg) == xdp_action::XDP_DROP {
         // Log the drop (rate-limited) so blocked traffic is visible instead
         // of vanishing silently. action=1 marks the event as a drop.
         if should_log_drop() {
