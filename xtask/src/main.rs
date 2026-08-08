@@ -49,7 +49,20 @@ fn main() -> Result<()> {
                     BPF_TARGET,
                     "--message-format=json-render-diagnostics",
                 ])
-                .env("CARGO_ENCODED_RUSTFLAGS", "-Cpanic=abort")
+                // The eBPF crate builds in the debug profile by default; the
+                // dev profile enables overflow-checks AND debug-assertions.
+                // With debug-assertions on, `ptr::copy_nonoverlapping` (used
+                // internally by probe-read/copy helpers) emits an "unsafe
+                // precondition violated" panic check — the resulting panic
+                // stubs get merged into the tail of every program and the
+                // kernel rejects them with "last insn is not an exit or jmp /
+                // processed 0 insns". Network math is intentionally wrapping,
+                // so disable both for the BPF build.
+                // (\x1f separates encoded rustflags args.)
+                .env(
+                    "CARGO_ENCODED_RUSTFLAGS",
+                    "-Cpanic=abort\x1f-Coverflow-checks=no\x1f-Cdebug-assertions=no",
+                )
                 .env("RUSTUP_TOOLCHAIN", BPF_TOOLCHAIN)
                 .arg(pkg_arg)
                 .output()

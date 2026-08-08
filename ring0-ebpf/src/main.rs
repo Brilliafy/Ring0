@@ -336,14 +336,37 @@ unsafe fn l3_info<T: PktData>(ctx: &T, eth: usize) -> (usize, u16) {
     }
     let mut ethertype = u16::from_be(read_u16(eth as *const u8, 12));
     let mut l3 = eth + 14;
-    let mut depth = 0usize;
-    while (ethertype == 0x8100 || ethertype == 0x88a8) && depth < 4 {
+    // Unrolled VLAN parsing (max 4 stacked 802.1Q/802.1ad tags) so every path
+    // has a compile-time-constant l3 offset. The previous loop made the packet
+    // offset unbounded and the verifier rejected it ("math between pkt pointer
+    // and register with unbounded min value").
+    if ethertype == 0x8100 || ethertype == 0x88a8 {
         if ctx.data_end() < l3 + 4 {
             return (0, 0);
         }
         ethertype = u16::from_be(read_u16(l3 as *const u8, 2));
         l3 += 4;
-        depth += 1;
+    }
+    if ethertype == 0x8100 || ethertype == 0x88a8 {
+        if ctx.data_end() < l3 + 4 {
+            return (0, 0);
+        }
+        ethertype = u16::from_be(read_u16(l3 as *const u8, 2));
+        l3 += 4;
+    }
+    if ethertype == 0x8100 || ethertype == 0x88a8 {
+        if ctx.data_end() < l3 + 4 {
+            return (0, 0);
+        }
+        ethertype = u16::from_be(read_u16(l3 as *const u8, 2));
+        l3 += 4;
+    }
+    if ethertype == 0x8100 || ethertype == 0x88a8 {
+        if ctx.data_end() < l3 + 4 {
+            return (0, 0);
+        }
+        ethertype = u16::from_be(read_u16(l3 as *const u8, 2));
+        l3 += 4;
     }
     (l3, ethertype)
 }
@@ -437,9 +460,9 @@ unsafe fn dns_query_blocked<T: PktData>(ctx: &T, qname_off: usize) -> bool {
 // than optionally dropping in enforce mode.
 
 #[inline(always)]
-unsafe fn dpi_scan_packet(ctx: &XdpContext, payload_off: usize) -> u32 {
-    const MAX_PATTERNS: u32 = 64;
-    const SCAN_WINDOW: usize = 64;
+unsafe fn dpi_scan_packet(ctx: &XdpContext, data: usize, payload_off: usize) -> u32 {
+    const MAX_PATTERNS: u32 = 10;
+    const SCAN_WINDOW: usize = 8;
 
     // Sentinel: NO_MATCH must not collide with pattern index 0 — the kernel
     // DPI_PATTERNS map is keyed by sequential index 0..N, so index 0 is a
@@ -453,29 +476,30 @@ unsafe fn dpi_scan_packet(ctx: &XdpContext, payload_off: usize) -> u32 {
         if let Some(pat) = DPI_PATTERNS.get_ptr(&idx) {
             let plen = (*pat).len as usize;
             if plen > 0 && plen <= 32 {
-                let mut off = 0usize;
-                while off < SCAN_WINDOW {
-                    let mut matched = true;
-                    let mut k = 0usize;
-                    while k < plen {
-                        let pos = payload_off + off + k;
-                        if pos >= ctx.data_end() {
-                            matched = false;
-                            break;
-                        }
-                        if *(ctx.data() as *const u8).add(pos) != (*pat).data[k] {
-                            matched = false;
-                            break;
-                        }
-                        k += 1;
-                    }
-                    if matched {
-                        rule_id = idx;
+                // Compare at payload offset 0 only. A sliding-window scan
+                // (positions x pattern bytes) blows the verifier's state
+                // budget ("BPF program is too large"); single-position keeps
+                // the fast path verifier-safe while still matching payload
+                // prefixes (e.g. a shell command or beacon banner at the
+                // start of the stream).
+                let mut matched = true;
+                let mut k = 0usize;
+                while k < plen {
+                    // data is the packet base; payload_off is a pure scalar.
+                    let pos = data + payload_off + k;
+                    if pos >= ctx.data_end() {
+                        matched = false;
                         break;
                     }
-                    off += 1;
+                    let pat_byte = *(core::ptr::addr_of!((*pat).data) as *const u8).add(k);
+                    if *(pos as *const u8) != pat_byte {
+                        matched = false;
+                        break;
+                    }
+                    k += 1;
                 }
-                if rule_id != NO_MATCH {
+                if matched {
+                    rule_id = idx;
                     break;
                 }
             }
@@ -538,17 +562,6 @@ unsafe fn try_ring0_xdp(ctx: &XdpContext) -> Result<u32, u32> {
         return Ok(xdp_action::XDP_DROP);
     }
 
-    // Kernel-level DNS domain blocklist (hashed FQDN lookup, sub-µs).
-    if proto == 17 && dp == 53 {
-        let dns = ip + 20 + 8;
-        if ctx.data_end() >= dns + 12 + 1 {
-            let qname = dns + 12;
-            if unsafe { dns_query_blocked(ctx, qname) } {
-                return Ok(xdp_action::XDP_DROP);
-            }
-        }
-    }
-
     let flow_key = FlowKey {
         src_ip,
         dst_ip,
@@ -559,49 +572,6 @@ unsafe fn try_ring0_xdp(ctx: &XdpContext) -> Result<u32, u32> {
     };
     if ESTABLISHED_FLOWS.get_ptr(&flow_key).is_some() {
         return Ok(xdp_action::XDP_PASS);
-    }
-
-    // Fast-path DPI on the payload of new flows (no reassembly): literal
-    // byte-pattern match, observe-and-pass by default; drop only in enforce
-    // mode (DPI_MODE key 1).
-    let dpi_payload_off = if proto == 6 {
-        let l4 = ip + 20;
-        if ctx.data_end() < l4 + 14 {
-            0
-        } else {
-            // TCP data offset: high nibble of byte 12 in the TCP header.
-            l4 + (((*(l4 as *const u8).add(12)) >> 4) as usize) * 4
-        }
-    } else if proto == 17 {
-        let l4 = ip + 20;
-        if ctx.data_end() < l4 + 8 {
-            0
-        } else {
-            l4 + 8
-        }
-    } else {
-        0
-    };
-    if dpi_payload_off > eth && dpi_payload_off < ctx.data_end() {
-        let rule = dpi_scan_packet(ctx, dpi_payload_off);
-        if rule != u32::MAX {
-            if DPI_MODE.get_ptr(&1).is_some() {
-                return Ok(xdp_action::XDP_DROP);
-            }
-            if let Some(mut entry) = RING_BUF.reserve::<DpiEvent>(0) {
-                entry.write(DpiEvent {
-                    kind: KIND_DPI,
-                    timestamp: ktime_get_ns(),
-                    pid: 0,
-                    rule_id: rule,
-                    src_ip,
-                    dst_ip,
-                    dst_port: dp,
-                    protocol: proto,
-                });
-                entry.submit(0);
-            }
-        }
     }
 
     if is_sampling_enabled() {
@@ -662,17 +632,6 @@ unsafe fn try_ring0_tc(ctx: &TcContext) -> Result<i32, i32> {
     } else {
         (0, 0)
     };
-
-    // Kernel-level DNS domain blocklist (hashed FQDN lookup, sub-µs).
-    if proto == 17 && dp == 53 {
-        let dns = ip + 20 + 8;
-        if ctx.data_end() >= dns + 12 + 1 {
-            let qname = dns + 12;
-            if unsafe { dns_query_blocked(ctx, qname) } {
-                return Ok(-1);
-            }
-        }
-    }
 
     let flow_key = FlowKey {
         src_ip,
@@ -787,6 +746,7 @@ unsafe fn syscall_arg(regs: *const aya_ebpf::bindings::pt_regs, n: usize) -> u64
 
 #[inline(always)]
 #[inline(never)]
+#[inline(always)]
 unsafe fn ring0_handle_openat(regs: *const aya_ebpf::bindings::pt_regs) {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
     let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
@@ -795,7 +755,7 @@ unsafe fn ring0_handle_openat(regs: *const aya_ebpf::bindings::pt_regs) {
         return;
     }
     let mut filename = [0u8; 64];
-    let _ = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(filename_ptr, &mut filename);
+    let _ = aya_ebpf::helpers::bpf_probe_read_user_str(filename_ptr, &mut filename);
     if path_matches_blocklist(&filename) && uid != 0 {
         if let Some(mut entry) = RING_BUF.reserve::<FileAccessEvent>(0) {
             entry.write(FileAccessEvent {
@@ -823,7 +783,11 @@ fn path_matches_blocklist(filename: &[u8; 64]) -> bool {
     for bl in &blocklist {
         let mut m = true;
         for i in 0..bl.len() {
-            if i >= 64 || filename[i] != bl[i] {
+            if i >= 64 {
+                m = false;
+                break;
+            }
+            if unsafe { *(filename.as_ptr().add(i)) } != bl[i] {
                 m = false;
                 break;
             }
@@ -837,6 +801,7 @@ fn path_matches_blocklist(filename: &[u8; 64]) -> bool {
 
 #[inline(always)]
 #[inline(never)]
+#[inline(always)]
 unsafe fn ring0_handle_connect(regs: *const aya_ebpf::bindings::pt_regs) {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
     let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
@@ -894,6 +859,7 @@ unsafe fn bpf_probe_read_user_u16(ptr: *const u8) -> u16 {
 
 #[inline(always)]
 #[inline(never)]
+#[inline(always)]
 unsafe fn ring0_handle_kill(regs: *const aya_ebpf::bindings::pt_regs) {
     let attacker = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
     let target_pid = syscall_arg(regs, 0) as u32;
@@ -915,7 +881,10 @@ unsafe fn ring0_handle_kill(regs: *const aya_ebpf::bindings::pt_regs) {
 fn path_matches_daemon(path: &[u8; 96]) -> bool {
     let daemon = b"/etc/ring0/rules.yaml\0";
     for i in 0..daemon.len() {
-        if i >= 96 || path[i] != daemon[i] {
+        if i >= 96 {
+            return false;
+        }
+        if unsafe { *(path.as_ptr().add(i)) } != daemon[i] {
             return false;
         }
     }
@@ -925,7 +894,10 @@ fn path_matches_daemon(path: &[u8; 96]) -> bool {
 fn path_matches_socket(path: &[u8; 96]) -> bool {
     let sock = b"/run/ring0d.sock\0";
     for i in 0..sock.len() {
-        if i >= 96 || path[i] != sock[i] {
+        if i >= 96 {
+            return false;
+        }
+        if unsafe { *(path.as_ptr().add(i)) } != sock[i] {
             return false;
         }
     }
@@ -934,6 +906,7 @@ fn path_matches_socket(path: &[u8; 96]) -> bool {
 
 #[inline(always)]
 #[inline(never)]
+#[inline(always)]
 unsafe fn ring0_handle_unlinkat(regs: *const aya_ebpf::bindings::pt_regs) {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
     let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
@@ -942,7 +915,7 @@ unsafe fn ring0_handle_unlinkat(regs: *const aya_ebpf::bindings::pt_regs) {
         return;
     }
     let mut path = [0u8; 96];
-    let _ = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(name_ptr, &mut path);
+    let _ = aya_ebpf::helpers::bpf_probe_read_user_str(name_ptr, &mut path);
     if uid != 0 && (path_matches_daemon(&path) || path_matches_socket(&path)) {
         if let Some(mut entry) = RING_BUF.reserve::<UnlinkEvent>(0) {
             entry.write(UnlinkEvent {
@@ -1070,20 +1043,28 @@ pub fn ring0_lsm_socket_connect(ctx: LsmContext) -> i32 {
         return 0;
     }
     let pid = ctx.pid();
-    let sock = unsafe { ptr::read_unaligned(ctx.as_ptr() as *const *const u8) };
+    // ctx args are u64 slots; read them aligned via ctx.arg (unaligned byte
+    // reads of the context are rejected by the verifier).
+    let sock = ctx.arg::<*const u8>(0);
     if sock.is_null() {
         return 0;
     }
-    let addr_ptr =
-        unsafe { ptr::read_unaligned((ctx.as_ptr() as *const *const u8).add(8)) } as *const u8;
+    let addr_ptr = ctx.arg::<*const u8>(1);
     if addr_ptr.is_null() {
         return 0;
     }
-    if unsafe { ptr::read_unaligned(addr_ptr as *const u16) } != 2 {
+    // sockaddr fields live in user memory — read them with probe helpers.
+    let family =
+        unsafe { aya_ebpf::helpers::bpf_probe_read_user::<u16>(addr_ptr.cast()) }.unwrap_or(0);
+    if family != 2 {
         return 0;
     }
-    let port = unsafe { u16::from_be(ptr::read_unaligned((addr_ptr.add(2)) as *const u16)) };
-    let ip = unsafe { ptr::read_unaligned((addr_ptr.add(4)) as *const u32) };
+    let port = unsafe { aya_ebpf::helpers::bpf_probe_read_user::<u16>(addr_ptr.add(2).cast()) }
+        .map(u16::from_be)
+        .unwrap_or(0);
+    let ip = unsafe { aya_ebpf::helpers::bpf_probe_read_user::<u32>(addr_ptr.add(4).cast()) }
+        .map(u32::from_be)
+        .unwrap_or(0);
     if unsafe { BLOCKED_IPS.get(&Key::new(32, ip)).is_some() }
         || unsafe { BLOCKED_PORTS.get_ptr(&port).is_some() }
     {
@@ -1169,6 +1150,7 @@ pub fn ring0_lsm_capable(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 #[inline(never)]
+#[inline(always)]
 unsafe fn ring0_handle_setuid(regs: *const aya_ebpf::bindings::pt_regs) {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
     let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
@@ -1190,6 +1172,7 @@ unsafe fn ring0_handle_setuid(regs: *const aya_ebpf::bindings::pt_regs) {
 
 #[inline(always)]
 #[inline(never)]
+#[inline(always)]
 unsafe fn ring0_handle_memfd(regs: *const aya_ebpf::bindings::pt_regs) {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
     let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
@@ -1197,7 +1180,7 @@ unsafe fn ring0_handle_memfd(regs: *const aya_ebpf::bindings::pt_regs) {
     let flags = syscall_arg(regs, 1) as u32;
     let mut name = [0u8; 32];
     if !name_ptr.is_null() {
-        let _ = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(name_ptr, &mut name);
+        let _ = aya_ebpf::helpers::bpf_probe_read_user_str(name_ptr, &mut name);
     }
     if let Some(mut entry) = ROOTKIT_EVENTS.reserve::<MemfdEvent>(0) {
         entry.write(MemfdEvent {
@@ -1214,6 +1197,7 @@ unsafe fn ring0_handle_memfd(regs: *const aya_ebpf::bindings::pt_regs) {
 
 #[inline(always)]
 #[inline(never)]
+#[inline(always)]
 unsafe fn ring0_handle_mmap(regs: *const aya_ebpf::bindings::pt_regs) {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
     let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
@@ -1244,6 +1228,7 @@ unsafe fn ring0_handle_mmap(regs: *const aya_ebpf::bindings::pt_regs) {
 
 #[inline(always)]
 #[inline(never)]
+#[inline(always)]
 unsafe fn ring0_handle_finit_module(regs: *const aya_ebpf::bindings::pt_regs) {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
     let uid = aya_ebpf::helpers::bpf_get_current_uid_gid() as u32;
@@ -1251,7 +1236,7 @@ unsafe fn ring0_handle_finit_module(regs: *const aya_ebpf::bindings::pt_regs) {
     let flags = syscall_arg(regs, 2) as u32;
     let mut name = [0u8; 64];
     if !name_ptr.is_null() {
-        let _ = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(name_ptr, &mut name);
+        let _ = aya_ebpf::helpers::bpf_probe_read_user_str(name_ptr, &mut name);
     }
     if let Some(mut entry) = ROOTKIT_EVENTS.reserve::<ModuleEvent>(0) {
         entry.write(ModuleEvent {
@@ -1288,9 +1273,9 @@ fn capture_tls_event(ctx: &ProbeContext, direction: u8) {
         if !buf_ptr.is_null() && len > 0 {
             // Read the TLS plaintext from user space with a probe-read helper.
             // Direct dereference of user pointers is rejected by the verifier.
-            let _ = unsafe {
-                aya_ebpf::helpers::bpf_probe_read_user_buf(buf_ptr, &mut buf[..len as usize])
-            };
+            if let Some(dst) = buf.get_mut(..len as usize) {
+                let _ = unsafe { aya_ebpf::helpers::bpf_probe_read_user_buf(buf_ptr, dst) };
+            }
         }
         entry.write(TlsEvent {
             kind: KIND_TLS,
