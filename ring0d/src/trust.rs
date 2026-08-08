@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,6 +9,8 @@ use tracing::{info, warn};
 const TRUSTED_PATHS: &[&str] = &[
     "/usr/bin/",
     "/usr/libexec/",
+    "/usr/lib64/",
+    "/usr/lib/",
     "/usr/sbin/",
     "/bin/",
     "/sbin/",
@@ -32,7 +33,10 @@ const ALWAYS_ALLOW_BINARIES: &[&str] = &[
 
 pub struct TrustEngine {
     cache: Arc<RwLock<HashMap<Vec<u8>, TrustStatus>>>,
-    gpg_key_map: Arc<RwLock<Vec<String>>>,
+    /// Cheap memo keyed by (path, size, mtime): avoids re-reading + hashing the
+    /// whole binary (and re-spawning `rpm`) for every connect from the same
+    /// unchanged binary.
+    path_memo: Arc<RwLock<HashMap<(String, u64, u64), TrustStatus>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,40 +49,70 @@ pub enum TrustStatus {
 
 impl TrustEngine {
     pub fn new() -> Self {
-        let mut engine = Self {
+        Self {
             cache: Arc::new(RwLock::new(HashMap::with_capacity(4096))),
-            gpg_key_map: Arc::new(RwLock::new(Vec::new())),
-        };
-        engine.load_gpg_keys();
-        engine
-    }
-
-    fn load_gpg_keys(&mut self) {
-        let gpg_dirs = &["/etc/pki/rpm-gpg/", "/usr/share/distribution-gpg-keys/"];
-        let mut keys = self.gpg_key_map.write();
-        for dir in gpg_dirs {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path
-                        .extension()
-                        .map(|e| e == "asc" || e == "gpg")
-                        .unwrap_or(false)
-                    {
-                        keys.push(path.display().to_string());
-                    }
-                }
-            }
+            path_memo: Arc::new(RwLock::new(HashMap::with_capacity(4096))),
         }
-        info!("Loaded {} GPG key files for RPM verification", keys.len());
     }
 
     pub fn verify_binary(&self, binary_path: &str, pid: u32) -> TrustStatus {
+        Self::verify_impl(&self.cache, &self.path_memo, binary_path, pid)
+    }
+
+    /// Async variant for use from the event loop: the expensive part
+    /// (whole-file read + SHA-256 + `rpm` subprocess) runs on a blocking
+    /// thread, so a slow disk or a slow rpm query cannot stall event
+    /// processing. Results are memoized, so subsequent connects from the same
+    /// unchanged binary are cheap cache hits.
+    pub async fn verify_binary_async(&self, binary_path: &str, pid: u32) -> TrustStatus {
+        let cache = self.cache.clone();
+        let path_memo = self.path_memo.clone();
+        let binary_path = binary_path.to_string();
+        tokio::task::spawn_blocking(move || {
+            Self::verify_impl(&cache, &path_memo, &binary_path, pid)
+        })
+        .await
+        .unwrap_or(TrustStatus::Unknown)
+    }
+
+    fn verify_impl(
+        cache: &RwLock<HashMap<Vec<u8>, TrustStatus>>,
+        path_memo: &RwLock<HashMap<(String, u64, u64), TrustStatus>>,
+        binary_path: &str,
+        pid: u32,
+    ) -> TrustStatus {
         if binary_path == "unknown" || binary_path.is_empty() {
             return TrustStatus::Unknown;
         }
 
-        let binary_bytes = match fs::read(binary_path) {
+        // Cheap memo first: (path, size, mtime) → status. Avoids reading and
+        // hashing the whole binary on every connect.
+        let meta = match std::fs::metadata(binary_path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("TrustEngine: cannot stat {binary_path} for PID {pid}: {e}");
+                return TrustStatus::Unknown;
+            }
+        };
+        let memo_key = (
+            binary_path.to_string(),
+            meta.len(),
+            meta.modified()
+                .map(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0),
+        );
+        {
+            let memo = path_memo.read();
+            if let Some(status) = memo.get(&memo_key) {
+                return status.clone();
+            }
+        }
+
+        let binary_bytes = match std::fs::read(binary_path) {
             Ok(b) => b,
             Err(e) => {
                 warn!("TrustEngine: cannot read binary {binary_path} for PID {pid}: {e}");
@@ -89,25 +123,32 @@ impl TrustEngine {
         let hash = Sha256::digest(&binary_bytes).to_vec();
 
         {
-            let cache = self.cache.read();
+            let cache = cache.read();
             if let Some(status) = cache.get(&hash) {
                 return status.clone();
             }
         }
 
-        let status = self.check_binary_status(binary_path, pid, &binary_bytes);
+        let status = Self::check_binary_status_gpg(binary_path, pid);
 
-        let mut cache = self.cache.write();
-        cache.insert(hash, status.clone());
+        {
+            let mut cache = cache.write();
+            cache.insert(hash, status.clone());
+            if cache.len() > 8192 {
+                cache.clear();
+            }
+        }
+        {
+            let mut memo = path_memo.write();
+            memo.insert(memo_key, status.clone());
+            if memo.len() > 8192 {
+                memo.clear();
+            }
+        }
         status
     }
 
-    fn check_binary_status(
-        &self,
-        binary_path: &str,
-        pid: u32,
-        _binary_bytes: &[u8],
-    ) -> TrustStatus {
+    fn check_binary_status_gpg(binary_path: &str, pid: u32) -> TrustStatus {
         let binary_name = Path::new(binary_path)
             .file_name()
             .and_then(|n| n.to_str())
@@ -127,14 +168,19 @@ impl TrustEngine {
             return TrustStatus::Untrusted;
         }
 
-        if self.verify_rpm_package(binary_path) {
-            let sig_ok = self.verify_rpm_signature(binary_path);
-            if sig_ok {
-                info!("TrustEngine: PID {pid} binary {binary_path} verified as signed RPM package");
+        if Self::verify_rpm_package(binary_path) {
+            // `rpm -qVf` verifies the installed file against the RPM database
+            // (sizes/checksums/modes). It is NOT a cryptographic signature
+            // check — that would require the original .rpm and `rpm -K`. We
+            // deliberately do not claim "signed": a modified file fails the
+            // DB check and the binary is treated as unverifiable.
+            let integ_ok = Self::verify_rpm_integrity(binary_path);
+            if integ_ok {
+                info!("TrustEngine: PID {pid} binary {binary_path} verified against RPM database");
                 return TrustStatus::TrustedSystemPackage;
             } else {
                 warn!(
-                    "TrustEngine: PID {pid} binary {binary_path} is from RPM but signature verification failed"
+                    "TrustEngine: PID {pid} binary {binary_path} is from RPM but failed integrity verification (modified or unverifiable)"
                 );
                 return TrustStatus::Unknown;
             }
@@ -146,7 +192,7 @@ impl TrustEngine {
         TrustStatus::TrustedBinary
     }
 
-    fn verify_rpm_package(&self, binary_path: &str) -> bool {
+    fn verify_rpm_package(binary_path: &str) -> bool {
         let output = match std::process::Command::new("rpm")
             .args(["-qf", "--queryformat", "%{NAME}", binary_path])
             .output()
@@ -168,14 +214,16 @@ impl TrustEngine {
         false
     }
 
-    fn verify_rpm_signature(&self, binary_path: &str) -> bool {
+    /// Verify the installed binary's file attributes against the RPM database
+    /// (`rpm -qVf`). Note: this is integrity-vs-DB, not a GPG signature check.
+    fn verify_rpm_integrity(binary_path: &str) -> bool {
         let output = match std::process::Command::new("rpm")
             .args(["-qVf", binary_path])
             .output()
         {
             Ok(o) => o,
             Err(e) => {
-                warn!("rpm signature verification failed for {binary_path}: {e}");
+                warn!("rpm integrity verification failed for {binary_path}: {e}");
                 return false;
             }
         };
@@ -193,9 +241,5 @@ impl TrustEngine {
 
     pub fn cache_size(&self) -> usize {
         self.cache.read().len()
-    }
-
-    pub fn gpg_key_count(&self) -> usize {
-        self.gpg_key_map.read().len()
     }
 }
