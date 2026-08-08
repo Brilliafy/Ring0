@@ -334,6 +334,9 @@ impl Daemon {
                             warn!("periodic intel feed sync failed: {e:?}");
                         }
                     });
+                    // Reap spent per-connection TLS scan budgets so the kernel
+                    // map cannot fill with finished connections.
+                    self.ebpf.clear_tls_budgets();
                 }
                 _ = governor_tick.tick() => {
                     self.tick_governor();

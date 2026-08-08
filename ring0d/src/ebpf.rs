@@ -704,6 +704,30 @@ impl EbpfManager {
     /// was bound to the single default-route interface at startup, so a
     /// Wi-Fi→cellular/VPN route switch silently moved traffic onto an
     /// unattached interface.
+    /// Reset all per-connection TLS scan budgets. Called on the periodic
+    /// intel tick so the budget map cannot fill with spent connections
+    /// forever (fresh connections would stop being scanned). A reset costs
+    /// each live connection one more ~8KB of re-inspection per hour — a
+    /// bounded, negligible re-scan of ongoing flows.
+    pub fn clear_tls_budgets(&mut self) {
+        if let Some(ebpf) = self.ebpf.as_mut() {
+            if let Some(map) = ebpf.map_mut("TLS_FLOW_BUDGET") {
+                if let Ok(mut map) = HashMap::<&mut MapData, u64, u32>::try_from(map) {
+                    let keys: Vec<u64> = map.keys().filter_map(Result::ok).collect();
+                    let mut cleared = 0u32;
+                    for k in keys {
+                        if map.remove(&k).is_ok() {
+                            cleared += 1;
+                        }
+                    }
+                    if cleared > 0 {
+                        info!("cleared {cleared} per-connection TLS scan budgets");
+                    }
+                }
+            }
+        }
+    }
+
     pub fn scan_interfaces(&mut self) {
         if self.ebpf.is_none() {
             return;

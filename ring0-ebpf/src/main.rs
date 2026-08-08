@@ -56,6 +56,16 @@ pub static SAMPLING_ENABLED: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
 /// traffic. Rate limit to one event per 20ms (~50/s).
 #[map]
 pub static PACKET_LAST_EMIT: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
+/// Per-connection TLS plaintext budget in bytes, keyed by (pid, SSL*).
+/// The interesting part of any flow is its START (protocol headers, the
+/// request, the first bytes of the response); everything after the budget is
+/// bulk transfer ("just download data") with little detection value. Once a
+/// connection exceeds the budget we stop emitting TLS events for it, so the
+/// daemon scans ~8KB per connection instead of the entire transfer.
+const TLS_SCAN_BUDGET_BYTES: u32 = 8192;
+
+#[map]
+pub static TLS_FLOW_BUDGET: HashMap<u64, u32> = HashMap::with_max_entries(65536, 0);
 
 #[map]
 pub static APP_QOS_MAP: HashMap<QosRateKey, QosRateVal> = HashMap::with_max_entries(256, 0);
@@ -1083,28 +1093,53 @@ unsafe fn ring0_handle_finit_module(regs: *const aya_ebpf::bindings::pt_regs) {
 // ── TLS uprobes ──────────────────────────────────────────────
 
 fn capture_tls_event(ctx: &ProbeContext, direction: u8) {
-    if let Some(mut entry) = unsafe { RING_BUF.reserve::<TlsEvent>(0) } {
-        let pid = ctx.pid();
-        let buf_ptr = ctx.arg::<*const u8>(1).unwrap_or(ptr::null());
-        let raw_len = ctx.arg::<u32>(2).unwrap_or(0);
-        // Distinguish the classic SSL_write/SSL_read signature (buf, num)
-        // from the *_ex variants, which pass a `size_t *` in arg 2 — a
-        // pointer-like value, not a length. Treating a pointer as a length
-        // would copy 256 bytes from an unrelated user address. Sizes of a
-        // single SSL_write/read above 16 MiB are implausible, so clamp those
-        // to zero and capture nothing rather than garbage.
-        let len = if raw_len <= 0x0100_0000 {
-            raw_len.min(256)
-        } else {
-            0
-        };
-        let mut buf = [0u8; 256];
-        if !buf_ptr.is_null() && len > 0 {
-            // Read the TLS plaintext from user space with a probe-read helper.
-            // Direct dereference of user pointers is rejected by the verifier.
-            if let Some(dst) = buf.get_mut(..len as usize) {
-                let _ = unsafe { aya_ebpf::helpers::bpf_probe_read_user_buf(buf_ptr, dst) };
+    let pid = ctx.pid();
+    let ssl = ctx.arg::<*const u8>(0).unwrap_or(ptr::null()) as u64;
+    let buf_ptr = ctx.arg::<*const u8>(1).unwrap_or(ptr::null());
+    let raw_len = ctx.arg::<u32>(2).unwrap_or(0);
+    // Distinguish the classic SSL_write/SSL_read signature (buf, num)
+    // from the *_ex variants, which pass a `size_t *` in arg 2 — a
+    // pointer-like value, not a length. Treating a pointer as a length
+    // would copy 256 bytes from an unrelated user address. Sizes of a
+    // single SSL_write/read above 16 MiB are implausible, so clamp those
+    // to zero and capture nothing rather than garbage.
+    let len = if raw_len <= 0x0100_0000 {
+        raw_len.min(256)
+    } else {
+        0
+    };
+    if len == 0 || buf_ptr.is_null() {
+        return;
+    }
+    // Per-connection budget: the interesting bytes of a flow are its start.
+    // The SSL handle uniquely identifies a connection within a process, so
+    // (pid, SSL*) keys the budget. Once a connection's budget is spent we
+    // stop emitting events for it — no ring traffic, no daemon scan.
+    let key = ((pid as u64) << 32) | (ssl & 0xFFFF_FFFF);
+    let within_budget = unsafe {
+        match TLS_FLOW_BUDGET.get_ptr_mut(&key) {
+            Some(b) => {
+                if *b >= TLS_SCAN_BUDGET_BYTES {
+                    false
+                } else {
+                    *b = (*b).saturating_add(len);
+                    true
+                }
             }
+            // First capture for this connection. E2BIG (map full) degrades to
+            // "not scanned" — safe, never blocks or drops other traffic.
+            None => TLS_FLOW_BUDGET.insert(&key, &len, 0).is_ok(),
+        }
+    };
+    if !within_budget {
+        return;
+    }
+    if let Some(mut entry) = unsafe { RING_BUF.reserve::<TlsEvent>(0) } {
+        let mut buf = [0u8; 256];
+        // Read the TLS plaintext from user space with a probe-read helper.
+        // Direct dereference of user pointers is rejected by the verifier.
+        if let Some(dst) = buf.get_mut(..len as usize) {
+            let _ = unsafe { aya_ebpf::helpers::bpf_probe_read_user_buf(buf_ptr, dst) };
         }
         entry.write(TlsEvent {
             kind: KIND_TLS,

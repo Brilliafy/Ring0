@@ -141,13 +141,14 @@ const SIGNATURES: &[Signature] = &[
     },
 ];
 
-/// Maximum payloads scanned per second. Each TLS uprobe event carries a
-/// payload snippet; under TLS-heavy traffic (video streaming, bulk transfers)
-/// the raw event rate can reach thousands/sec. Hyperscan is O(n) per scan, but
-/// per-scan call overhead plus the daemon's alert/storage pipeline still
-/// needs a hard ceiling so ordinary traffic cannot peg a core. Scans beyond
-/// the budget are skipped (the most recent traffic still gets scanned).
-const MAX_SCANS_PER_SEC: u64 = 300;
+/// Maximum payloads scanned per second. This is a pure safety ceiling against
+/// a pathological flood (connection storms, misbehaving libraries); in normal
+/// operation the kernel's per-connection TLS scan budget keeps the event rate
+/// proportional to CONNECTION STARTS, not throughput — a download emits ~32
+/// events (one per 256-byte chunk of its ~8KB interesting prefix), not one
+/// per TLS record. Scans beyond the ceiling are skipped (safety over
+/// completeness during an attack).
+const MAX_SCANS_PER_SEC: u64 = 2000;
 
 /// Single-pass DPI engine.
 ///
