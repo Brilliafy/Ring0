@@ -4,7 +4,20 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+/// Resolve a bare command name (e.g. "curl") to a full path by searching
+/// $PATH. Returns None when not found.
+fn trust_resolve_path(name: &str) -> Option<String> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in path.split(':') {
+        let candidate = format!("{dir}/{name}");
+        if std::path::Path::new(&candidate).is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
 
 const TRUSTED_PATHS: &[&str] = &[
     "/usr/bin/",
@@ -85,12 +98,27 @@ impl TrustEngine {
             return TrustStatus::Unknown;
         }
 
+        // Short-lived processes (curl one-liners, scripted tools) resolve to
+        // the bare comm name ("curl") because /proc/<pid>/exe is gone by the
+        // time the event is processed. Resolve basenames against PATH so the
+        // trust verdict still applies; unresolvable basenames fall through to
+        // the ALWAYS_ALLOW check and are logged at debug, not per-event warn.
+        let resolved = if binary_path.contains('/') {
+            binary_path.to_string()
+        } else {
+            trust_resolve_path(binary_path).unwrap_or_else(|| binary_path.to_string())
+        };
+
         // Cheap memo first: (path, size, mtime) → status. Avoids reading and
         // hashing the whole binary on every connect.
-        let meta = match std::fs::metadata(binary_path) {
+        let meta = match std::fs::metadata(&resolved) {
             Ok(m) => m,
             Err(e) => {
-                warn!("TrustEngine: cannot stat {binary_path} for PID {pid}: {e}");
+                if resolved.contains('/') {
+                    warn!("TrustEngine: cannot stat {resolved} for PID {pid}: {e}");
+                } else {
+                    debug!("TrustEngine: cannot stat {resolved} for PID {pid}: {e}");
+                }
                 return TrustStatus::Unknown;
             }
         };

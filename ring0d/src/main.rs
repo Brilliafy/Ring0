@@ -1169,7 +1169,16 @@ impl Daemon {
                                     self.broadcast_alert_record(&a).await;
                                 }
                             }
-                            Err(e) => warn!("YARA scan skipped for {binary}: {e}"),
+                            // YARA isn't compiled in: warn once, not once per
+                            // process event (was spamming the log + churning
+                            // allocations for every memfd/exec).
+                            Err(_) => {
+                                static WARNED: std::sync::atomic::AtomicBool =
+                                    std::sync::atomic::AtomicBool::new(false);
+                                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                    warn!("YARA engine not implemented — binary scanning skipped");
+                                }
+                            }
                         }
                     }
                 }
