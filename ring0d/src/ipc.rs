@@ -214,17 +214,27 @@ impl IpcServer {
                                         Ok(cmd) => {
                                             // Destructive/sensitive commands are
                                             // restricted to root or members of the
-                                            // "ring0" admin group, otherwise any
-                                            // local process could kill arbitrary
-                                            // processes, shut the daemon down, or
-                                            // answer prompts on behalf of the user.
+                                            // "ring0" admin group. Everyone else is
+                                            // asked via polkitd, which pops the
+                                            // desktop authentication dialog.
                                             if is_privileged_command(&cmd)
                                                 && !peer_is_privileged(&peer_cred)
                                             {
-                                                warn!(
-                                                    "denied privileged command {cmd:?} from uid {}",
-                                                    peer_cred.uid
-                                                );
+                                                let ok = crate::polkit::check_authorization(
+                                                    peer_cred.pid as u32,
+                                                    peer_cred.uid,
+                                                )
+                                                .await;
+                                                if ok {
+                                                    if cmd_tx.send(cmd).is_err() {
+                                                        break;
+                                                    }
+                                                } else {
+                                                    warn!(
+                                                        "denied privileged command {cmd:?} from uid {}",
+                                                        peer_cred.uid
+                                                    );
+                                                }
                                             } else if cmd_tx.send(cmd).is_err() {
                                                 break;
                                             }

@@ -148,7 +148,45 @@ RULESEOF
     fi
     chown -R root:"$GROUP" "$CONFIG_DIR"
     chmod 750 "$CONFIG_DIR"
+    # Ship the polkit policy alongside the config (installed later by install_polkit).
+    if [ -d "$(dirname "$0")/../etc/ring0/polkit" ]; then
+        mkdir -p "$CONFIG_DIR/polkit"
+        cp "$(dirname "$0")/../etc/ring0/polkit/com.ring0.policy" "$CONFIG_DIR/polkit/"
+    fi
     pass "Configuration deployed to $CONFIG_DIR"
+}
+
+# Install polkit policy so the unprivileged GUI/CLI can be authorized for
+# privileged daemon commands via the desktop authentication dialog.
+install_polkit() {
+    echo ""
+    echo "--- Installing Polkit Policy ---"
+    mkdir -p /usr/share/polkit-1/actions
+    if [ -f "$CONFIG_DIR/polkit/com.ring0.policy" ]; then
+        cp "$CONFIG_DIR/polkit/com.ring0.policy" /usr/share/polkit-1/actions/
+    else
+        # Fallback: write the policy inline if the bundled file is absent.
+        cat > /usr/share/polkit-1/actions/com.ring0.policy << 'POLKITEOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<policyconfig>
+  <vendor>Ring0 Security</vendor>
+  <action id="com.ring0.security.control">
+    <description>Control the Ring0 security daemon</description>
+    <message>Authentication is required to control the Ring0 security daemon</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+</policyconfig>
+POLKITEOF
+    fi
+    chmod 644 /usr/share/polkit-1/actions/com.ring0.policy
+    pass "Polkit policy installed (com.ring0.security.control)"
 }
 
 # Install systemd service
@@ -290,6 +328,7 @@ create_dirs
 build_binaries
 install_binaries
 deploy_config
+install_polkit
 install_systemd
 install_selinux
 install_apparmor

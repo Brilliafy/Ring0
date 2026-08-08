@@ -18,6 +18,7 @@ pub mod intel;
 // wired into the event pipeline (see IntelApiClient).
 pub mod intel_api;
 pub mod ipc;
+pub mod polkit;
 pub mod power;
 pub mod privesc;
 pub mod process;
