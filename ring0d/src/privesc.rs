@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Debug, Clone)]
 pub struct PrivEscAttempt {
@@ -42,10 +42,16 @@ impl PrivEscDetector {
         target_pid: u32,
     ) -> Option<PrivEscAttempt> {
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
-        let desc = format!(
-            "ptrace injection attempt: PID {} -> PID {}",
-            pid, target_pid
-        );
+        // The kernel LSM hook cannot expose the child's pid without CO-RE
+        // task_struct bindings, so target_pid is 0 — don't present it as data.
+        let desc = if target_pid != 0 {
+            format!(
+                "ptrace injection attempt: PID {} -> PID {}",
+                pid, target_pid
+            )
+        } else {
+            format!("ptrace access attempt: PID {}", pid)
+        };
         let attempt = PrivEscAttempt {
             timestamp: now,
             pid,
@@ -55,7 +61,7 @@ impl PrivEscDetector {
             blocked: true,
         };
         self.push_attempt(attempt.clone());
-        info!("[PRIVESC] {desc}");
+        debug!("[PRIVESC] {desc}");
         Some(attempt)
     }
 
@@ -77,7 +83,7 @@ impl PrivEscDetector {
             blocked,
         };
         if blocked {
-            info!("[PRIVESC_BLOCKED] {desc}");
+            debug!("[PRIVESC_BLOCKED] {desc}");
         }
         self.push_attempt(attempt.clone());
         Some(attempt)
@@ -104,7 +110,7 @@ impl PrivEscDetector {
             blocked,
         };
         if blocked {
-            info!("[PRIVESC_BLOCKED] {desc}");
+            debug!("[PRIVESC_BLOCKED] {desc}");
         }
         self.push_attempt(attempt.clone());
         Some(attempt)

@@ -129,7 +129,8 @@ struct Daemon {
 
 impl Daemon {
     async fn new(shutdown: Arc<Notify>) -> Result<Self> {
-        let mut ebpf = ebpf::EbpfManager::load()?;
+        let lsm_enforce = std::env::var("RING0_LSM_ENFORCE").as_deref() == Ok("1");
+        let mut ebpf = ebpf::EbpfManager::load(lsm_enforce)?;
         // Fast-path DPI: sync literal patterns into the kernel map. Observe-only
         // by default; RING0_DPI_ENFORCE=1 switches the fast path to drop.
         let dpi_synced = ebpf.sync_dpi_patterns(ebpf::BPF_DPI_SIGNATURES);
@@ -405,9 +406,32 @@ impl Daemon {
                 ),
             );
             self.storage.write_alert(&a);
-            self.ipc.broadcast_raw(&a).await;
+            let evt = ipc::build_alert_event(
+                4000,
+                3,
+                &format!(
+                    "blocked port traffic {}.{}.{}.{}:{}",
+                    (dst_ip >> 24) & 0xFF,
+                    (dst_ip >> 16) & 0xFF,
+                    (dst_ip >> 8) & 0xFF,
+                    dst_ip & 0xFF,
+                    dst_port
+                ),
+            );
+            self.ipc.broadcast_raw(&evt).await;
         }
         let _ = (src_ip, proto, action, binary);
+    }
+
+    /// Broadcast an encoded `AlertRecord` as the capnp `ring0_event::Alert`
+    /// frame every IPC subscriber can decode. The compact AlertRecord binary
+    /// format is what gets persisted to storage; the broadcast stream is
+    /// shared with the GUI and `ring0ctl tail`, which parse `ring0_event`.
+    async fn broadcast_alert_record(&self, encoded: &[u8]) {
+        if let Some(rec) = alert::AlertRecord::decode(encoded) {
+            let evt = ipc::build_alert_event(rec.rule_id, rec.severity, &rec.message);
+            self.ipc.broadcast_raw(&evt).await;
+        }
     }
 
     async fn on_process_exec(&self, raw: &[u8]) {
@@ -432,6 +456,11 @@ impl Daemon {
         let cmdline =
             crate::process::ProcessResolver::cmdline(pid).unwrap_or_else(|| "unknown".into());
         let parent_binary = crate::process::ProcessResolver::binary_path(ppid);
+        // Every exec is broadcast as a capnp processExec event so the GUI
+        // ProcessTree and `ring0ctl tail` see live process activity even when
+        // no alert fires (previously only alert-worthy execs were surfaced).
+        let exec_evt = ipc::build_process_exec_event(pid, ppid, uid, &binary, &cmdline);
+        self.ipc.broadcast_raw(&exec_evt).await;
         if let Some(ref pb) = parent_binary {
             self.baseline.record_exec(&binary, Some(pb));
         } else {
@@ -443,20 +472,23 @@ impl Daemon {
         {
             let a = build_alert_bytes_rule(8001, 2, &anomaly);
             self.storage.write_alert(&a);
-            self.ipc.broadcast_raw(&a).await;
+            let evt = ipc::build_alert_event(8001, 2, &anomaly);
+            self.ipc.broadcast_raw(&evt).await;
         }
         self.correlation.push_exec(pid, ppid, &binary, &cmdline);
         if let Some(pb) = &parent_binary {
             for rid in self.rules.check_process_anomaly(&binary, Some(pb)) {
                 let a = build_alert_bytes_rule(rid, 3, "process anomaly");
                 self.storage.write_alert(&a);
-                self.ipc.broadcast_raw(&a).await;
+                self.broadcast_alert_record(&a).await;
             }
         }
         if self.ebpf.binary_blocked(&binary) {
             let a = build_alert_bytes_rule(9001, 4, &format!("blocked binary executed: {binary}"));
             self.storage.write_alert(&a);
-            self.ipc.broadcast_raw(&a).await;
+            let evt =
+                ipc::build_alert_event(9001, 4, &format!("blocked binary executed: {binary}"));
+            self.ipc.broadcast_raw(&evt).await;
             // F9: capture starttime now (≈ event time) and re-verify just
             // before the kill, so a PID recycled between the kernel
             // tracepoint and this handler cannot make us SIGKILL an innocent
@@ -499,7 +531,8 @@ impl Daemon {
         for rid in self.rules.check_file_access(&fnbuf, pid, true) {
             let a = build_alert_bytes_hids(rid, &binary, &fnbuf);
             self.storage.write_alert(&a);
-            self.ipc.broadcast_raw(&a).await;
+            let evt = ipc::build_alert_event(rid, 3, &format!("{binary}: {fnbuf}"));
+            self.ipc.broadcast_raw(&evt).await;
         }
         let evt = ipc::build_file_access_event(pid, uid, &binary, &fnbuf);
         self.storage.write_raw(&evt);
@@ -521,7 +554,8 @@ impl Daemon {
         if let Some(anomaly) = self.baseline.check_connection_anomaly(dip, dp) {
             let a = build_alert_bytes_rule(8002, 2, &anomaly);
             self.storage.write_alert(&a);
-            self.ipc.broadcast_raw(&a).await;
+            let evt = ipc::build_alert_event(8002, 2, &anomaly);
+            self.ipc.broadcast_raw(&evt).await;
         }
         let binary =
             crate::process::ProcessResolver::binary_path(pid).unwrap_or_else(|| "unknown".into());
@@ -531,7 +565,8 @@ impl Daemon {
         if let Some(anomaly) = self.desktop_sandbox.check_network_anomaly(pid, &binary) {
             let a = build_alert_bytes_rule(1001, 3, &anomaly.description);
             self.storage.write_alert(&a);
-            self.ipc.broadcast_raw(&a).await;
+            let evt = ipc::build_alert_event(1001, 3, &anomaly.description);
+            self.ipc.broadcast_raw(&evt).await;
             info!("[SANDBOX] {}", anomaly.description);
         }
         let evt = ipc::build_connect_event(pid, uid, &binary, dip, dp, proto);
@@ -556,7 +591,19 @@ impl Daemon {
                 ),
             );
             self.storage.write_alert(&a);
-            self.ipc.broadcast_raw(&a).await;
+            let evt = ipc::build_alert_event(
+                4003,
+                2,
+                &format!(
+                    "Contextual block: {}.{}.{}.{}:{} by PID {pid}",
+                    (dip >> 24) & 0xFF,
+                    (dip >> 16) & 0xFF,
+                    (dip >> 8) & 0xFF,
+                    dip & 0xFF,
+                    dp
+                ),
+            );
+            self.ipc.broadcast_raw(&evt).await;
             return;
         }
         match trust_status {
@@ -647,7 +694,7 @@ impl Daemon {
         if let Some(evt) = self.self_defense.ingest_kill_attempt(attacker, target, sig) {
             let alert = build_self_defense_alert(&evt);
             self.storage.write_alert(&alert);
-            self.ipc.broadcast_raw(&alert).await;
+            self.broadcast_alert_record(&alert).await;
         }
     }
 
@@ -665,7 +712,7 @@ impl Daemon {
         if let Some(evt) = self.self_defense.ingest_unlink_attempt(pid, &path) {
             let alert = build_self_defense_alert(&evt);
             self.storage.write_alert(&alert);
-            self.ipc.broadcast_raw(&alert).await;
+            self.broadcast_alert_record(&alert).await;
         }
     }
 
@@ -679,7 +726,7 @@ impl Daemon {
         for m in self.dpi.scan_payload(payload) {
             let alert = build_alert_bytes_rule(m.rule_id, m.severity, &m.signature_name);
             self.storage.write_alert(&alert);
-            self.ipc.broadcast_raw(&alert).await;
+            self.broadcast_alert_record(&alert).await;
         }
     }
 
@@ -722,7 +769,7 @@ impl Daemon {
         let alert = build_alert_bytes_rule(5000 + rule_id, 2, &msg);
         if self.alert_due(5000 + rule_id) {
             self.storage.write_alert(&alert);
-            self.ipc.broadcast_raw(&alert).await;
+            self.broadcast_alert_record(&alert).await;
         }
         info!("[DPI] {msg}");
     }
@@ -782,7 +829,7 @@ impl Daemon {
             info!("[LSM_DENY] {desc}");
             let alert = build_alert_bytes_rule(9000 + event_type as u32, 4, &desc);
             self.storage.write_alert(&alert);
-            self.ipc.broadcast_raw(&alert).await;
+            self.broadcast_alert_record(&alert).await;
         } else {
             info!("[LSM_ALLOW] {} pid={} path={}", event_name, pid, path);
         }
@@ -826,13 +873,15 @@ impl Daemon {
             ebpf::KIND_SETUID => {
                 let new_uid = u32::from_le_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
                 self.privesc.ingest_setuid_event(pid, uid, new_uid);
-                let a = build_alert_bytes_rule(
-                    2001,
-                    4,
-                    &format!("setuid escalation PID {} {}->{}", pid, uid, new_uid),
-                );
-                self.storage.write_alert(&a);
-                self.ipc.broadcast_raw(&a).await;
+                if self.alert_due(2001) {
+                    let a = build_alert_bytes_rule(
+                        2001,
+                        4,
+                        &format!("setuid escalation PID {} {}->{}", pid, uid, new_uid),
+                    );
+                    self.storage.write_alert(&a);
+                    self.broadcast_alert_record(&a).await;
+                }
                 // A real uid escalation is the clearest privilege-escalation signal;
                 // contain the process. (Informational capable/ptrace events do not
                 // trigger containment — freezing processes for those is destructive.)
@@ -844,28 +893,32 @@ impl Daemon {
             ebpf::KIND_PTRACE => {
                 let target = u32::from_le_bytes(raw[28..32].try_into().unwrap_or([0; 4]));
                 self.privesc.ingest_ptrace_attempt(pid, uid, target);
-                let a = build_alert_bytes_rule(
-                    2002,
-                    4,
-                    &if target != 0 {
-                        format!("ptrace PID {} -> {}", pid, target)
-                    } else {
-                        format!("ptrace access attempt PID {}", pid)
-                    },
-                );
-                self.storage.write_alert(&a);
-                self.ipc.broadcast_raw(&a).await;
+                if self.alert_due(2002) {
+                    let a = build_alert_bytes_rule(
+                        2002,
+                        4,
+                        &if target != 0 {
+                            format!("ptrace PID {} -> {}", pid, target)
+                        } else {
+                            format!("ptrace access attempt PID {}", pid)
+                        },
+                    );
+                    self.storage.write_alert(&a);
+                    self.broadcast_alert_record(&a).await;
+                }
             }
             ebpf::KIND_CAP => {
                 let capability = u32::from_le_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
                 self.privesc.ingest_capable_check(pid, uid, capability);
-                let a = build_alert_bytes_rule(
-                    2003,
-                    3,
-                    &format!("capable PID {} cap={}", pid, capability),
-                );
-                self.storage.write_alert(&a);
-                self.ipc.broadcast_raw(&a).await;
+                if self.alert_due(2003) {
+                    let a = build_alert_bytes_rule(
+                        2003,
+                        3,
+                        &format!("capable PID {} cap={}", pid, capability),
+                    );
+                    self.storage.write_alert(&a);
+                    self.broadcast_alert_record(&a).await;
+                }
             }
             _ => {}
         }
@@ -900,7 +953,7 @@ impl Daemon {
                     let desc = finding.description.clone();
                     let a = build_alert_bytes_rule(7001, 3, &desc);
                     self.storage.write_alert(&a);
-                    self.ipc.broadcast_raw(&a).await;
+                    self.broadcast_alert_record(&a).await;
                     info!("[ROOTKIT] {desc}");
                 }
             }
@@ -919,7 +972,7 @@ impl Daemon {
                     let desc = finding.description.clone();
                     let a = build_alert_bytes_rule(7002, 3, &desc);
                     self.storage.write_alert(&a);
-                    self.ipc.broadcast_raw(&a).await;
+                    self.broadcast_alert_record(&a).await;
                     info!("[ROOTKIT] {desc}");
                 }
             }
@@ -935,7 +988,7 @@ impl Daemon {
                     let desc = finding.description.clone();
                     let a = build_alert_bytes_rule(7000, 3, &desc);
                     self.storage.write_alert(&a);
-                    self.ipc.broadcast_raw(&a).await;
+                    self.broadcast_alert_record(&a).await;
                     info!("[ROOTKIT] {desc}");
                     if let Some(binary) = crate::process::ProcessResolver::binary_path(pid) {
                         match self.intel.scan_binary(&binary) {
@@ -943,7 +996,7 @@ impl Daemon {
                                 for m in matches {
                                     let a = build_alert_bytes_rule(7003, 3, &m);
                                     self.storage.write_alert(&a);
-                                    self.ipc.broadcast_raw(&a).await;
+                                    self.broadcast_alert_record(&a).await;
                                 }
                             }
                             Err(e) => warn!("YARA scan skipped for {binary}: {e}"),
@@ -1052,16 +1105,21 @@ impl Daemon {
             // F11: each insert is a syscall; a full feed (tens of thousands of
             // entries) would stall the event loop for seconds. Apply in chunks
             // and yield between them so IPC/event processing stays responsive.
+            // NOTE: domains are applied in ONE call — sync_dns_domains mirrors
+            // the feed into the userspace fallback list by rebuilding a HashSet
+            // of the whole list, so chunked calls were O(n²) (166 chunks × up
+            // to 340k string clones each == minutes of stall). Single call =
+            // one O(n) rebuild. The kernel DNS map holds 200k entries max, so
+            // anything beyond that never made it into the kernel anyway.
             let mut c = 0usize;
             for chunk in payload.cidrs.chunks(SYNC_CHUNK) {
                 c += self.ebpf.sync_blocked_cidrs(chunk);
                 tokio::task::yield_now().await;
             }
-            let mut d = 0usize;
-            for chunk in payload.domains.chunks(SYNC_CHUNK) {
-                d += self.ebpf.sync_dns_domains(chunk);
-                tokio::task::yield_now().await;
-            }
+            let mut domains = payload.domains;
+            domains.truncate(190_000); // kernel map capacity; userspace matcher covers the rest
+            let d = self.ebpf.sync_dns_domains(&domains);
+            tokio::task::yield_now().await;
             let mut p = 0usize;
             for chunk in payload.ports.chunks(SYNC_CHUNK) {
                 p += self.ebpf.sync_blocked_ports(chunk);

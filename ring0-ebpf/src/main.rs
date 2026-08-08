@@ -52,6 +52,11 @@ pub static ESTABLISHED_FLOWS: LruHashMap<FlowKey, u32> = LruHashMap::with_max_en
 /// `PacketEvent` emission (governor "critical" mode). Absent = sampling on.
 #[map]
 pub static SAMPLING_ENABLED: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
+/// Last packet-event emission time (key 0, ktime ns) — the per-packet sampler
+/// must NOT emit one event per packet or the daemon (which writes every event
+/// to storage) saturates the disk and the whole system freezes under ordinary
+/// traffic. Rate limit to one event per 20ms (~50/s).
+pub static PACKET_LAST_EMIT: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
 
 #[map]
 pub static APP_QOS_MAP: HashMap<QosRateKey, QosRateVal> = HashMap::with_max_entries(256, 0);
@@ -274,9 +279,15 @@ fn ktime_get_ns() -> u64 {
 
 fn check_blocked(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16) -> u32 {
     let drop = xdp_action::XDP_DROP;
-    if unsafe { BLOCKED_IPS.get(&Key::new(32, src_ip)).is_some() }
-        || unsafe { BLOCKED_IPS.get(&Key::new(32, dst_ip)).is_some() }
-        || unsafe { BLOCKED_PORTS.get_ptr(&src_port).is_some() }
+    if unsafe {
+        BLOCKED_IPS
+            .get(&Key::new(32, u32::from_be(src_ip)))
+            .is_some()
+    } || unsafe {
+        BLOCKED_IPS
+            .get(&Key::new(32, u32::from_be(dst_ip)))
+            .is_some()
+    } || unsafe { BLOCKED_PORTS.get_ptr(&src_port).is_some() }
         || unsafe { BLOCKED_PORTS.get_ptr(&dst_port).is_some() }
     {
         return drop;
@@ -516,6 +527,24 @@ fn is_sampling_enabled() -> bool {
     unsafe { SAMPLING_ENABLED.get_ptr(&1).is_none() }
 }
 
+/// Rate-limited packet-event sampling: at most one event per 20ms globally.
+/// The governor can additionally disable sampling entirely (SAMPLING_ENABLED).
+fn should_sample_packet() -> bool {
+    if !is_sampling_enabled() {
+        return false;
+    }
+    let now = ktime_get_ns();
+    if let Some(last) = unsafe { PACKET_LAST_EMIT.get_ptr(&0) } {
+        // SAFETY: the map value is a u64 owned by the kernel map; copying it
+        // into a local is a plain read (no aliasing, verified bounds).
+        let last = unsafe { core::ptr::read(last) };
+        if now - last < 20_000_000 {
+            return false;
+        }
+    }
+    unsafe { PACKET_LAST_EMIT.insert(&0, &now, 0).is_ok() }
+}
+
 // ── XDP program ──────────────────────────────────────────────
 
 #[xdp]
@@ -574,7 +603,7 @@ unsafe fn try_ring0_xdp(ctx: &XdpContext) -> Result<u32, u32> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    if is_sampling_enabled() {
+    if should_sample_packet() {
         if let Some(mut entry) = RING_BUF.reserve::<PacketEvent>(0) {
             entry.write(PacketEvent {
                 kind: KIND_PACKET,
@@ -645,7 +674,7 @@ unsafe fn try_ring0_tc(ctx: &TcContext) -> Result<i32, i32> {
         return Ok(0);
     }
 
-    if is_sampling_enabled() {
+    if should_sample_packet() {
         if let Some(mut entry) = RING_BUF.reserve::<PacketEvent>(0) {
             entry.write(PacketEvent {
                 kind: KIND_PACKET,
@@ -1065,7 +1094,7 @@ pub fn ring0_lsm_socket_connect(ctx: LsmContext) -> i32 {
     let ip = unsafe { aya_ebpf::helpers::bpf_probe_read_user::<u32>(addr_ptr.add(4).cast()) }
         .map(u32::from_be)
         .unwrap_or(0);
-    if unsafe { BLOCKED_IPS.get(&Key::new(32, ip)).is_some() }
+    if unsafe { BLOCKED_IPS.get(&Key::new(32, u32::from_be(ip))).is_some() }
         || unsafe { BLOCKED_PORTS.get_ptr(&port).is_some() }
     {
         let evt = LsmEvent {
@@ -1113,7 +1142,7 @@ pub fn ring0_lsm_ptrace(ctx: LsmContext) -> i32 {
         buf.write(evt);
         buf.submit(0);
     }
-    if is_lsm_enforced() {
+    if is_lsm_enforced() && uid != 0 {
         -1
     } else {
         0
@@ -1141,7 +1170,7 @@ pub fn ring0_lsm_capable(ctx: LsmContext) -> i32 {
             buf.write(evt);
             buf.submit(0);
         }
-        if is_lsm_enforced() {
+        if is_lsm_enforced() && uid != 0 {
             return -1;
         }
     }
