@@ -45,10 +45,26 @@ impl ContextualSecurity {
         let locked = self.screen_locked.clone();
         self.dbus_monitor = Some(tokio::spawn(async move {
             let conn = zbus::Connection::session().await.ok();
+            // zbus 5 caches properties lazily by default: the first
+            // get_property on a proxy spawns a background GetAll, which for a
+            // screensaver service that isn't installed turns into a warn storm
+            // ("Failed to populate properties cache via GetAll") and burns CPU.
+            // We therefore (a) disable property caching and (b) back off for a
+            // minute after several consecutive failures so missing services are
+            // probed at most once per minute instead of every 3 s.
+            let mut consecutive_misses = 0u32;
             loop {
+                if consecutive_misses >= 3 {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    consecutive_misses = 0;
+                    continue;
+                }
                 if let Some(conn) = &conn {
                     if let Some(l) = screen_locked_via_dbus(conn).await {
                         locked.store(l, Ordering::Relaxed);
+                        consecutive_misses = 0;
+                    } else {
+                        consecutive_misses += 1;
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -134,7 +150,24 @@ async fn screen_locked_via_dbus(conn: &zbus::Connection) -> Option<bool> {
             "org.freedesktop.ScreenSaver",
         ),
     ] {
-        let Ok(proxy) = zbus::proxy::Proxy::new(conn, bus, path, iface).await else {
+        // cache_properties(CacheProperties::No): a plain Get, no background
+        // GetAll. With the default lazy caching, the first read of a property
+        // spawns a GetAll task per probe; for a service that isn't installed
+        // that produces a warning storm and pointless bus traffic.
+        let builder: zbus::proxy::Builder<'_, zbus::proxy::Proxy<'_>> =
+            zbus::proxy::Builder::new(conn);
+        let Ok(builder) = builder
+            .destination(bus)
+            .and_then(|b| b.path(path))
+            .and_then(|b| b.interface(iface))
+        else {
+            continue;
+        };
+        let Ok(proxy) = builder
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+        else {
             continue;
         };
         if let Ok(active) = proxy.get_property::<bool>("Active").await {

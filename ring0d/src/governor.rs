@@ -7,8 +7,12 @@ use tracing::{info, warn};
 
 const CPU_CHECK_INTERVAL_SECS: u64 = 2;
 // Thresholds are in percent of a single CPU core used by the daemon.
-const NORMAL_THRESHOLD: f32 = 1.0;
-const ELEVATED_THRESHOLD: f32 = 3.0;
+// These are intentionally generous: a security monitor that disables packet
+// sampling at the first sign of work defeats itself. 20% of a core is still
+// "idle" for this daemon (it drives several ring readers + the event loop);
+// only sustained use above 50% of a core throttles sampling.
+const NORMAL_THRESHOLD: f32 = 20.0;
+const ELEVATED_THRESHOLD: f32 = 50.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum GovernorState {
@@ -25,6 +29,9 @@ pub struct CpuGovernor {
     last_check: RwLock<Instant>,
     daemon_cpu: AtomicU32,
     bpf_cpu: AtomicU32,
+    /// (sample time, utime, stime) of the previous CPU sample, used to compute
+    /// the CPU% from the interval delta instead of sleeping on the event loop.
+    cpu_sample: RwLock<Option<(Instant, u64, u64)>>,
 }
 
 impl CpuGovernor {
@@ -37,6 +44,7 @@ impl CpuGovernor {
             last_check: RwLock::new(Instant::now()),
             daemon_cpu: AtomicU32::new(0),
             bpf_cpu: AtomicU32::new(0),
+            cpu_sample: RwLock::new(None),
         }
     }
 
@@ -103,22 +111,34 @@ impl CpuGovernor {
     fn measure_daemon_cpu(&self) -> f32 {
         // Sample the daemon's own CPU usage from /proc/self/stat (utime+stime
         // deltas) and return it as a percentage of a single core. The previous
-        // implementation measured *global* system CPU usage and mixed fractions
-        // with the percent thresholds, so the governor could never trigger.
+        // implementation slept 100 ms on the event loop every governor tick;
+        // instead the tick is already gated at >= CPU_CHECK_INTERVAL_SECS, so
+        // the delta over the full interval gives the same measurement without
+        // blocking the loop.
         let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
         if clk_tck <= 0 {
             return 0.0;
         }
         let clk_tck = clk_tck as f64;
-        let Some((u1, s1)) = Self::proc_self_ticks() else {
+        let Some((u, s)) = Self::proc_self_ticks() else {
             return 0.0;
         };
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let Some((u2, s2)) = Self::proc_self_ticks() else {
-            return 0.0;
+        let now = Instant::now();
+        let pct = match *self.cpu_sample.read() {
+            Some((prev_at, prev_u, prev_s)) => {
+                let dt = now.duration_since(prev_at).as_secs_f64();
+                if dt > 0.0 {
+                    let dticks =
+                        (u.saturating_sub(prev_u) + s.saturating_sub(prev_s)) as f64 / clk_tck;
+                    // percent of one core over the sampling window
+                    (dticks / dt) * 100.0
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
         };
-        let delta = (u2.saturating_sub(u1) + s2.saturating_sub(s1)) as f64 / clk_tck;
-        let pct = delta / 0.1 * 100.0; // percent of one core over the 100ms window
+        *self.cpu_sample.write() = Some((now, u, s));
         pct as f32
     }
 

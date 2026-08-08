@@ -67,6 +67,7 @@ impl FimEngine {
     fn hash_directory(&self, dir: &Path, baseline: &mut HashMap<String, Vec<u8>>) -> usize {
         let mut count = 0usize;
         if let Ok(entries) = fs::read_dir(dir) {
+            let mut batch_start = std::time::Instant::now();
             for entry in entries.flatten() {
                 let path = entry.path();
                 // Follow nothing: `d_type` from the directory entry (skips
@@ -90,6 +91,19 @@ impl FimEngine {
                 let path_str = path.display().to_string();
                 baseline.insert(path_str, hash);
                 count += 1;
+                // Duty-cycle throttle: an unthrottled baseline over /usr/lib64
+                // saturates a core for minutes, which trips the power governor
+                // into Critical (sampling off) and starves the very security
+                // work the baseline is supposed to support. Every 16 files we
+                // sleep for twice the time the batch took (~33% duty cycle),
+                // keeping the scan at a fraction of a core.
+                if count % 16 == 0 {
+                    let batch = batch_start.elapsed();
+                    if !batch.is_zero() {
+                        std::thread::sleep(batch.saturating_mul(2));
+                    }
+                    batch_start = std::time::Instant::now();
+                }
             }
         }
         count

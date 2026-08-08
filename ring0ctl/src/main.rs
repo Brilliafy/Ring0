@@ -461,6 +461,44 @@ fn format_event_capnp(data: &[u8]) -> Result<String> {
                 p.getPid()
             ))
         }
+        Which::ProcessExec(e) => {
+            let p = e.map_err(|e| anyhow::anyhow!("exec read failed: {e}"))?;
+            let binary = p
+                .getBinaryPath()
+                .ok()
+                .and_then(|s| s.to_str().ok().map(|s| s.to_string()))
+                .unwrap_or_default();
+            let cmdline = p
+                .getCommandLine()
+                .ok()
+                .and_then(|s| s.to_str().ok().map(|s| s.to_string()))
+                .unwrap_or_default();
+            Ok(format!(
+                "{} pid={} ppid={} {} {}",
+                "EXEC".cyan().bold(),
+                p.getPid(),
+                p.getPpid(),
+                binary,
+                cmdline
+            ))
+        }
+        Which::Connect(c) => {
+            let p = c.map_err(|e| anyhow::anyhow!("connect read failed: {e}"))?;
+            let binary = p
+                .getBinaryPath()
+                .ok()
+                .and_then(|s| s.to_str().ok().map(|s| s.to_string()))
+                .unwrap_or_default();
+            let dst = ip_to_string(p.getDstIp().map_err(|e| anyhow::anyhow!("dst_ip: {e}"))?);
+            Ok(format!(
+                "{} pid={} {} → {}:{}",
+                "CONNECT".blue().bold(),
+                p.getPid(),
+                binary,
+                dst,
+                p.getDstPort()
+            ))
+        }
         Which::Alert(a) => {
             let alert = a.map_err(|e| anyhow::anyhow!("alert read failed: {e}"))?;
             let sig = alert
