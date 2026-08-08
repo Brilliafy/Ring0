@@ -101,7 +101,7 @@ async fn listen_signals(
             // SIGUSR1 reloads the rules engine (previously it only logged
             // 'pending' without doing anything).
             Some(SIGUSR1) => {
-                info!("SIGUSR1 — reloading rules");
+                info!("SIGUSR1  -  reloading rules");
                 let _ = cmd_tx.send(ipc::DaemonCmd::ReloadRules);
             }
             Some(_) => {
@@ -193,11 +193,11 @@ impl Daemon {
                 info!("eBPF LSM inline prevention active (enforce mode)");
             } else {
                 info!(
-                    "eBPF LSM in AUDIT mode — set RING0_LSM_ENFORCE=1 to enable inline prevention"
+                    "eBPF LSM in AUDIT mode  -  set RING0_LSM_ENFORCE=1 to enable inline prevention"
                 );
             }
         } else {
-            warn!("eBPF LSM not available — using XDP/tracepoint fallback enforcement");
+            warn!("eBPF LSM not available  -  using XDP/tracepoint fallback enforcement");
         }
 
         let rocksdb_inner = storage.inner_db();
@@ -241,7 +241,7 @@ impl Daemon {
             let fim_bg = fim.clone();
             tokio::task::spawn_blocking(move || {
                 let count = fim_bg.scan_and_baseline();
-                info!("FIM: background baseline complete — {count} system files");
+                info!("FIM: background baseline complete  -  {count} system files");
             });
         }
         let privesc = privesc::PrivEscDetector::new();
@@ -394,7 +394,7 @@ impl Daemon {
         // refuse to decode it and log loudly instead of silently misparsing.
         if !event_len_ok(raw[0], raw.len()) {
             error!(
-                "ring-buffer ABI mismatch: kind {} expected >= {} bytes, got {} — daemon and kernel are out of sync",
+                "ring-buffer ABI mismatch: kind {} expected >= {} bytes, got {}  -  daemon and kernel are out of sync",
                 raw[0],
                 ring0_abi::EVENT_SIZE[raw[0] as usize].map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
                 raw.len()
@@ -430,9 +430,34 @@ impl Daemon {
             ipc::build_packet_event(ts, src_ip, dst_ip, src_port, dst_port, proto, pid, action);
         self.storage.write_raw(&evt);
         self.ipc.broadcast_raw(&evt).await;
+        // A kernel fast-path drop (action=1) is security-relevant: surface it
+        // in the log (throttled per rule id so a blocked scanner's bursts
+        // don't flood the log) in addition to the broadcast.
+        if action == 1 && self.alert_due(10002) {
+            info!(
+                "[XDP DROP] {}.{}.{}.{}:{}{} -> {}.{}.{}.{}:{}",
+                (src_ip >> 24) & 0xFF,
+                (src_ip >> 16) & 0xFF,
+                (src_ip >> 8) & 0xFF,
+                src_ip & 0xFF,
+                src_port,
+                if proto == 17 {
+                    "/udp"
+                } else if proto == 6 {
+                    "/tcp"
+                } else {
+                    ""
+                },
+                (dst_ip >> 24) & 0xFF,
+                (dst_ip >> 16) & 0xFF,
+                (dst_ip >> 8) & 0xFF,
+                dst_ip & 0xFF,
+                dst_port,
+            );
+        }
         self.pcap_buffer.push(raw, ts);
         let binary = if pid > 0 {
-            // F11: cached 1s-TTL path — a raw readlink per packet turns a
+            // F11: cached 1s-TTL path  -  a raw readlink per packet turns a
             // scan into thousands of blocking syscalls on the event loop.
             crate::process::ProcessResolver::binary_path_cached(pid)
                 .unwrap_or_else(|| "unknown".into())
@@ -671,11 +696,11 @@ impl Daemon {
             trust::TrustStatus::TrustedSystemPackage | trust::TrustStatus::TrustedBinary => {
                 // Resolve the real 5-tuple for this socket and mark the flow
                 // established in the kernel ESTABLISHED_FLOWS map. Previously
-                // this called mark_flow_safe(pid, dip, 0, dp, proto) — the pid
+                // this called mark_flow_safe(pid, dip, 0, dp, proto)  -  the pid
                 // was stuffed into the src_ip slot, so no kernel entry ever
                 // matched and nothing was ever offloaded.
                 // F11: resolve_flow_for_dst walks /proc/*/fd for every process
-                // — a synchronous scan that must run off the event loop.
+                //  -  a synchronous scan that must run off the event loop.
                 let flow = tokio::task::spawn_blocking(move || {
                     crate::process::ProcessResolver::resolve_flow_for_dst(pid, dip, dp, proto)
                 })
@@ -686,10 +711,10 @@ impl Daemon {
                     match self.ebpf.mark_flow_established(&key) {
                         Ok(()) => {
                             let _ = self.fastpath.mark_flow_safe(key);
-                            info!("TrustEngine: PID {pid} {binary} trusted — flow offloaded to kernel fast path");
+                            info!("TrustEngine: PID {pid} {binary} trusted  -  flow offloaded to kernel fast path");
                         }
                         Err(e) => {
-                            info!("TrustEngine: PID {pid} {binary} trusted — kernel offload unavailable: {e}");
+                            info!("TrustEngine: PID {pid} {binary} trusted  -  kernel offload unavailable: {e}");
                         }
                     }
                 }
@@ -697,10 +722,10 @@ impl Daemon {
             trust::TrustStatus::Untrusted | trust::TrustStatus::Unknown => {
                 // F10: Unknown (any verification failure: unreadable binary,
                 // missing rpm, spawn_blocking error, …) must NOT silently
-                // allow the connection — route it through the same user
+                // allow the connection  -  route it through the same user
                 // prompt as Untrusted (fail-secure posture).
                 info!(
-                    "TrustEngine: PID {pid} {binary} UNTRUSTED/UNVERIFIED — creating user prompt"
+                    "TrustEngine: PID {pid} {binary} UNTRUSTED/UNVERIFIED  -  creating user prompt"
                 );
                 let (country_code, country_name) = self.enrichment.lookup_country(dip);
                 // rDNS is a network round-trip; bound it so a hostile/resolver
@@ -788,7 +813,7 @@ impl Daemon {
         let direction = raw[28]; // 0 = SSL_write (upload), 1 = SSL_read
         let hits = self.dpi.scan_payload(payload);
         for m in &hits {
-            // Surface the process that triggered the match — in consumer
+            // Surface the process that triggered the match  -  in consumer
             // security the WHO matters as much as the bytes.
             let binary = crate::process::ProcessResolver::binary_path(tpid)
                 .unwrap_or_else(|| "unknown".into());
@@ -873,7 +898,7 @@ impl Daemon {
     }
 
     /// Apply the configured response to a high-risk event. Default is
-    /// Notify — freezing/killing can destroy real work, so enforcement is
+    /// Notify  -  freezing/killing can destroy real work, so enforcement is
     /// opt-in via RING0_RESPONSE=block|freeze|kill.
     async fn enforce_high_risk(&mut self, pid: u32, binary: &str, score: i32, dst_ip: Option<u32>) {
         match self.response_mode {
@@ -1012,7 +1037,7 @@ impl Daemon {
             info!("Baseline learning progress: {:.1}%", progress * 100.0);
             if progress >= 1.0 {
                 self.baseline.finish_learning();
-                info!("Baseline learning period complete — switching to anomaly detection");
+                info!("Baseline learning period complete  -  switching to anomaly detection");
             }
         }
     }
@@ -1055,7 +1080,7 @@ impl Daemon {
                 }
                 // A real uid escalation is the clearest privilege-escalation signal;
                 // contain the process. (Informational capable/ptrace events do not
-                // trigger containment — freezing processes for those is destructive.)
+                // trigger containment  -  freezing processes for those is destructive.)
                 // Capture starttime at event time and verify before freezing so a
                 // recycled PID cannot freeze an innocent process.
                 let starttime = crate::process::ProcessResolver::starttime(pid);
@@ -1177,7 +1202,9 @@ impl Daemon {
                                 static WARNED: std::sync::atomic::AtomicBool =
                                     std::sync::atomic::AtomicBool::new(false);
                                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                    warn!("YARA engine not implemented — binary scanning skipped");
+                                    warn!(
+                                        "YARA engine not implemented  -  binary scanning skipped"
+                                    );
                                 }
                             }
                         }
@@ -1209,7 +1236,7 @@ impl Daemon {
         let pct = self.governor.daemon_cpu_pct() + self.governor.bpf_cpu_pct();
         // Apply the governor's decisions to the kernel. Previously the
         // sampling/dpi flags were written by the governor but never consumed
-        // by anything — the control loop was inert.
+        // by anything  -  the control loop was inert.
         self.ebpf
             .set_sampling_enabled(self.governor.is_sampling_enabled());
         self.ebpf.set_dpi_enforce(self.governor.is_dpi_fast_mode());
@@ -1227,7 +1254,7 @@ impl Daemon {
     async fn eval_correlations(&self) {
         for alert in self.correlation.eval() {
             info!(
-                "correlation: [{}] {} — {}",
+                "correlation: [{}] {}  -  {}",
                 alert.pattern_id, alert.pattern_name, alert.description
             );
             let bytes = build_correlation_alert_bytes(&alert);
@@ -1240,7 +1267,7 @@ impl Daemon {
                     alert.id,
                     alert.severity,
                     &format!(
-                        "[{}] {} — {}",
+                        "[{}] {}  -  {}",
                         alert.pattern_id, alert.pattern_name, alert.description
                     ),
                 );
@@ -1262,11 +1289,11 @@ impl Daemon {
         }
         map.insert(rule_id, now);
         if map.len() > 256 {
-            // E20: drop only expired entries so the throttle stays effective —
+            // E20: drop only expired entries so the throttle stays effective  -
             // clearing reopened the suppression window for every rule at once.
             map.retain(|_, prev| now.duration_since(*prev) < ALERT_MIN_INTERVAL);
             if map.len() > 256 {
-                map.clear(); // everything is hot — start over
+                map.clear(); // everything is hot  -  start over
             }
         }
         true
@@ -1285,7 +1312,7 @@ impl Daemon {
             // F11: each insert is a syscall; a full feed (tens of thousands of
             // entries) would stall the event loop for seconds. Apply in chunks
             // and yield between them so IPC/event processing stays responsive.
-            // NOTE: domains are applied in ONE call — sync_dns_domains mirrors
+            // NOTE: domains are applied in ONE call  -  sync_dns_domains mirrors
             // the feed into the userspace fallback list by rebuilding a HashSet
             // of the whole list, so chunked calls were O(n²) (166 chunks × up
             // to 340k string clones each == minutes of stall). Single call =
@@ -1349,7 +1376,7 @@ impl Daemon {
                 self.threat_blocklist.unblock_port(port);
             }
             KillProcess(pid) => {
-                // F1: pid_t is signed 32-bit — a u32 pid >= 0x8000_0000 casts
+                // F1: pid_t is signed 32-bit  -  a u32 pid >= 0x8000_0000 casts
                 // to a negative pid_t, and kill(-1, SIGKILL) signals EVERY
                 // process the daemon may signal. Refuse anything that does not
                 // fit a positive pid_t.
@@ -1429,7 +1456,7 @@ impl Daemon {
             }
             MarkFlowAllowed(dst_ip, dst_port, protocol, pid) => {
                 // F11: resolve_flow_for_dst walks /proc/*/fd for every process
-                // — a synchronous scan that must not run on the event loop.
+                //  -  a synchronous scan that must not run on the event loop.
                 let key = tokio::task::spawn_blocking(move || {
                     crate::process::ProcessResolver::resolve_flow_for_dst(
                         pid, dst_ip, dst_port, protocol,
@@ -1485,7 +1512,7 @@ impl Daemon {
                 let cidrs = filters.len() as u32;
                 let ports = self.ebpf.blocked_port_count() as u32;
                 let dropped = self.storage.dropped_count();
-                // E19: the client read path caps frames at 64 KiB — a huge
+                // E19: the client read path caps frames at 64 KiB  -  a huge
                 // blocked-CIDR list would exceed it and the client would
                 // discard the status frame. Cap the embedded list (counters
                 // still reflect the full set).
@@ -1535,7 +1562,7 @@ impl Daemon {
     }
     fn cleanup(&mut self) {
         // Detach eBPF first so the kernel is never held by us, then only a
-        // bounded WAL sync — the full memtable->SST flush can block shutdown
+        // bounded WAL sync  -  the full memtable->SST flush can block shutdown
         // for minutes on a slow disk (the Drop path drains + flushes anyway).
         self.ebpf.detach();
         self.storage.flush_bounded();
@@ -1607,7 +1634,7 @@ fn build_correlation_alert_bytes(alert: &correlation::CorrelationAlert) -> Vec<u
         alert.severity,
         alert.pattern_id,
         &format!(
-            "[{}] {} — {}",
+            "[{}] {}  -  {}",
             alert.mitre_technique, alert.pattern_name, alert.description
         ),
     )
@@ -1620,7 +1647,7 @@ mod tests {
 
     #[test]
     fn event_len_ok_never_panics_and_enforces_known_sizes() {
-        // E6: exhaustive kinds x lengths — the ring-buffer guard must never
+        // E6: exhaustive kinds x lengths  -  the ring-buffer guard must never
         // panic and must reject every undersized fixed-layout kind.
         for kind in 0u8..=255u8 {
             for len in 0..=200usize {
@@ -1638,7 +1665,7 @@ mod tests {
     #[test]
     fn alert_decode_never_panics_on_garbage() {
         // AlertRecord::decode sits on the untrusted storage read path
-        // (query_alerts / build_query_response) — it must never panic on
+        // (query_alerts / build_query_response)  -  it must never panic on
         // arbitrary bytes.
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
         for len in 0..128usize {

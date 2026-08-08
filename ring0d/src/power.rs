@@ -65,11 +65,11 @@ impl PowerGovernor {
                         if sleeping {
                             fim_throttled.store(true, Ordering::Relaxed);
                             poll_interval.store(30, Ordering::Relaxed);
-                            info!("PowerGovernor: system sleeping — FIM throttled");
+                            info!("PowerGovernor: system sleeping  -  FIM throttled");
                         } else {
                             fim_throttled.store(false, Ordering::Relaxed);
                             poll_interval.store(5, Ordering::Relaxed);
-                            info!("PowerGovernor: system resumed — full performance");
+                            info!("PowerGovernor: system resumed  -  full performance");
                         }
                     }
                     Err(e) => warn!("PowerGovernor: bad PrepareForSleep payload: {e}"),
@@ -83,11 +83,11 @@ impl PowerGovernor {
         if on_battery {
             self.fim_throttled.store(true, Ordering::Relaxed);
             self.poll_interval.store(30, Ordering::Relaxed);
-            info!("PowerGovernor: switched to BATTERY — throttling FIM, poll interval = 30s");
+            info!("PowerGovernor: switched to BATTERY  -  throttling FIM, poll interval = 30s");
         } else {
             self.fim_throttled.store(false, Ordering::Relaxed);
             self.poll_interval.store(5, Ordering::Relaxed);
-            info!("PowerGovernor: switched to AC power — full performance");
+            info!("PowerGovernor: switched to AC power  -  full performance");
         }
     }
 

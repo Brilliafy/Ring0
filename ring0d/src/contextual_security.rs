@@ -90,19 +90,19 @@ impl ContextualSecurity {
         let policies = self.per_process_policies.read();
         if let Some(policy) = policies.get(&pid) {
             if self.screen_locked.load(Ordering::Relaxed) && policy.block_on_lock {
-                info!("ContextualSecurity: blocking PID {pid} ({binary_name}) — screen locked");
+                info!("ContextualSecurity: blocking PID {pid} ({binary_name})  -  screen locked");
                 return true;
             }
             if !policy.is_foreground && policy.block_background {
                 info!(
-                    "ContextualSecurity: blocking PID {pid} ({binary_name}) — background process"
+                    "ContextualSecurity: blocking PID {pid} ({binary_name})  -  background process"
                 );
                 return true;
             }
         }
 
         if self.screen_locked.load(Ordering::Relaxed) && !binary.contains("/usr/bin/") {
-            info!("ContextualSecurity: blocking PID {pid} ({binary_name}) — screen locked + non-system binary");
+            info!("ContextualSecurity: blocking PID {pid} ({binary_name})  -  screen locked + non-system binary");
             return true;
         }
 

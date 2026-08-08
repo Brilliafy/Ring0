@@ -55,7 +55,12 @@ pub struct CorrelationEngine {
     files: DashMap<u32, Vec<FileRecord>>,
     proc_tree: Arc<RwLock<HashMap<u32, u32>>>,
     alerts: Arc<RwLock<Vec<CorrelationAlert>>>,
+    /// (pattern_id, root_pid) → last emission (nanos): prevents the same chain
+    /// from re-alerting on every 5s eval tick while the pattern persists.
+    last_emit: Arc<RwLock<HashMap<(u32, u32), u64>>>,
 }
+
+const EMIT_DEDUP_NS: u64 = 60_000_000_000;
 
 impl CorrelationEngine {
     pub fn new() -> Self {
@@ -65,6 +70,7 @@ impl CorrelationEngine {
             files: DashMap::new(),
             proc_tree: Arc::new(RwLock::new(HashMap::new())),
             alerts: Arc::new(RwLock::new(Vec::with_capacity(1024))),
+            last_emit: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -104,6 +110,17 @@ impl CorrelationEngine {
         let mut results = Vec::new();
         let now = nano_now();
 
+        // E20: index execs by parent pid once per eval so the child lookup
+        // below is O(1) per exec instead of an O(n²) scan of the whole table
+        // on every 5-second tick. (Records are cloned so the index outlives
+        // the DashMap shard guards.)
+        let mut children_of: HashMap<u32, Vec<ExecRecord>> = HashMap::new();
+        for entry in self.execs.iter() {
+            for rec in entry.value().iter() {
+                children_of.entry(rec.ppid).or_default().push(rec.clone());
+            }
+        }
+
         for entry in self.execs.iter() {
             let pid = *entry.key();
             let records = entry.value();
@@ -124,15 +141,19 @@ impl CorrelationEngine {
                 })
                 .unwrap_or_default();
 
-            let child_execs: Vec<ExecRecord> = self
-                .execs
-                .iter()
-                .filter(|e| {
-                    *e.key() != pid && e.value().last().map(|r| r.ppid == pid).unwrap_or(false)
+            let child_execs: Vec<ExecRecord> = children_of
+                .get(&pid)
+                .map(|recs| {
+                    // most recent exec per child pid, within the window
+                    let mut last_by_pid: HashMap<u32, &ExecRecord> = HashMap::new();
+                    for r in recs {
+                        if r.pid != pid && now.saturating_sub(r.timestamp) < WINDOW_EXEC_NS {
+                            last_by_pid.insert(r.pid, r);
+                        }
+                    }
+                    last_by_pid.into_values().cloned().collect()
                 })
-                .flat_map(|e| e.value().last().cloned())
-                .filter(|r| now.saturating_sub(r.timestamp) < WINDOW_EXEC_NS)
-                .collect();
+                .unwrap_or_default();
 
             if !parent_connects.is_empty() && !child_execs.is_empty() {
                 let id = NEXT_CORRELATION_ID.fetch_add(1, Ordering::Relaxed);
@@ -167,7 +188,9 @@ impl CorrelationEngine {
                     timestamp: now,
                 };
                 self.push_alert(alert.clone());
-                results.push(alert);
+                if self.should_emit(alert.pattern_id, alert.root_pid, now) {
+                    results.push(alert);
+                }
             }
         }
 
@@ -212,11 +235,29 @@ impl CorrelationEngine {
                     timestamp: now,
                 };
                 self.push_alert(alert.clone());
-                results.push(alert);
+                if self.should_emit(alert.pattern_id, alert.root_pid, now) {
+                    results.push(alert);
+                }
             }
         }
 
         results
+    }
+
+    /// True if this (pattern, root) chain has not emitted within the dedup
+    /// window. Bounded bookkeeping map.
+    fn should_emit(&self, pattern_id: u32, root_pid: u32, now: u64) -> bool {
+        let mut emit = self.last_emit.write();
+        if let Some(prev) = emit.get(&(pattern_id, root_pid)) {
+            if now.saturating_sub(*prev) < EMIT_DEDUP_NS {
+                return false;
+            }
+        }
+        emit.insert((pattern_id, root_pid), now);
+        if emit.len() > 8192 {
+            emit.clear();
+        }
+        true
     }
 
     pub fn recent_alerts(&self) -> Vec<CorrelationAlert> {

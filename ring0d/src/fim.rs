@@ -49,7 +49,7 @@ impl FimEngine {
         };
         let _ = db.cf_handle("fim_baseline").or_else(|| {
             warn!(
-                "FIM baseline CF not found at runtime — column families must be created at DB open"
+                "FIM baseline CF not found at runtime  -  column families must be created at DB open"
             );
             db.cf_handle("fim_baseline")
         });
@@ -70,7 +70,7 @@ impl FimEngine {
             }
             if hashed_bytes >= MAX_FIM_BASELINE_BYTES {
                 info!(
-                    "FIM: baseline byte budget exhausted ({MAX_FIM_BASELINE_BYTES} MB) — remaining dirs deferred"
+                    "FIM: baseline byte budget exhausted ({MAX_FIM_BASELINE_BYTES} MB)  -  remaining dirs deferred"
                 );
                 break;
             }
@@ -81,7 +81,7 @@ impl FimEngine {
 
         self.persist_baseline(&baseline);
         info!(
-            "FIM: scanned and baselined {count} files ({hashed_bytes} MB) — budget {MAX_FIM_BASELINE_BYTES} MB"
+            "FIM: scanned and baselined {count} files ({hashed_bytes} MB)  -  budget {MAX_FIM_BASELINE_BYTES} MB"
         );
         count
     }
@@ -222,7 +222,7 @@ impl FimEngine {
         let current_hash = Self::sha256_file(Path::new(path))?;
 
         if current_hash != *stored_hash {
-            let msg = format!("FIM: file {path} has been modified — hash mismatch");
+            let msg = format!("FIM: file {path} has been modified  -  hash mismatch");
             warn!("{msg}");
             return Some(msg);
         }

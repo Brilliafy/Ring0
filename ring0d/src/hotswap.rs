@@ -22,7 +22,7 @@ impl HotswapManager {
 
     pub fn init_bpffs(&self) -> Result<()> {
         if !Path::new("/sys/fs/bpf").exists() {
-            warn!("BPF filesystem not mounted at /sys/fs/bpf — cannot pin maps");
+            warn!("BPF filesystem not mounted at /sys/fs/bpf  -  cannot pin maps");
             return Ok(());
         }
         fs::create_dir_all(BPFFS_PATH).context("Failed to create /sys/fs/bpf/ring0")?;
@@ -36,7 +36,7 @@ impl HotswapManager {
         // fake Ok(()) would make callers believe the map survives a daemon
         // restart when it actually does not.
         Err(anyhow::anyhow!(
-            "map pinning is not implemented — map {name} was not pinned"
+            "map pinning is not implemented  -  map {name} was not pinned"
         ))
     }
 
@@ -48,13 +48,13 @@ impl HotswapManager {
 
     pub fn hotswap_program(&self, prog_name: &str, _new_fd: i32) -> Result<()> {
         Err(anyhow::anyhow!(
-            "program hotswap is not implemented — {prog_name} was not swapped"
+            "program hotswap is not implemented  -  {prog_name} was not swapped"
         ))
     }
 
     pub fn rollback(&self, prog_name: &str, _old_fd: i32) -> Result<()> {
         Err(anyhow::anyhow!(
-            "program rollback is not implemented — {prog_name} was not rolled back"
+            "program rollback is not implemented  -  {prog_name} was not rolled back"
         ))
     }
 
@@ -65,6 +65,6 @@ impl HotswapManager {
 
 fn bpf_pin_map(_fd: i32, _path: &str) -> Result<()> {
     Err(anyhow::anyhow!(
-        "eBPF map pinning is not implemented — the map will not survive a daemon restart"
+        "eBPF map pinning is not implemented  -  the map will not survive a daemon restart"
     ))
 }

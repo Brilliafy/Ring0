@@ -32,7 +32,7 @@ impl SelfDefense {
 
     pub fn lock_ebpf_maps(&self) {
         self.locked.store(true, Ordering::SeqCst);
-        info!("eBPF maps locked — detach/resize prevented");
+        info!("eBPF maps locked  -  detach/resize prevented");
     }
 
     pub fn is_locked(&self) -> bool {

@@ -144,7 +144,7 @@ const SIGNATURES: &[Signature] = &[
 /// Maximum payloads scanned per second. This is a pure safety ceiling against
 /// a pathological flood (connection storms, misbehaving libraries); in normal
 /// operation the kernel's per-connection TLS scan budget keeps the event rate
-/// proportional to CONNECTION STARTS, not throughput — a download emits ~32
+/// proportional to CONNECTION STARTS, not throughput  -  a download emits ~32
 /// events (one per 256-byte chunk of its ~8KB interesting prefix), not one
 /// per TLS record. Scans beyond the ceiling are skipped (safety over
 /// completeness during an attack).
@@ -156,7 +156,7 @@ const MAX_SCANS_PER_SEC: u64 = 2000;
 /// each payload is scanned in a single O(n) pass with one shared scratch
 /// buffer. The previous implementation ran one `hs_scan` per signature
 /// (O(signatures × n)) and copied every payload through `String::from_utf8_lossy`;
-/// both are gone — scanning is zero-copy over the raw bytes.
+/// both are gone  -  scanning is zero-copy over the raw bytes.
 pub struct DpiEngine {
     db: hyperscan::BlockDatabase,
     scratch: hyperscan::Scratch,
@@ -231,7 +231,7 @@ impl DpiEngine {
     /// Replace the dynamic (Suricata-derived) signature set. Patterns arrive
     /// as hyperscan-ready strings (already escaped; `(?i)` inline for nocase)
     /// with (sid, severity). A failed compile keeps the previous set and the
-    /// batch is logged — a poisoned feed must not disable detection.
+    /// batch is logged  -  a poisoned feed must not disable detection.
     pub fn set_dynamic_patterns(&mut self, patterns: Vec<(u32, String, u8)>) {
         use hyperscan::prelude::*;
         if patterns.is_empty() {
@@ -275,7 +275,7 @@ impl DpiEngine {
             },
             Err(e) => {
                 warn!(
-                    "DPI: dynamic signature compile failed ({e}) — keeping previous set of {}",
+                    "DPI: dynamic signature compile failed ({e})  -  keeping previous set of {}",
                     self.dyn_ids.len()
                 );
             }
@@ -289,7 +289,7 @@ impl DpiEngine {
             .unwrap_or(0);
         let bucket = self.scan_bucket.load(Ordering::Relaxed);
         if bucket != now {
-            // New 1-second window: reset the counter (benign race — worst case
+            // New 1-second window: reset the counter (benign race  -  worst case
             // we under- or over-count by one window).
             self.scan_bucket.store(now, Ordering::Relaxed);
             self.scan_count.store(1, Ordering::Relaxed);
@@ -301,7 +301,7 @@ impl DpiEngine {
 
     /// Scan a payload (e.g. TLS plaintext, reassembled stream) for threat
     /// signatures. Single O(n) hyperscan pass over ALL signatures; the payload
-    /// is scanned in place (zero-copy, no UTF-8 validation — patterns are
+    /// is scanned in place (zero-copy, no UTF-8 validation  -  patterns are
     /// byte-oriented). Rate-limited to `MAX_SCANS_PER_SEC` payloads/sec.
     pub fn scan_payload(&self, payload: &[u8]) -> Vec<DpiMatch> {
         if payload.is_empty() || !self.scan_allowed() {

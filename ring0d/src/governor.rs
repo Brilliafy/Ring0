@@ -92,14 +92,14 @@ impl CpuGovernor {
                 *self.dpi_fast_mode.write() = false;
                 let pct = self.ring_buffer_pct.load(Ordering::Relaxed);
                 if pct > 70 {
-                    warn!("Governor: ring buffer at {pct}% — increasing capacity would help");
+                    warn!("Governor: ring buffer at {pct}%  -  increasing capacity would help");
                 }
             }
             GovernorState::Critical => {
                 *self.sampling_enabled.write() = false;
                 *self.dpi_fast_mode.write() = true;
                 warn!(
-                    "Governor CRITICAL: CPU {:.1}% — sampling disabled, DPI in fast-header mode",
+                    "Governor CRITICAL: CPU {:.1}%  -  sampling disabled, DPI in fast-header mode",
                     total_pct
                 );
             }

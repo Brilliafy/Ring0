@@ -155,14 +155,17 @@ impl ForensicExporter {
     }
 
     pub fn trigger_export(&self, alert_id: u64, severity: u8, description: &str) {
-        let frames = self.packet_buffer.snapshot();
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
         let case_id = NEXT_CASE_ID.fetch_add(1, Ordering::Relaxed);
         let filename = format!("incident_{}_{}.tar.gz", timestamp, case_id);
         let path = PathBuf::from(FORENSICS_DIR).join(&filename);
 
+        // F12: snapshot() deep-clones up to PCAP_BUFFER_SIZE (100 MB) of packet
+        // frames  -  it must run inside the blocking task, not on the event loop.
+        let buffer = self.packet_buffer.clone();
         let desc_owned = description.to_string();
         tokio::task::spawn_blocking(move || {
+            let frames = buffer.snapshot();
             if let Err(e) = Self::write_bundle(
                 &path,
                 &frames,
@@ -182,7 +185,48 @@ impl ForensicExporter {
                     severity,
                 );
             }
+            // F12: an incident stream must not fill the root filesystem  -  prune
+            // archives by age and keep a bounded count.
+            Self::retain_archives();
         });
+    }
+
+    /// Keep only the newest `MAX_ARCHIVES` bundles and delete anything older
+    /// than `ARCHIVE_MAX_AGE` days.
+    fn retain_archives() {
+        const MAX_ARCHIVES: usize = 20;
+        const ARCHIVE_MAX_AGE_DAYS: u64 = 30;
+
+        let Ok(rd) = fs::read_dir(FORENSICS_DIR) else {
+            return;
+        };
+        let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = rd
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter_map(|e| {
+                let m = e.metadata().ok()?;
+                let t = m.modified().unwrap_or(std::time::UNIX_EPOCH);
+                Some((t, e.path()))
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0)); // oldest first
+
+        let cutoff = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(ARCHIVE_MAX_AGE_DAYS * 24 * 3600);
+        let keep_from = files.len().saturating_sub(MAX_ARCHIVES);
+        let mut removed = 0usize;
+        for (i, (t, p)) in files.iter().enumerate() {
+            let too_old = *t < cutoff;
+            let beyond_count = i < keep_from;
+            if too_old || beyond_count {
+                if fs::remove_file(p).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        if removed > 0 {
+            info!("Forensics: pruned {removed} stale archive(s) from {FORENSICS_DIR}");
+        }
     }
 
     fn write_bundle(

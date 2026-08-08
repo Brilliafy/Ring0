@@ -1,6 +1,6 @@
 //! Heuristic risk scoring: `score = w_process + w_network + w_payload`.
 //!
-//! A payload alone rarely tells you something is malicious — context does.
+//! A payload alone rarely tells you something is malicious  -  context does.
 //! `python3` exec'ing from /tmp and uploading to a raw IP is interesting;
 //! `firefox` downloading to ~/Downloads is not. The risk engine combines
 //! process lineage, destination reputation signals, and payload matches into
@@ -63,7 +63,7 @@ pub struct RiskResult {
 
 /// Magic byte signatures that indicate a file payload in the TLS plaintext.
 /// Presence in an UPLOAD (SSL_write) is exfiltration-ish; in a download it is
-/// informational (a downloaded binary is normal — but worth noting).
+/// informational (a downloaded binary is normal  -  but worth noting).
 fn detect_file_magic(buf: &[u8]) -> Option<&'static str> {
     if buf.starts_with(b"\x7fELF") {
         Some("ELF binary")

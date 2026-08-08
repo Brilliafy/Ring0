@@ -21,13 +21,13 @@ const CN_VAL_PROC: u32 = 0x1;
 const PROC_CN_MCAST_LISTEN: u32 = 0x1;
 const PROC_EVENT_FORK: u32 = 0x1;
 const PROC_EVENT_EXEC: u32 = 0x2;
-// NOTE: PROC_EVENT_EXIT is 0x80000000 (bit 31) — 0x4 is PROC_EVENT_UID.
+// NOTE: PROC_EVENT_EXIT is 0x80000000 (bit 31)  -  0x4 is PROC_EVENT_UID.
 const PROC_EVENT_EXIT: u32 = 0x8000_0000;
 
 /// Kernel-truth PID set maintained from the kernel's process-events
 /// notification (netlink connector / CN_PROC). fork/exit events are delivered
 /// by the kernel itself, so a userspace rootkit that hides processes by
-/// hooking `getdents64` cannot remove a PID from this set — the daemon diffs it
+/// hooking `getdents64` cannot remove a PID from this set  -  the daemon diffs it
 /// against the /proc (VFS) view to find hidden processes.
 pub struct ProcConnector {
     pids: Arc<RwLock<HashMap<u32, Instant>>>,

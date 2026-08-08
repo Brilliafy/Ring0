@@ -53,7 +53,7 @@ fn main() -> Result<()> {
                 // dev profile enables overflow-checks AND debug-assertions.
                 // With debug-assertions on, `ptr::copy_nonoverlapping` (used
                 // internally by probe-read/copy helpers) emits an "unsafe
-                // precondition violated" panic check — the resulting panic
+                // precondition violated" panic check  -  the resulting panic
                 // stubs get merged into the tail of every program and the
                 // kernel rejects them with "last insn is not an exit or jmp /
                 // processed 0 insns". Network math is intentionally wrapping,
@@ -79,7 +79,7 @@ fn main() -> Result<()> {
             // Locate the executable cargo claims to have produced. A stale
             // `cargo-xtask` installed on PATH (or a build that silently skips
             // relinking) can report success while the object file is stale or
-            // missing — the daemon then loads the wrong code. Verify the real
+            // missing  -  the daemon then loads the wrong code. Verify the real
             // artifact instead of trusting the exit code.
             let mut exe: Option<PathBuf> = None;
             for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -104,7 +104,7 @@ fn main() -> Result<()> {
             }
 
             let exe = exe.context(
-                "cargo completed without reporting the eBPF binary artifact — \
+                "cargo completed without reporting the eBPF binary artifact  -  \
                  refusing to report success for a missing object (is a stale \
                  cargo-xtask shadowing this one?)",
             )?;

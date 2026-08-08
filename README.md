@@ -1,9 +1,9 @@
-# Ring0 — Linux eBPF Security Command Center
+# Ring0  -  Linux eBPF Security Command Center
 
 A high-performance host-based NIDS/HIDS for the Linux desktop. Ring0 inspects
 TLS plaintext at the `SSL_read`/`SSL_write` boundary, tracks process lineage
 in userspace, scores every connection with a heuristic risk engine, and can
-optionally enforce (block/freeze/kill) — all with a kernel fast path that is
+optionally enforce (block/freeze/kill)  -  all with a kernel fast path that is
 deliberately cheap enough to run on a consumer laptop without making the
 machine feel slow.
 
@@ -40,20 +40,20 @@ engine decides what (if anything) to do.
  (kernel eBPF)        (userspace state)   (decision matrix)  (notify by default)
 ```
 
-**Stage 1 — capture.** eBPF programs in the kernel observe traffic with a
+**Stage 1  -  capture.** eBPF programs in the kernel observe traffic with a
 strict cost budget (see §5): XDP/TC drop only what is *explicitly blocked*;
 TLS uprobes capture only the *interesting prefix* of each connection; the
 exec tracepoint feeds the process tree.
 
-**Stage 2 — context.** Every TLS event is enriched with **who** is talking:
+**Stage 2  -  context.** Every TLS event is enriched with **who** is talking:
 the process binary, its ancestry chain, its trust verdict (RPM-verified or
 not), and the destination. *A payload alone rarely tells you something is
-malicious — context does.*
+malicious  -  context does.*
 
-**Stage 3 — scoring.** A linear scoring model combines process, network, and
+**Stage 3  -  scoring.** A linear scoring model combines process, network, and
 payload evidence into one number. Thresholds map the score to a verdict.
 
-**Stage 4 — response.** By default high-risk events only alert (freezing or
+**Stage 4  -  response.** By default high-risk events only alert (freezing or
 killing a process can destroy hours of unsaved work). Enforcement is
 strictly opt-in via `RING0_RESPONSE`.
 
@@ -61,10 +61,10 @@ strictly opt-in via `RING0_RESPONSE`.
 
 ## 2. Telemetry capture (the kernel)
 
-### 2.1 XDP / TC fast path — physical NICs only
+### 2.1 XDP / TC fast path  -  physical NICs only
 
 Attached to **physical interfaces only** (those with a
-`/sys/class/net/<name>/device` symlink — PCI/USB NICs). Tunnel interfaces
+`/sys/class/net/<name>/device` symlink  -  PCI/USB NICs). Tunnel interfaces
 (`wg*`, `tun*`, `veth*`, `docker0`, `br*`) are **never** filtered, so a
 WireGuard VPN's decrypted inner traffic is never dropped against the
 blocklist, and the outer encrypted UDP is only ever dropped by *your*
@@ -85,7 +85,7 @@ VPN server or service whose hosting IP happens to be listed still work. Your
 `ring0ctl block` command writes to **both** maps (explicit intent is enforced
 both ways).
 
-### 2.2 TLS plaintext capture — the "interesting prefix" model
+### 2.2 TLS plaintext capture  -  the "interesting prefix" model
 
 Uprobes on `SSL_write`/`SSL_read` capture plaintext **before** encryption.
 Attached to every `libssl.so` on the machine (system + conda/homebrew
@@ -107,12 +107,12 @@ new connection ──► emit plaintext events until ~8 KB captured ──► si
 
 **Why this model?** The interesting bytes of any flow are its start:
 protocol headers, the request, the first bytes of the response, executable
-magic bytes. Everything after that is bulk transfer — "just download data".
+magic bytes. Everything after that is bulk transfer  -  "just download data".
 Scanning a 144 MB download's *entire* body would burn CPU for no detection
 value; scanning its first ~8 KB costs ~33 events and catches the signal.
 
 The per-process budget is **trust-aware**: the daemon writes
-`TLS_PID_BUDGET` overrides from the trust engine — untrusted/unknown
+`TLS_PID_BUDGET` overrides from the trust engine  -  untrusted/unknown
 processes (script hosts, `/tmp` binaries) get a 32 KB window (4×), trusted
 high-throughput apps get 4 KB. A `flow_id` field in every event
 (`(pid << 32) | ssl_low32`) future-proofs the schema for flow-addressed
@@ -137,7 +137,7 @@ only with `RING0_LSM_ENFORCE=1` (they emit audit events on very hot paths).
 ### 3.1 Process lineage tree
 
 Every exec records `{pid, ppid, binary, cmdline, cwd}`. `ancestry(pid)`
-walks the ppid chain to answer *"who is this really from?"* — a `python3`
+walks the ppid chain to answer *"who is this really from?"*  -  a `python3`
 one-liner exec'd by `bash` from `/tmp` is a very different signal than the
 same bytes from `/usr/lib64/firefox/firefox`. The tree is bounded (32k
 entries) and pruned by `/proc` liveness checks.
@@ -150,18 +150,18 @@ verification happens once per unchanged binary. Bare command names
 (`curl`) are resolved via `PATH`, so short-lived processes are scored
 against their real binary instead of being flagged "unknown".
 
-### 3.3 DPI engine — single-pass O(n)
+### 3.3 DPI engine  -  single-pass O(n)
 
 All signatures (20 built-in + up to **28,581 Suricata-derived** literals
 extracted from `emerging-all.rules`) are compiled into **one** hyperscan
 database. Each payload is scanned in a **single O(n) pass** with a shared
-scratch buffer — not one scan per signature. The userspace scan ceiling
+scratch buffer  -  not one scan per signature. The userspace scan ceiling
 (2000 payloads/sec) is a pure flood safety valve; steady-state cost scales
 with *connection starts*, not throughput.
 
 ---
 
-## 4. Risk scoring engine — the math
+## 4. Risk scoring engine  -  the math
 
 ### 4.1 The model
 
@@ -252,7 +252,7 @@ daemon RSS stable at ~214 MB under live traffic; SIGTERM shutdown ~1 s.
 
 ## 7. Build & run
 
-> `cargo` lives in `~/.cargo/bin`, which root's `secure_path` excludes — build
+> `cargo` lives in `~/.cargo/bin`, which root's `secure_path` excludes  -  build
 > as your user, then run the binary directly as root (it is self-contained).
 
 ```bash
@@ -276,7 +276,7 @@ sudo env RUST_LOG=info ./target/debug/ring0d
 ./ring0-gui/build/ring0-gui           # desktop UI
 ```
 
-The daemon is **not** installed as a systemd service by design — run it when
+The daemon is **not** installed as a systemd service by design  -  run it when
 you want it. Stability is the priority: the kernel footprint is minimal,
 enforcement is opt-in, and every hot path is bounded.
 
@@ -288,8 +288,8 @@ enforcement is opt-in, and every hot path is bounded.
 |---|---|
 | `ring0-ebpf` | Kernel-space eBPF programs (XDP, TC, uprobes, tracepoints) |
 | `ring0-abi` | Shared wire contract: event kinds + fixed ring-buffer layouts |
-| `ring0d` | Root daemon — BPF loader, lineage, trust, DPI, risk, storage, IPC |
-| `ring0ctl` | CLI — status, tail, query, block/unblock, kill, doctor |
+| `ring0d` | Root daemon  -  BPF loader, lineage, trust, DPI, risk, storage, IPC |
+| `ring0ctl` | CLI  -  status, tail, query, block/unblock, kill, doctor |
 | `ring0-gui` | Qt6/QML desktop UI (RingZero) |
 | `ring0-common` | Shared types + Cap'n Proto bindings |
 | `xtask` | eBPF build task runner (pinned nightly-2025-05-01, LLVM 20) |
@@ -301,9 +301,9 @@ enforcement is opt-in, and every hot path is bounded.
 - **IPv6 is not filtered** by the XDP/TC fast path (IPv4 + VLAN only); the
   daemon warns at load.
 - **`lsm/bprm_check`** fails to attach on some kernels ("unknown BTF type
-  `bpf_lsm_bprm_check`") — a kernel-BTF limitation, harmless.
+  `bpf_lsm_bprm_check`")  -  a kernel-BTF limitation, harmless.
 - **HTTP/2 headers are HPACK-compressed**, so UA-based signatures won't match
   on HTTP/2 streams the way they do on HTTP/1.1 plaintext.
 - **Bundled/static TLS stacks** that don't call a system `libssl`
   `SSL_write`/`SSL_read` symbol are invisible to the uprobes.
-- Enforcement (freeze/kill) is opt-in and never the default — see §4.5.
+- Enforcement (freeze/kill) is opt-in and never the default  -  see §4.5.
