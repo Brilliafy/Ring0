@@ -366,6 +366,10 @@ impl Daemon {
                 _ = fastpath_tick.tick() => {
                     self.fastpath.purge_idle_flows();
                     self.storage.flush_bounded();
+                    // Keep the memtable bounded so RSS stays flat (see
+                    // RocksManager::maybe_flush); runs the flush on a worker
+                    // thread so a slow disk never stalls the tick loop.
+                    self.storage.maybe_flush();
                     // Per-pid TLS budget overrides only matter for live
                     // processes; reap them every minute so short-lived
                     // process churn (scripted curl bursts) cannot fill the

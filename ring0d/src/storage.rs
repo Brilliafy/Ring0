@@ -297,6 +297,31 @@ impl RocksManager {
         }
     }
 
+    /// Flush the memtable once it has grown past a threshold, so RSS stays
+    /// flat (a tight sawtooth) instead of creeping to RocksDB's default
+    /// 64 MB write-buffer limit and flushing hours later. The flush itself
+    /// runs on a detached worker thread because `db.flush()` can block for
+    /// seconds on a slow spinning disk; the writer queue keeps draining
+    /// meanwhile. The shutdown path still uses only [`Self::flush_bounded`].
+    pub fn maybe_flush(&self) {
+        const MEMTABLE_FLUSH_MB: u64 = 16;
+        let cur = self
+            .db
+            .property_value("rocksdb.cur-size-all-mem-tables")
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if cur >= MEMTABLE_FLUSH_MB * 1024 * 1024 {
+            let db = self.db.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = db.flush() {
+                    error!("RocksDB periodic memtable flush failed: {e}");
+                }
+            });
+        }
+    }
+
     /// Full flush used at shutdown. NEVER call this on the main thread during
     /// a system shutdown: `db.flush()` blocks until the memtable reaches the
     /// disk, which on an HDD can hang the poweroff for minutes. The Drop

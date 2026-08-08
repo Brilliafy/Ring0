@@ -3,6 +3,15 @@ use std::process::Command;
 /// These integration tests talk to a running `ring0d` daemon over the Unix
 /// socket. When the daemon is not reachable they are skipped rather than
 /// failed, so `cargo test` passes on machines without the daemon running.
+/// block/unblock/kill are privileged daemon commands: when the caller is
+/// not root the daemon asks polkitd, which pops an interactive desktop
+/// authentication dialog (com.ring0.security.control, auth_admin_keep).
+/// CI and headless test runs have no agent to answer, so those tests are
+/// skipped unless the test process is root (root is always authorized).
+fn running_as_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
 fn daemon_socket_available() -> bool {
     std::path::Path::new("/run/ring0d.sock").exists()
         || std::env::var("RING0_SOCKET")
@@ -21,6 +30,10 @@ fn run_ring0ctl(args: &[&str]) -> std::process::Output {
 fn test_ring0ctl_block_unblock() {
     if !daemon_socket_available() {
         eprintln!("skipping: ring0d daemon socket not present");
+        return;
+    }
+    if !running_as_root() {
+        eprintln!("skipping: block/unblock is polkit-gated for non-root callers");
         return;
     }
     let output = run_ring0ctl(&["block", "10.0.0.1"]);
@@ -42,6 +55,10 @@ fn test_ring0ctl_block_unblock() {
 fn test_ring0ctl_kill_invalid_pid() {
     if !daemon_socket_available() {
         eprintln!("skipping: ring0d daemon socket not present");
+        return;
+    }
+    if !running_as_root() {
+        eprintln!("skipping: kill is polkit-gated for non-root callers");
         return;
     }
     let output = run_ring0ctl(&["kill", "999999999"]);
