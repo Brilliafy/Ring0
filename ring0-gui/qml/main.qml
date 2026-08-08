@@ -40,12 +40,12 @@ ApplicationWindow {
                 onTriggered: { appWindow.show(); appWindow.raise(); }
             }
             MenuItem {
-                text: "Pause Protection (5m)"
-                onTriggered: { /* send pause command */ }
+                text: "Reload Rules"
+                onTriggered: { bridge.reloadRules() }
             }
             MenuItem {
-                text: "Reload Rules"
-                onTriggered: { /* send reload command */ }
+                text: "Shutdown Daemon"
+                onTriggered: { bridge.shutdownDaemon() }
             }
             MenuItem { separator: true }
             MenuItem {
@@ -256,7 +256,8 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 spacing: 8
                 Button { text: "Block IP"; highlighted: true; onClicked: { doBlockIp(pendingAlertIp); alertPopup.close() } }
-                Button { text: "Kill Process"; onClicked: alertPopup.close() }
+                // Note: AlertEvent carries no pid in the schema, so "Kill Process"
+                // would have nothing to act on — removed rather than left inert.
                 Button { text: "Dismiss"; flat: true; onClicked: alertPopup.close() }
             }
         }
@@ -288,6 +289,22 @@ ApplicationWindow {
         repeat: true
         onTriggered: {
             bridge.daemonStatus()
+        }
+    }
+
+    // Auto-reconnect: if the daemon restarts (or the socket drops), the reader
+    // thread exits and bridge.isConnected() flips false; retry every 5s.
+    // Previously a lagged/disconnected client was severed silently with no
+    // retry, leaving the operator with a dead dashboard during an incident.
+    Timer {
+        id: reconnectTimer
+        interval: 5000
+        running: true
+        repeat: true
+        onTriggered: {
+            if (bridge && !bridge.isConnected()) {
+                daemonConnected = bridge.connectDaemon(daemonSocket || "/run/ring0d.sock")
+            }
         }
     }
 
