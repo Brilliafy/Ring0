@@ -30,7 +30,7 @@ pub static BLOCKED_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(65536, 0);
 /// et-compromised…) identify malicious SOURCES and are only enforced
 /// INBOUND; blocking OUTBOUND destinations against them would silently drop
 /// the user's own traffic (e.g. a WireGuard VPN server whose hosting IP is
-/// on a feed list) — so user blocks live in a separate map checked for
+/// on a feed list)  -  so user blocks live in a separate map checked for
 /// both directions.
 #[map]
 pub static USER_BLOCKED_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(16384, 0);
@@ -58,7 +58,7 @@ pub static ESTABLISHED_FLOWS: LruHashMap<FlowKey, u32> = LruHashMap::with_max_en
 /// `PacketEvent` emission (governor "critical" mode). Absent = sampling on.
 #[map]
 pub static SAMPLING_ENABLED: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
-/// Last packet-event emission time (key 0, ktime ns) — the per-packet sampler
+/// Last packet-event emission time (key 0, ktime ns)  -  the per-packet sampler
 /// must NOT emit one event per packet or the daemon (which writes every event
 /// to storage) saturates the disk and the whole system freezes under ordinary
 /// traffic. Rate limit to one event per 20ms (~50/s).
@@ -114,7 +114,7 @@ pub static DPI_MODE: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
 
 // ── Struct definitions ───────────────────────────────────────
 
-/// 5-tuple flow key — shared ABI type (see ring0-abi).
+/// 5-tuple flow key  -  shared ABI type (see ring0-abi).
 pub use ring0_abi::FlowKey;
 
 #[repr(C)]
@@ -130,7 +130,7 @@ pub struct QosRateVal {
     pub last_update_ns: u64,
 }
 
-// Event kinds (first byte of every ring buffer entry) — shared with the
+// Event kinds (first byte of every ring buffer entry)  -  shared with the
 // userspace daemon via the ring0-abi crate; do NOT redefine locally.
 use ring0_abi::{
     KIND_CAP, KIND_CONNECT, KIND_FILE_ACCESS, KIND_KILL, KIND_LSM, KIND_MEMFD, KIND_MMAP,
@@ -388,6 +388,23 @@ fn is_sampling_enabled() -> bool {
     unsafe { SAMPLING_ENABLED.get_ptr(&1).is_none() }
 }
 
+/// Drop-event rate limit: at most one DROP log per 100ms globally, so a
+/// blocked scanner cannot flood the ring with drop events while still
+/// surfacing every distinct drop burst.
+#[map]
+pub static PACKET_DROP_LAST_EMIT: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
+
+fn should_log_drop() -> bool {
+    let now = ktime_get_ns();
+    if let Some(last) = unsafe { PACKET_DROP_LAST_EMIT.get_ptr(&0) } {
+        let last = unsafe { core::ptr::read(last) };
+        if now - last < 100_000_000 {
+            return false;
+        }
+    }
+    unsafe { PACKET_DROP_LAST_EMIT.insert(&0, &now, 0).is_ok() }
+}
+
 /// Rate-limited packet-event sampling: at most one event per 20ms globally.
 /// The governor can additionally disable sampling entirely (SAMPLING_ENABLED).
 fn should_sample_packet() -> bool {
@@ -424,7 +441,7 @@ unsafe fn try_ring0_xdp(ctx: &XdpContext) -> Result<u32, u32> {
     }
     if ethertype != 0x0800 {
         // IPv6 (0x86dd) and other non-IPv4 frames are not filtered by the
-        // XDP fast path (documented limitation — the daemon warns at load).
+        // XDP fast path (documented limitation  -  the daemon warns at load).
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -449,6 +466,24 @@ unsafe fn try_ring0_xdp(ctx: &XdpContext) -> Result<u32, u32> {
     };
 
     if check_blocked(src_ip, dst_ip, sp, dp) == xdp_action::XDP_DROP {
+        // Log the drop (rate-limited) so blocked traffic is visible instead
+        // of vanishing silently. action=1 marks the event as a drop.
+        if should_log_drop() {
+            if let Some(mut entry) = RING_BUF.reserve::<PacketEvent>(0) {
+                entry.write(PacketEvent {
+                    kind: KIND_PACKET,
+                    timestamp: ktime_get_ns(),
+                    src_ip,
+                    dst_ip,
+                    src_port: sp,
+                    dst_port: dp,
+                    protocol: proto,
+                    pid: 0,
+                    action: 1,
+                });
+                entry.submit(0);
+            }
+        }
         return Ok(xdp_action::XDP_DROP);
     }
 
@@ -578,7 +613,7 @@ pub fn ring0_sched_exec(_ctx: BtfTracePointContext) -> u32 {
 // ── Generic syscall-entry dispatcher ─────────────────────────
 //
 // The per-syscall `sys_enter_<name>` events (e.g. `sys_enter_openat`) are NOT
-// real kernel tracepoints — they are dynamically-created trace events layered on
+// real kernel tracepoints  -  they are dynamically-created trace events layered on
 // top of the generic `sys_enter` tracepoint (see `kernel/trace/trace_syscalls.c`).
 // Raw/btf tracepoint programs can therefore only attach to the generic
 // `sys_enter` tracepoint; we dispatch on the syscall number and read the real
@@ -645,7 +680,7 @@ unsafe fn ring0_handle_openat(regs: *const aya_ebpf::bindings::pt_regs) {
     // Cheap precheck: read only the first 8 bytes and compare against the
     // first 8 bytes of every blocklist prefix. The previous code ran a full
     // bpf_probe_read_user_str (up to 64 bytes, NUL-scanning) on EVERY openat
-    // on the machine — ~2.9us/call, which made shells/editors/CLIs (agy,
+    // on the machine  -  ~2.9us/call, which made shells/editors/CLIs (agy,
     // firefox) visibly sluggish. The expensive str-read now runs only for
     // paths that pass the 8-byte precheck.
     let mut head: [u8; 8] = [0; 8];
@@ -849,7 +884,7 @@ pub fn ring0_sys_enter(ctx: BtfTracePointContext) -> u32 {
     #[cfg(bpf_target_arch = "x86_64")]
     {
         use self::syscall_nrs::*;
-        // Read the tracepoint args DIRECTLY via ctx.arg (plain ctx loads) —
+        // Read the tracepoint args DIRECTLY via ctx.arg (plain ctx loads)  -
         // the previous implementation used two bpf_probe_read_kernel helper
         // calls per syscall, adding ~19% latency to EVERY syscall on the
         // machine (measured: 500k getpid 305ms -> 365ms), which made CLI
@@ -967,7 +1002,7 @@ pub fn ring0_lsm_socket_connect(ctx: LsmContext) -> i32 {
     if addr_ptr.is_null() {
         return 0;
     }
-    // sockaddr fields live in user memory — read them with probe helpers.
+    // sockaddr fields live in user memory  -  read them with probe helpers.
     let family =
         unsafe { aya_ebpf::helpers::bpf_probe_read_user::<u16>(addr_ptr.cast()) }.unwrap_or(0);
     if family != 2 {
@@ -1010,7 +1045,7 @@ pub fn ring0_lsm_socket_connect(ctx: LsmContext) -> i32 {
 #[lsm(hook = "ptrace_access_check")]
 pub fn ring0_lsm_ptrace(ctx: LsmContext) -> i32 {
     // bpf_lsm_ptrace_access_check(struct task_struct *child, unsigned int mode)
-    // Slot 0 is the `child` task_struct pointer — reading it as a u32 yields
+    // Slot 0 is the `child` task_struct pointer  -  reading it as a u32 yields
     // the low bits of a kernel heap address, not a pid. We audit the tracer
     // and the *mode* (PTRACE_MODE_*); the child's pid is not exposed here
     // without task_struct CO-RE bindings, so `target` is left zero and the
@@ -1163,9 +1198,9 @@ unsafe fn ring0_handle_finit_module(regs: *const aya_ebpf::bindings::pt_regs) {
 // ── TLS uprobes ──────────────────────────────────────────────
 
 /// True when the captured SSL_write plaintext starts with an HTTP request
-/// method — the boundary of a NEW request on a reused connection. HTTP/1.1
+/// method  -  the boundary of a NEW request on a reused connection. HTTP/1.1
 /// requests begin with the method verb; HTTP/2 begins with the PRI preface
-/// (not a method, so no reset — the connection-start budget already covered
+/// (not a method, so no reset  -  the connection-start budget already covered
 /// it).
 #[inline(always)]
 fn is_http_request_start(buf: &[u8; 256], len: usize) -> bool {
@@ -1190,7 +1225,7 @@ fn capture_tls_event(ctx: &ProbeContext, direction: u8) {
     let buf_ptr = ctx.arg::<*const u8>(1).unwrap_or(ptr::null());
     let raw_len = ctx.arg::<u32>(2).unwrap_or(0);
     // Distinguish the classic SSL_write/SSL_read signature (buf, num)
-    // from the *_ex variants, which pass a `size_t *` in arg 2 — a
+    // from the *_ex variants, which pass a `size_t *` in arg 2  -  a
     // pointer-like value, not a length. Treating a pointer as a length
     // would copy 256 bytes from an unrelated user address. Sizes of a
     // single SSL_write/read above 16 MiB are implausible, so clamp those
@@ -1204,7 +1239,7 @@ fn capture_tls_event(ctx: &ProbeContext, direction: u8) {
         return;
     }
     let is_write = direction == 0;
-    // Per-connection budget, keyed by (pid, SSL*) — the SSL handle uniquely
+    // Per-connection budget, keyed by (pid, SSL*)  -  the SSL handle uniquely
     // identifies a connection within a process. Per-pid override from the
     // daemon (trust engine) selects the budget.
     let key = ((pid as u64) << 32) | (ssl & 0xFFFF_FFFF);
@@ -1253,7 +1288,7 @@ fn capture_tls_event(ctx: &ProbeContext, direction: u8) {
                 }
             }
             // First capture for this connection. E2BIG (map full) degrades to
-            // "not scanned" — safe, never blocks or drops other traffic.
+            // "not scanned"  -  safe, never blocks or drops other traffic.
             None => TLS_FLOW_BUDGET.insert(&key, &len, 0).is_ok(),
         }
     };

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use tracing::{info, warn};
 
-/// FNV-1a 64-bit — must match the kernel hash in ring0-ebpf.
+/// FNV-1a 64-bit  -  must match the kernel hash in ring0-ebpf.
 pub fn fnv1a_hash(s: &str) -> u64 {
     let s = s.trim_end_matches('.');
     let mut h: u64 = 14695981039346656037;
@@ -117,7 +117,7 @@ async fn fetch_text(client: &reqwest::Client, url: &str) -> Option<String> {
     let resp = client.get(url).send().await.ok()?;
     if let Some(cl) = resp.content_length() {
         if cl > MAX_FEED_BYTES as u64 {
-            warn!("feed {url}: content-length {cl} exceeds cap {MAX_FEED_BYTES} — skipping");
+            warn!("feed {url}: content-length {cl} exceeds cap {MAX_FEED_BYTES}  -  skipping");
             return None;
         }
     }
@@ -127,7 +127,7 @@ async fn fetch_text(client: &reqwest::Client, url: &str) -> Option<String> {
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.ok()?;
         if body.len().saturating_add(chunk.len()) > MAX_FEED_BYTES {
-            warn!("feed {url}: exceeded {MAX_FEED_BYTES} byte cap — aborting download");
+            warn!("feed {url}: exceeded {MAX_FEED_BYTES} byte cap  -  aborting download");
             return None;
         }
         body.extend_from_slice(&chunk);
@@ -218,7 +218,7 @@ fn parse_ip_cidrs(text: &str, cidrs: &mut HashSet<(u32, u8)>) -> usize {
 /// Parse a Suricata/ET rule line, extracting kernel-primitive constraints.
 ///
 /// CRITICAL SEMANTIC: only `drop`/`reject` rules may feed the kernel
-/// blocklists. `alert` rules express detection intent — promoting their ports
+/// blocklists. `alert` rules express detection intent  -  promoting their ports
 /// into `BLOCKED_PORTS` previously made the kernel drop ALL traffic on common
 /// ports (80/443/53/…) the moment the ET ruleset synced, a self-inflicted
 /// connectivity outage.
@@ -269,7 +269,7 @@ fn extract_ports_tokens(tok: &str, ports: &mut HashSet<u16>) {
             continue;
         }
         if part.contains(':') {
-            // Range (e.g. 1024:65535) — the exact-port kernel map cannot
+            // Range (e.g. 1024:65535)  -  the exact-port kernel map cannot
             // represent it; skip rather than block one endpoint.
             continue;
         }
@@ -311,7 +311,7 @@ fn first_literal_content(line: &str) -> Option<String> {
             || content.len() < 4
             || content.bytes().any(|b| b < 0x20 || b == 0x7f || b == b'\\')
         {
-            return None; // hex-encoded or regex-y literal — skip the rule
+            return None; // hex-encoded or regex-y literal  -  skip the rule
         }
         let tail = &q[end + 1..];
         let nocase = tail.starts_with(';') && tail[..tail.len().min(32)].contains("nocase");
@@ -401,7 +401,7 @@ fn parse_suricata_rule(
                 let end = q.find('"').unwrap_or(q.len());
                 let content = &q[..end];
                 // Reject hex-escaped (|..|), whitespace-containing, or
-                // punctuation-laden literals — they are not domains and would
+                // punctuation-laden literals  -  they are not domains and would
                 // only poison the hash blocklist.
                 let is_domain = content.contains('.')
                     && content
@@ -558,7 +558,7 @@ mod tests {
     /// `dns_query_blocked`: the wire name `\x04evil\x03com\0` is hashed by
     /// synthesizing one '.' between labels, then FNV-1a over the lowercased
     /// bytes. This MUST produce the same values as `fnv1a_hash` on the same
-    /// textual name — that is the parity contract the kernel fix restores.
+    /// textual name  -  that is the parity contract the kernel fix restores.
     fn kernel_style_qname_hash(labels: &[&str]) -> u64 {
         let mut name = String::new();
         for (i, l) in labels.iter().enumerate() {

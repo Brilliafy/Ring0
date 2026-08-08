@@ -127,7 +127,10 @@ impl DesktopSandbox {
             ),
         };
         self.push_anomaly(anomaly.clone());
-        info!("[SANDBOX] {} — no network permission", anomaly.description);
+        info!(
+            "[SANDBOX] {}  -  no network permission",
+            anomaly.description
+        );
         Some(anomaly)
     }
 
@@ -150,7 +153,7 @@ impl DesktopSandbox {
                 ),
             };
             self.push_anomaly(anomaly.clone());
-            info!("[SANDBOX] {} — host file access", anomaly.description);
+            info!("[SANDBOX] {}  -  host file access", anomaly.description);
             return Some(anomaly);
         }
         None

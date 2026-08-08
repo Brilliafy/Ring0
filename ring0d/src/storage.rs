@@ -154,7 +154,7 @@ impl RocksManager {
             if dropped_now > 0 && dropped_now - dropped_at_last_report >= DROP_REPORT_INTERVAL {
                 dropped_at_last_report = dropped_now;
                 warn!(
-                    "RocksDB write queue overflowed — {dropped_now} events dropped (storage backpressure)"
+                    "RocksDB write queue overflowed  -  {dropped_now} events dropped (storage backpressure)"
                 );
             }
             if disconnected {
@@ -168,7 +168,7 @@ impl RocksManager {
     ///
     /// DISABLED BY DEFAULT: raw events (packet/exec/connect) are persisted to
     /// the `events` column family, but nothing ever reads them (query_events
-    /// has no callers — the GUI/CLI query alerts). Writing them saturates the
+    /// has no callers  -  the GUI/CLI query alerts). Writing them saturates the
     /// RocksDB memtable (64 MB x 4 buffers) on slow disks, which looked like a
     /// memory leak (steady RSS growth at the event-write rate) and hammered
     /// the disk. Set RING0_EVENT_LOG=1 to persist raw events again.
@@ -290,7 +290,7 @@ impl RocksManager {
     /// Best-effort periodic flush: sync the WAL without an fsync (fast) so
     /// the write-ahead log stays small. The full memtable->SST flush
     /// (`db.flush()`) can block for minutes on a slow spinning disk, which
-    /// used to hang systemd shutdown — it is only ever run by the Drop path.
+    /// used to hang systemd shutdown  -  it is only ever run by the Drop path.
     pub fn flush_bounded(&self) {
         if let Err(e) = self.db.flush_wal(false) {
             error!("RocksDB WAL flush failed: {e}");
@@ -314,7 +314,7 @@ impl RocksManager {
 impl Drop for RocksManager {
     fn drop(&mut self) {
         // Close the queue and join the writer so queued writes land before the
-        // final flush — otherwise a shutdown could lose the tail of the queue.
+        // final flush  -  otherwise a shutdown could lose the tail of the queue.
         drop(self.write_tx.take());
         if let Some(handle) = self.writer.take() {
             let _ = handle.join();

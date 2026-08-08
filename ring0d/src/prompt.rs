@@ -102,7 +102,7 @@ impl PromptEngine {
 
         let mut pending = self.pending.write();
         // Coalesce: an untrusted process making many connections (a browser, a
-        // C2 client) used to spawn one prompt PER connection — flooding the
+        // C2 client) used to spawn one prompt PER connection  -  flooding the
         // GUI and, once they timed out, auto-blocking every destination IP.
         // Reuse the existing prompt for this process instead; the user answers
         // once and the decision's scope applies to the rest.
@@ -157,7 +157,7 @@ impl PromptEngine {
                 // "Allow once" must actually do something: mark the flow so the
                 // kernel fast path stops re-evaluating it. (A fully synchronous
                 // allow-before-connect gate would require the LSM to block the
-                // pending connect — see the audit's structural recommendations;
+                // pending connect  -  see the audit's structural recommendations;
                 // this at least prevents repeat prompting and offloads the flow.)
                 let cmd = DaemonCmd::MarkFlowAllowed(
                     prompt.dst_ip,
@@ -167,7 +167,7 @@ impl PromptEngine {
                 );
                 let _ = self.cmd_tx.send(cmd);
                 info!(
-                    "PromptEngine: allowing {}:{} once — flow marked allowed",
+                    "PromptEngine: allowing {}:{} once  -  flow marked allowed",
                     prompt.dst_ip, prompt.dst_port
                 );
             }
@@ -208,7 +208,7 @@ impl PromptEngine {
             format!("user-block-{}", dip_str)
         };
 
-        // F6: serialize the rule as structured data — never string-interpolate
+        // F6: serialize the rule as structured data  -  never string-interpolate
         // the attacker-controlled binary_path into YAML (a binary named
         // `"x" \n ...` could previously break out of the quoted scalar and
         // inject arbitrary rules). serde_yaml escapes quotes/backslashes and
@@ -259,9 +259,9 @@ impl PromptEngine {
         };
 
         // F6: validate the merged document parses BEFORE touching the live
-        // file — a malformed merge must never corrupt /etc/ring0/rules.yaml.
+        // file  -  a malformed merge must never corrupt /etc/ring0/rules.yaml.
         serde_yaml::from_str::<serde_yaml::Value>(&updated)
-            .with_context(|| "synthesized rule produced invalid YAML — refusing to write")?;
+            .with_context(|| "synthesized rule produced invalid YAML  -  refusing to write")?;
 
         // Atomic write: temp file + fsync + rename, so a crash mid-write (or a
         // concurrent rules reload) never observes a torn rules file.
@@ -302,7 +302,7 @@ impl PromptEngine {
                 // Timeout now just closes the prompt; explicit user decisions
                 // (allow/deny) still apply through SubmitPromptDecision.
                 warn!(
-                    "PromptEngine: prompt {id} timed out after {}s — dropped (no auto-block) for {}:{} ({})",
+                    "PromptEngine: prompt {id} timed out after {}s  -  dropped (no auto-block) for {}:{} ({})",
                     prompt.timeout_secs, prompt.dst_ip, prompt.dst_port, prompt.binary_path,
                 );
             }

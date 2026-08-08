@@ -294,7 +294,7 @@ impl Ring0BridgeRust {
                                 q.push_back(event_json);
                             }
                         } else if let Some(resp_json) = deserialize_query_response(&msg_buf) {
-                            // A QueryLogs reply — stash it for queryLogs().
+                            // A QueryLogs reply  -  stash it for queryLogs().
                             if let Ok(mut slot) = pending_query_response.lock() {
                                 *slot = Some(resp_json);
                             }

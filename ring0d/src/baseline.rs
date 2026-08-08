@@ -28,7 +28,7 @@ impl BaselineEngine {
                 cf
             }
             None => {
-                warn!("Baseline column family not found — skipping (not available at runtime)");
+                warn!("Baseline column family not found  -  skipping (not available at runtime)");
                 return Self {
                     db,
                     start_time: RwLock::new(Instant::now()),
@@ -227,7 +227,7 @@ impl BaselineEngine {
         self.learning_mode.store(false, Ordering::Relaxed);
         let elapsed = self.start_time.read().elapsed();
         info!(
-            "Baseline learning finished after {:.2}s — switching to anomaly detection. \
+            "Baseline learning finished after {:.2}s  -  switching to anomaly detection. \
              Learned: {} exec paths, {} parent pairs, {} connections",
             elapsed.as_secs_f64(),
             self.learned_exec_paths.read().len(),

@@ -43,7 +43,7 @@ impl PrivEscDetector {
     ) -> Option<PrivEscAttempt> {
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
         // The kernel LSM hook cannot expose the child's pid without CO-RE
-        // task_struct bindings, so target_pid is 0 — don't present it as data.
+        // task_struct bindings, so target_pid is 0  -  don't present it as data.
         let desc = if target_pid != 0 {
             format!(
                 "ptrace injection attempt: PID {} -> PID {}",

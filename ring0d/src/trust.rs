@@ -191,7 +191,7 @@ impl TrustEngine {
         let in_trusted_path = TRUSTED_PATHS.iter().any(|p| binary_path.starts_with(p));
         if !in_trusted_path {
             info!(
-                "TrustEngine: PID {pid} binary {binary_path} not in trusted paths — marking untrusted"
+                "TrustEngine: PID {pid} binary {binary_path} not in trusted paths  -  marking untrusted"
             );
             return TrustStatus::Untrusted;
         }
@@ -199,7 +199,7 @@ impl TrustEngine {
         if Self::verify_rpm_package(binary_path) {
             // `rpm -qVf` verifies the installed file against the RPM database
             // (sizes/checksums/modes). It is NOT a cryptographic signature
-            // check — that would require the original .rpm and `rpm -K`. We
+            // check  -  that would require the original .rpm and `rpm -K`. We
             // deliberately do not claim "signed": a modified file fails the
             // DB check and the binary is treated as unverifiable.
             let integ_ok = Self::verify_rpm_integrity(binary_path);

@@ -52,7 +52,7 @@ pub const SIZE_UNLINK: usize = 120;
 /// `LsmEvent`: kind(1)+pad(7)+ts(8)+pid(4)+uid(4)+type(1)+denied(1)+pad(2)
 ///             +path(96)+pad(2)+dstIp(4)+dstPort(2)+pad(4→align 8) = 136
 ///
-/// NOTE: `path` occupies 26..122; `dst_ip` is NOT at 122 — u32 alignment pads
+/// NOTE: `path` occupies 26..122; `dst_ip` is NOT at 122  -  u32 alignment pads
 /// to 124, so `dst_ip` is at 124..128 and `dst_port` at 128..130. This is the
 /// implicit-padding trap the audit flagged; the size table makes it explicit.
 pub const SIZE_LSM: usize = 136;

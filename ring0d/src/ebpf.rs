@@ -11,7 +11,7 @@ use aya::{Ebpf, EbpfLoader};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-// Event kinds — canonical definitions live in the ring0-abi crate (shared with
+// Event kinds  -  canonical definitions live in the ring0-abi crate (shared with
 // ring0-ebpf); re-exported here for convenience.
 pub use ring0_abi::{
     KIND_CAP, KIND_CONNECT, KIND_DPI, KIND_FILE_ACCESS, KIND_KILL, KIND_LSM, KIND_MEMFD, KIND_MMAP,
@@ -21,7 +21,7 @@ pub use ring0_abi::{
 /// Literal DPI signatures synced into the kernel DPI_PATTERNS map.
 ///
 /// The kernel scanner probes keys `0..N` (see `dpi_scan_packet` in
-/// ring0-ebpf), so the *map key* is the sequential index here — NOT the rule
+/// ring0-ebpf), so the *map key* is the sequential index here  -  NOT the rule
 /// id. The parallel `BPF_DPI_RULE_IDS` array maps index → real signature rule
 /// id, which the daemon uses to look up the signature name. (Previously the
 /// rule ids themselves were used as keys, so the kernel scan range 0..64 never
@@ -146,11 +146,11 @@ impl EbpfManager {
             lsm_enforce,
         ) {
             Ok(mgr) => {
-                info!("eBPF manager initialized — real programs loaded");
+                info!("eBPF manager initialized  -  real programs loaded");
                 Ok(mgr)
             }
             Err(e) => {
-                warn!("eBPF load failed: {e:?} — continuing with fallback enforcement");
+                warn!("eBPF load failed: {e:?}  -  continuing with fallback enforcement");
                 Ok(Self {
                     ring_tx,
                     lsm_tx,
@@ -178,7 +178,7 @@ impl EbpfManager {
         lsm_enforce: bool,
     ) -> Result<Self> {
         let path =
-            find_bpf_object().context("eBPF object not found — run `cargo xtask build` first")?;
+            find_bpf_object().context("eBPF object not found  -  run `cargo xtask build` first")?;
         info!("loading eBPF object: {path}");
 
         let btf = aya::Btf::from_sys_fs().context("failed to load kernel BTF")?;
@@ -202,14 +202,14 @@ impl EbpfManager {
             }
             attached_interfaces.lock().push(iface);
         } else {
-            warn!("no default interface found — XDP not attached");
+            warn!("no default interface found  -  XDP not attached");
         }
         // F7: the XDP/TC fast path filters IPv4 (incl. stacked 802.1Q VLAN)
         // only. IPv6 (0x86dd) traffic is passed without IP/port/DNS/DPI checks,
-        // and block_ip ignores V6 addresses — document the gap explicitly so
+        // and block_ip ignores V6 addresses  -  document the gap explicitly so
         // it is not mistaken for a working IPv6 blocklist.
         warn!(
-            "IPv6 traffic is NOT filtered by the XDP/TC fast path — IPv6-blocked hosts remain reachable (IPv4 + VLAN filtering is active)"
+            "IPv6 traffic is NOT filtered by the XDP/TC fast path  -  IPv6-blocked hosts remain reachable (IPv4 + VLAN filtering is active)"
         );
 
         // ── Attach BTF tracepoints (looked up by ELF section name) ──
@@ -218,7 +218,7 @@ impl EbpfManager {
         // (they are dynamically layered on the generic `sys_enter` tracepoint),
         // so raw/btf tracepoint programs can only attach to `sys_enter`. The
         // eBPF program dispatches on the syscall number internally.
-        // sched_process_exec (on every exec) stays attached — it is cheap and
+        // sched_process_exec (on every exec) stays attached  -  it is cheap and
         // feeds the process lineage tree.
         match attach_tracepoint(&mut ebpf, "tp_btf/sched_process_exec", &btf) {
             Ok(()) => {}
@@ -230,7 +230,7 @@ impl EbpfManager {
         // prime suspect for the system-wide slowdowns and lock-screen hangs
         // (every syscall pays the dispatch + probe cost, and a hiccup in any
         // handler stalls the whole machine). Gated behind
-        // RING0_SYSCALL_MONITOR=1 (opt-in) — the XDP/TC blocklist, TLS
+        // RING0_SYSCALL_MONITOR=1 (opt-in)  -  the XDP/TC blocklist, TLS
         // uprobes and exec tracepoint still provide the core protection
         // without a per-syscall hook.
         if std::env::var("RING0_SYSCALL_MONITOR").as_deref() == Ok("1") {
@@ -244,7 +244,7 @@ impl EbpfManager {
 
         // ── Attach LSM programs (by section name) ──
         // NOTE: lsm/file_open is a compile-time no-op and is eliminated from
-        // the object entirely — do not request it here.
+        // the object entirely  -  do not request it here.
         // `lsm/capable` and `lsm/ptrace_access_check` run on system-wide hot
         // paths (every capability check, every ptrace access check) and emit a
         // ring event per hit even in audit mode. Under normal operation that
@@ -257,7 +257,7 @@ impl EbpfManager {
         if lsm_enforce {
             lsm_names.extend(["lsm/ptrace_access_check", "lsm/capable"]);
         } else {
-            info!("LSM ptrace/capable hooks not attached (audit storm risk) — set RING0_LSM_ENFORCE=1 to enable");
+            info!("LSM ptrace/capable hooks not attached (audit storm risk)  -  set RING0_LSM_ENFORCE=1 to enable");
         }
         for name in lsm_names {
             match attach_lsm(&mut ebpf, name, &btf) {
@@ -343,7 +343,7 @@ impl EbpfManager {
             // Insert BOTH the full path (matched by the userspace exec
             // handler via `binary_blocked`) AND the basename (matched by
             // the kernel LSM `bprm_check`, which only has the 16-byte
-            // `comm` — a full path can never match a comm prefix).
+            // `comm`  -  a full path can never match a comm prefix).
             for key_name in [
                 name,
                 Path::new(name)
@@ -421,7 +421,7 @@ impl EbpfManager {
                 list.push(s);
             }
             if !inserted {
-                warn!("kernel BLOCKED_IPS insert failed for {ip} — enforcement degraded to userspace mirror only");
+                warn!("kernel BLOCKED_IPS insert failed for {ip}  -  enforcement degraded to userspace mirror only");
             }
             info!("blocked {ip}");
         } else {
@@ -429,7 +429,7 @@ impl EbpfManager {
             // (documented limitation). A silent no-op here would make an
             // administrator believe ::1/::ffff blocks are effective.
             warn!(
-                "IPv6 address {ip}: blocking IPv6 is not supported by the XDP/TC fast path — request ignored"
+                "IPv6 address {ip}: blocking IPv6 is not supported by the XDP/TC fast path  -  request ignored"
             );
         }
         Ok(())
@@ -457,7 +457,7 @@ impl EbpfManager {
             list.retain(|x| x != &s);
             info!("unblocked {ip}");
         } else {
-            warn!("IPv6 address {ip}: IPv6 blocking is not supported — nothing to unblock");
+            warn!("IPv6 address {ip}: IPv6 blocking is not supported  -  nothing to unblock");
         }
         Ok(())
     }
@@ -550,7 +550,7 @@ impl EbpfManager {
         // (blocked_ips / DaemonStatus) reflect reality whether or not the
         // kernel map insert succeeded (previously the list was only
         // populated on kernel failure, making status under-report).
-        // Dedup via HashSet — `list.contains` per entry is O(n²) and a feed
+        // Dedup via HashSet  -  `list.contains` per entry is O(n²) and a feed
         // with 100k CIDRs stalls the daemon for minutes.
         let mut list = self.fallback_blocked_ips.lock();
         let mut seen: std::collections::HashSet<String> = list.iter().cloned().collect();
@@ -649,7 +649,7 @@ impl EbpfManager {
 
     /// Set DPI enforcement (drop on match). Off by default = observe-only.
     pub fn set_dpi_enforce(&mut self, enforce: bool) {
-        // Only act (map write + log) when the mode actually changes — the
+        // Only act (map write + log) when the mode actually changes  -  the
         // governor tick used to call this every 5s, writing the map and
         // logging every time (17k+ log lines/day) regardless of state.
         let changed = if let Some(ebpf) = self.ebpf.as_mut() {
@@ -674,9 +674,9 @@ impl EbpfManager {
         };
         if changed {
             if enforce {
-                info!("DPI enforcement enabled — matching traffic will be dropped");
+                info!("DPI enforcement enabled  -  matching traffic will be dropped");
             } else {
-                info!("DPI in observe mode — matching traffic is reported, not dropped");
+                info!("DPI in observe mode  -  matching traffic is reported, not dropped");
             }
         }
     }
@@ -747,7 +747,7 @@ impl EbpfManager {
     /// Reset all per-connection TLS scan budgets. Called on the periodic
     /// intel tick so the budget map cannot fill with spent connections
     /// forever (fresh connections would stop being scanned). A reset costs
-    /// each live connection one more ~8KB of re-inspection per hour — a
+    /// each live connection one more ~8KB of re-inspection per hour  -  a
     /// bounded, negligible re-scan of ongoing flows.
     /// Budget override for untrusted/suspicious processes (script hosts,
     /// /tmp binaries, unsigned builds). Must match TLS_UNTRUSTED_BUDGET in
@@ -839,8 +839,8 @@ fn list_up_interfaces() -> Vec<String> {
         // exists for real NICs (PCI/USB) but not for virtual/tunnel devices
         // (wireguard wg*, tun/tap, veth, docker0, br*, tailscale…). Attaching
         // XDP/TC to a VPN tunnel filters the DECRYPTED inner traffic against
-        // the blocklist — dropping the user's own VPN packets and breaking
-        // connectivity — and to virtual bridges double-filters traffic. The
+        // the blocklist  -  dropping the user's own VPN packets and breaking
+        // connectivity  -  and to virtual bridges double-filters traffic. The
         // physical edge (wlo1/eth0) already sees the ENCRYPTED outer packets,
         // which is where egress/ingress filtering belongs.
         if !Path::new(&format!("/sys/class/net/{name}/device")).exists() {
@@ -859,7 +859,7 @@ type LpmTrieKey = aya::maps::lpm_trie::Key<u32>;
 
 fn attach_xdp(ebpf: &mut Ebpf, iface: &str) -> Result<()> {
     // aya 0.14 names programs by their ELF symbol (the Rust fn name), NOT the
-    // section name — `program_mut("xdp")` never matched and no program ever
+    // section name  -  `program_mut("xdp")` never matched and no program ever
     // attached, silently disabling all kernel enforcement.
     let program: &mut Xdp = ebpf
         .program_mut("ring0_xdp")
@@ -874,7 +874,7 @@ fn attach_tc(ebpf: &mut Ebpf, iface: &str) -> Result<()> {
     use aya::programs::tc;
     // clsact is not idempotent to add: a daemon restart (or scan_interfaces
     // re-run) hits "Exclusivity flag on, cannot modify" because the qdisc
-    // already exists — treat "already attached" as success.
+    // already exists  -  treat "already attached" as success.
     if let Err(e) = tc::qdisc_add_clsact(iface) {
         let already = matches!(&e, aya::programs::tc::TcError::AlreadyAttached)
             || e.to_string().contains("Exclusivity");
@@ -1059,7 +1059,7 @@ fn spawn_ring_reader(
                     // daemon's run loop subscribes a moment after this reader
                     // starts (the attach phase races the subscription), and an
                     // exec/packet event in that window used to terminate the
-                    // RING_BUF reader permanently — after which the daemon ran
+                    // RING_BUF reader permanently  -  after which the daemon ran
                     // with zero live packet/process events while the "ring
                     // reader started" log said otherwise.
                     let _ = tx.send(bytes);

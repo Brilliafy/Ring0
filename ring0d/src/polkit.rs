@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use tracing::{info, warn};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
-/// Polkit action id — must match `etc/ring0/polkit/com.ring0.policy`.
+/// Polkit action id  -  must match `etc/ring0/polkit/com.ring0.policy`.
 pub const RING0_CONTROL_ACTION: &str = "com.ring0.security.control";
 
 /// Ask polkitd whether the given Unix process may perform privileged daemon
@@ -26,14 +26,14 @@ pub async fn check_authorization(pid: u32, uid: u32) -> bool {
     let conn = match zbus::Connection::system().await {
         Ok(c) => c,
         Err(e) => {
-            warn!("polkit: system bus unavailable ({e}) — denying privileged action");
+            warn!("polkit: system bus unavailable ({e})  -  denying privileged action");
             return false;
         }
     };
     let authority = match AuthorityProxy::new(&conn).await {
         Ok(a) => a,
         Err(e) => {
-            warn!("polkit: cannot reach org.freedesktop.PolicyKit1 ({e}) — denying");
+            warn!("polkit: cannot reach org.freedesktop.PolicyKit1 ({e})  -  denying");
             return false;
         }
     };
@@ -41,7 +41,7 @@ pub async fn check_authorization(pid: u32, uid: u32) -> bool {
     let subject = match Subject::new_for_owner(pid, None, Some(uid)) {
         Ok(s) => s,
         Err(e) => {
-            warn!("polkit: cannot build subject for pid {pid} ({e}) — denying");
+            warn!("polkit: cannot build subject for pid {pid} ({e})  -  denying");
             return false;
         }
     };
@@ -69,7 +69,7 @@ pub async fn check_authorization(pid: u32, uid: u32) -> bool {
             }
         }
         Err(e) => {
-            warn!("polkit: CheckAuthorization failed ({e}) — denying");
+            warn!("polkit: CheckAuthorization failed ({e})  -  denying");
             false
         }
     }

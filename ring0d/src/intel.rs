@@ -47,7 +47,9 @@ impl IntelManager {
     pub fn new(db: Arc<rocksdb::DB>) -> Self {
         let (sync_tx, _sync_rx) = watch::channel(false);
         let _ = db.cf_handle(INTEL_DB_CF).or_else(|| {
-            warn!("Intel DB CF not found at runtime — column families must be created at DB open");
+            warn!(
+                "Intel DB CF not found at runtime  -  column families must be created at DB open"
+            );
             db.cf_handle(INTEL_DB_CF)
         });
 
@@ -127,19 +129,58 @@ impl IntelManager {
             }
         };
 
-        let body = match response.text().await {
-            Ok(b) => b,
-            Err(e) => {
+        // E10: cap the downloaded body so a hostile/hijacked feed cannot
+        // exhaust daemon memory (only the first 10k lines are used anyway).
+        const MAX_FEED_BYTES: usize = 64 * 1024 * 1024;
+        if let Some(cl) = response.content_length() {
+            if cl > MAX_FEED_BYTES as u64 {
                 return IntelFeedState {
                     feed_name: name.to_string(),
                     entries_added: 0,
                     entries_total: 0,
                     last_sync: chrono::Utc::now().to_rfc3339(),
                     success: false,
-                    error_message: format!("Failed to read response body: {e}"),
+                    error_message: format!("feed too large: {cl} bytes"),
                 };
             }
-        };
+        }
+        use futures_util::StreamExt;
+        let mut body_bytes: Vec<u8> = Vec::new();
+        let mut stream = response.bytes_stream();
+        let mut exceeded = false;
+        loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    if body_bytes.len().saturating_add(chunk.len()) > MAX_FEED_BYTES {
+                        exceeded = true;
+                        break;
+                    }
+                    body_bytes.extend_from_slice(&chunk);
+                }
+                Some(Err(e)) => {
+                    return IntelFeedState {
+                        feed_name: name.to_string(),
+                        entries_added: 0,
+                        entries_total: 0,
+                        last_sync: chrono::Utc::now().to_rfc3339(),
+                        success: false,
+                        error_message: format!("Failed to read response body: {e}"),
+                    };
+                }
+                None => break,
+            }
+        }
+        if exceeded {
+            return IntelFeedState {
+                feed_name: name.to_string(),
+                entries_added: 0,
+                entries_total: 0,
+                last_sync: chrono::Utc::now().to_rfc3339(),
+                success: false,
+                error_message: format!("feed exceeds {MAX_FEED_BYTES} byte cap"),
+            };
+        }
+        let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
         let mut entries = Vec::new();
         let mut total = 0u32;
@@ -208,6 +249,6 @@ impl IntelManager {
     /// yet: returning an empty result here would make callers believe the
     /// binary was scanned and found clean, which is a false sense of security.
     pub fn scan_binary(&self, _path: &str) -> Result<Vec<String>, String> {
-        Err("YARA engine not implemented — binary was not scanned".to_string())
+        Err("YARA engine not implemented  -  binary was not scanned".to_string())
     }
 }

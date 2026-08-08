@@ -124,8 +124,8 @@ fn send_command(frame: &[u8]) -> Result<Vec<u8>> {
 ///
 /// Privileged commands are gated by polkit in the daemon: the daemon answers
 /// with an `OK`/`DENIED` frame once the authorization (and possible desktop
-/// dialog) has completed. We must keep the connection — and therefore our
-/// /proc/<pid> entry — alive until then, or the polkit subject lookup races
+/// dialog) has completed. We must keep the connection  -  and therefore our
+/// /proc/<pid> entry  -  alive until then, or the polkit subject lookup races
 /// our exit and the first command is spuriously denied. A 5-minute read
 /// timeout covers the user taking their time with the dialog; a timeout
 /// degrades gracefully (the command may still have been applied).
@@ -149,7 +149,7 @@ fn send_command_no_response(frame: &[u8]) -> Result<()> {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                return Ok(()); // no ack — older daemon or non-privileged cmd
+                return Ok(()); // no ack  -  older daemon or non-privileged cmd
             }
             Err(e) => return Err(e).context("failed to read command ack"),
         }
@@ -167,7 +167,7 @@ fn send_command_no_response(frame: &[u8]) -> Result<()> {
         if resp == b"DENIED" {
             bail!("denied by the daemon (polkit authorization failed)");
         }
-        // Otherwise it was a broadcast event frame — skip and keep reading.
+        // Otherwise it was a broadcast event frame  -  skip and keep reading.
     }
     bail!("no command ack received (broadcast flood?)")
 }

@@ -122,12 +122,30 @@ impl ThreatBlocklist {
         _name: &str,
         url: &str,
     ) -> Result<Vec<String>, String> {
+        const MAX_FEED_BYTES: usize = 128 * 1024 * 1024;
         let resp = client
             .get(url)
             .send()
             .await
             .map_err(|e| format!("HTTP: {e}"))?;
-        let body = resp.text().await.map_err(|e| format!("Body: {e}"))?;
+        // E10: cap the downloaded body so a hostile/hijacked feed cannot
+        // exhaust daemon memory.
+        if let Some(cl) = resp.content_length() {
+            if cl > MAX_FEED_BYTES as u64 {
+                return Err(format!("feed too large: {cl} bytes"));
+            }
+        }
+        use futures_util::StreamExt;
+        let mut body: Vec<u8> = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Body: {e}"))?;
+            if body.len().saturating_add(chunk.len()) > MAX_FEED_BYTES {
+                return Err("feed exceeds size cap".into());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8_lossy(&body).into_owned();
 
         let mut domains = Vec::new();
         for line in body.lines() {
@@ -221,7 +239,7 @@ impl ThreatBlocklist {
         }
         // Note: the write lock must be dropped before rebuilding the matcher;
         // `rebuild_ac_matcher` takes the read lock and parking_lot RwLocks are
-        // not reentrant — holding the write lock here used to deadlock the
+        // not reentrant  -  holding the write lock here used to deadlock the
         // daemon at startup.
         info!("ThreatBlocklist: loaded {count} domains from {path}");
         self.rebuild_ac_matcher();

@@ -2,23 +2,18 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
 use parking_lot::RwLock;
+use ring0_abi::FlowKey;
 use tracing::info;
 
 const IDLE_TIMEOUT_SECS: u64 = 300;
 const MAX_FLOWS: u32 = 65536;
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
-pub struct FlowKey {
-    pub src_ip: u32,
-    pub dst_ip: u32,
-    pub src_port: u16,
-    pub dst_port: u16,
-    pub protocol: u8,
-}
-
+/// Userspace mirror of the kernel fast-path flow table.
+///
+/// NOTE: this list is a *reporting* mirror only  -  enforcement/offload happens
+/// in the kernel `ESTABLISHED_FLOWS` map (`EbpfManager::mark_flow_established`).
+/// `mark_flow_safe` updates both so the two views never diverge.
 pub struct FastPathManager {
     active_flows: Arc<RwLock<VecDeque<(FlowKey, Instant)>>>,
 }
@@ -30,22 +25,7 @@ impl FastPathManager {
         }
     }
 
-    pub fn mark_flow_safe(
-        &self,
-        src_ip: u32,
-        dst_ip: u32,
-        src_port: u16,
-        dst_port: u16,
-        protocol: u8,
-    ) -> Result<()> {
-        let key = FlowKey {
-            src_ip,
-            dst_ip,
-            src_port,
-            dst_port,
-            protocol,
-        };
-
+    pub fn mark_flow_safe(&self, key: FlowKey) -> Result<(), anyhow::Error> {
         let mut flows = self.active_flows.write();
         if flows.len() >= MAX_FLOWS as usize {
             flows.pop_front();
@@ -54,24 +34,9 @@ impl FastPathManager {
         Ok(())
     }
 
-    pub fn remove_flow(
-        &self,
-        src_ip: u32,
-        dst_ip: u32,
-        src_port: u16,
-        dst_port: u16,
-        protocol: u8,
-    ) {
-        let key = FlowKey {
-            src_ip,
-            dst_ip,
-            src_port,
-            dst_port,
-            protocol,
-        };
-
+    pub fn remove_flow(&self, key: &FlowKey) {
         let mut flows = self.active_flows.write();
-        flows.retain(|(k, _)| k != &key);
+        flows.retain(|(k, _)| k != key);
     }
 
     pub fn purge_idle_flows(&self) {
@@ -93,10 +58,17 @@ impl FastPathManager {
     }
 
     pub fn handle_tcp_fin(&self, src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16) {
-        self.remove_flow(src_ip, dst_ip, src_port, dst_port, 6);
+        self.remove_flow(&FlowKey {
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            protocol: 6,
+            _pad: [0u8; 7],
+        });
     }
 
     pub fn handle_tcp_rst(&self, src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16) {
-        self.remove_flow(src_ip, dst_ip, src_port, dst_port, 6);
+        self.handle_tcp_fin(src_ip, dst_ip, src_port, dst_port);
     }
 }

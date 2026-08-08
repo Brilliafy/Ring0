@@ -11,12 +11,43 @@ fn cgroup_v2_available() -> bool {
 
 impl ContainmentManager {
     pub fn quarantine_pid(pid: u32) -> bool {
-        if cgroup_v2_available() {
-            Self::cgroup_freeze(pid)
+        // F1: pid_t is signed 32-bit; u32 pids >= 0x8000_0000 would cast to a
+        // negative pid_t and signal a process group (or 0xFFFF_FFFF == -1,
+        // which signals every process the daemon may signal).
+        if i32::try_from(pid).map(|p| p > 0).unwrap_or(false) {
+            if cgroup_v2_available() {
+                Self::cgroup_freeze(pid)
+            } else {
+                warn!("cgroup v2 not mounted, using SIGSTOP fallback for PID {pid}");
+                Self::sigstop_fallback(pid)
+            }
         } else {
-            warn!("cgroup v2 not mounted, using SIGSTOP fallback for PID {pid}");
-            Self::sigstop_fallback(pid)
+            warn!("refusing to quarantine invalid PID {pid}");
+            false
         }
+    }
+
+    /// Quarantine a PID only if it still matches the starttime captured when
+    /// the triggering event was observed. A mismatch means the PID was reused
+    /// (or the process died) since the event  -  freezing it would hit an
+    /// innocent process, so we refuse and log.
+    pub fn quarantine_pid_checked(pid: u32, expected_starttime: Option<u64>) -> bool {
+        if let Some(expected) = expected_starttime {
+            match crate::process::ProcessResolver::starttime(pid) {
+                Some(actual) if actual != expected => {
+                    warn!(
+                        "refusing to quarantine PID {pid}: starttime changed since event (PID reuse?)  -  expected {expected}, got {actual}"
+                    );
+                    return false;
+                }
+                None => {
+                    warn!("refusing to quarantine PID {pid}: process already gone");
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        Self::quarantine_pid(pid)
     }
 
     fn cgroup_freeze(pid: u32) -> bool {
@@ -43,7 +74,16 @@ impl ContainmentManager {
     }
 
     fn sigstop_fallback(pid: u32) -> bool {
-        let ret = unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+        // F1: never pass a wrapped/negative pid_t to kill(2)  -  kill(-1, ...)
+        // would stop every process on the host.
+        let pid_i = match i32::try_from(pid) {
+            Ok(p) if p > 0 => p,
+            _ => {
+                error!("sigstop_fallback: refusing invalid PID {pid}");
+                return false;
+            }
+        };
+        let ret = unsafe { libc::kill(pid_i, libc::SIGSTOP) };
         if ret == 0 {
             info!("PID {pid} stopped via SIGSTOP fallback");
             true
@@ -55,6 +95,11 @@ impl ContainmentManager {
     }
 
     pub fn kill_tree(root_pid: u32) -> u32 {
+        // F1: refuse pids that would wrap to negative pid_t in kill(2).
+        if i32::try_from(root_pid).map(|p| p > 0).unwrap_or(false) == false {
+            error!("kill_tree: refusing invalid root PID {root_pid}");
+            return 0;
+        }
         let mut killed = 0u32;
         let proc = Path::new("/proc");
         let dir = match fs::read_dir(proc) {
@@ -73,10 +118,16 @@ impl ContainmentManager {
                     .and_then(|r| r.ok())
             })
             .filter(|pid| {
+                // E14: compare the *parsed* PPid numerically  -  a substring
+                // match (`"PPid: 7"` containing "7") also matched PPid 70,
+                // 107, … and could mass-kill unrelated process trees.
                 let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-                status
-                    .lines()
-                    .any(|l| l.starts_with("PPid:") && l.contains(&root_pid.to_string()))
+                status.lines().any(|l| {
+                    l.trim_start()
+                        .strip_prefix("PPid:")
+                        .and_then(|v| v.trim().parse::<u32>().ok())
+                        == Some(root_pid)
+                })
             })
             .collect();
 
@@ -86,7 +137,8 @@ impl ContainmentManager {
                 killed += 1;
             }
         }
-        let ret = unsafe { libc::kill(root_pid as i32, libc::SIGKILL) };
+        let root_pid_i = root_pid as i32; // guarded above: 1..=i32::MAX
+        let ret = unsafe { libc::kill(root_pid_i, libc::SIGKILL) };
         if ret == 0 {
             killed += 1;
         }

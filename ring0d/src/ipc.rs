@@ -30,7 +30,7 @@ pub enum DaemonCmd {
     /// a user "allow once" decision.
     MarkFlowAllowed(u32, u16, u8, u32),
     /// `caller_pid` is the kernel-verified SO_PEERCRED pid of the process that
-    /// submitted the decision — used to reject self-approval by the process
+    /// submitted the decision  -  used to reject self-approval by the process
     /// under scrutiny (defense in depth on top of the privilege gate).
     SubmitPromptDecision(u64, String, String, u32),
     FlatpakList,
@@ -106,12 +106,12 @@ impl IpcServer {
                 let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
             } else {
                 warn!(
-                    "IPC socket path {path} changed after bind — refusing chown/chmod (possible symlink swap)"
+                    "IPC socket path {path} changed after bind  -  refusing chown/chmod (possible symlink swap)"
                 );
             }
         } else {
             warn!(
-                "IPC socket {path}: running {}root with no ring0 group — using permissive 0o666 mode (telemetry readable by any local process). Install creates the ring0 group and runs the daemon as root to harden this.",
+                "IPC socket {path}: running {}root with no ring0 group  -  using permissive 0o666 mode (telemetry readable by any local process). Install creates the ring0 group and runs the daemon as root to harden this.",
                 if is_root { "" } else { "non-" }
             );
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
@@ -163,7 +163,7 @@ impl IpcServer {
                                                 // broadcast backlog. Resync instead of
                                                 // silently severing the connection.
                                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                                    warn!("IPC client lagged {n} events — resynchronizing");
+                                                    warn!("IPC client lagged {n} events  -  resynchronizing");
                                                 }
                                                 Err(_) => break,
                                             }

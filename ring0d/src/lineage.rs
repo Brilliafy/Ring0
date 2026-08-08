@@ -1,7 +1,7 @@
 //! Process lineage tree: pid -> { ppid, binary, cmdline, cwd, … } fed by the
 //! `sched_process_exec` tracepoint and the netlink proc connector. Lets the
-//! risk engine answer "who is this network activity really from?" — binary
-//! path, ancestry chain, and recent connections — without shelling out to
+//! risk engine answer "who is this network activity really from?"  -  binary
+//! path, ancestry chain, and recent connections  -  without shelling out to
 //! /proc on every event.
 
 use std::collections::VecDeque;
