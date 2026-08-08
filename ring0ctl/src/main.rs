@@ -136,31 +136,40 @@ fn send_command_no_response(frame: &[u8]) -> Result<()> {
     stream.write_all(&len)?;
     stream.write_all(frame)?;
     stream.flush()?;
+    // The socket also carries the daemon's broadcast event stream, so the
+    // first frame we read may be a broadcast, not our ack. Keep reading until
+    // an OK/DENIED ack appears (bounded to avoid an endless drain).
     let mut len_buf = [0u8; 4];
-    match stream.read_exact(&mut len_buf) {
-        Ok(_) => {}
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
-        {
+    for _ in 0..100_000 {
+        match stream.read_exact(&mut len_buf) {
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(()); // no ack — older daemon or non-privileged cmd
+            }
+            Err(e) => return Err(e).context("failed to read command ack"),
+        }
+        let resp_len = u32::from_le_bytes(len_buf) as usize;
+        if resp_len == 0 || resp_len > 65536 {
             return Ok(());
         }
-        Err(e) => return Err(e).context("failed to read command ack"),
+        let mut resp = vec![0u8; resp_len];
+        stream
+            .read_exact(&mut resp)
+            .context("failed to read command ack body")?;
+        if resp == b"OK" {
+            return Ok(());
+        }
+        if resp == b"DENIED" {
+            bail!("denied by the daemon (polkit authorization failed)");
+        }
+        // Otherwise it was a broadcast event frame — skip and keep reading.
     }
-    let resp_len = u32::from_le_bytes(len_buf) as usize;
-    if resp_len == 0 || resp_len > 65536 {
-        return Ok(());
-    }
-    let mut resp = vec![0u8; resp_len];
-    stream
-        .read_exact(&mut resp)
-        .context("failed to read command ack body")?;
-    if resp == b"DENIED" {
-        bail!("denied by the daemon (polkit authorization failed)");
-    }
-    Ok(())
+    bail!("no command ack received (broadcast flood?)")
 }
 
 /// Send the Status command and wait for the daemon's status broadcast event.

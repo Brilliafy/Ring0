@@ -390,21 +390,27 @@ impl EbpfManager {
 
     pub fn block_ip(&mut self, ip: IpAddr) -> Result<()> {
         if let IpAddr::V4(v4) = ip {
-            let inserted = if let Some(ebpf) = self.ebpf.as_mut() {
+            // A USER block is explicit intent: enforce it on BOTH inbound
+            // (BLOCKED_IPS) and outbound (USER_BLOCKED_IPS). Feed CIDRs never
+            // touch USER_BLOCKED_IPS, so a VPN server on a feed-listed range
+            // still works.
+            let mut inserted = false;
+            if let Some(ebpf) = self.ebpf.as_mut() {
                 if let Some(map) = ebpf.map_mut("BLOCKED_IPS") {
                     if let Ok(mut map) = LpmTrie::<&mut MapData, u32, u8>::try_from(map) {
                         let key = LpmTrieKey::new(32, u32::from_be(u32::from(v4)));
                         map.insert(&key, &1, 0)?;
-                        true
-                    } else {
-                        false
+                        inserted = true;
                     }
-                } else {
-                    false
                 }
-            } else {
-                false
-            };
+                if let Some(map) = ebpf.map_mut("USER_BLOCKED_IPS") {
+                    if let Ok(mut map) = LpmTrie::<&mut MapData, u32, u8>::try_from(map) {
+                        let key = LpmTrieKey::new(32, u32::from_be(u32::from(v4)));
+                        map.insert(&key, &1, 0)?;
+                        inserted = true;
+                    }
+                }
+            }
             // Mirror into the reporting list on BOTH outcomes so status views
             // (blocked_ips / DaemonStatus) reflect reality whether or not the
             // kernel map insert succeeded (previously the list was only
@@ -430,21 +436,21 @@ impl EbpfManager {
     }
     pub fn unblock_ip(&mut self, ip: IpAddr) -> Result<()> {
         if let IpAddr::V4(v4) = ip {
-            let _removed = if let Some(ebpf) = self.ebpf.as_mut() {
+            // Remove from BOTH maps (inbound + user outbound).
+            if let Some(ebpf) = self.ebpf.as_mut() {
                 if let Some(map) = ebpf.map_mut("BLOCKED_IPS") {
                     if let Ok(mut map) = LpmTrie::<&mut MapData, u32, u8>::try_from(map) {
                         let key = LpmTrieKey::new(32, u32::from_be(u32::from(v4)));
                         let _ = map.remove(&key);
-                        true
-                    } else {
-                        false
                     }
-                } else {
-                    false
                 }
-            } else {
-                false
-            };
+                if let Some(map) = ebpf.map_mut("USER_BLOCKED_IPS") {
+                    if let Ok(mut map) = LpmTrie::<&mut MapData, u32, u8>::try_from(map) {
+                        let key = LpmTrieKey::new(32, u32::from_be(u32::from(v4)));
+                        let _ = map.remove(&key);
+                    }
+                }
+            }
             // Always remove from the reporting mirror.
             let mut list = self.fallback_blocked_ips.lock();
             let s = ip.to_string();
@@ -827,6 +833,17 @@ fn list_up_interfaces() -> Vec<String> {
     for entry in dir.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if name == "lo" {
+            continue;
+        }
+        // PHYSICAL interfaces only: a `/sys/class/net/<name>/device` symlink
+        // exists for real NICs (PCI/USB) but not for virtual/tunnel devices
+        // (wireguard wg*, tun/tap, veth, docker0, br*, tailscale…). Attaching
+        // XDP/TC to a VPN tunnel filters the DECRYPTED inner traffic against
+        // the blocklist — dropping the user's own VPN packets and breaking
+        // connectivity — and to virtual bridges double-filters traffic. The
+        // physical edge (wlo1/eth0) already sees the ENCRYPTED outer packets,
+        // which is where egress/ingress filtering belongs.
+        if !Path::new(&format!("/sys/class/net/{name}/device")).exists() {
             continue;
         }
         let operstate =

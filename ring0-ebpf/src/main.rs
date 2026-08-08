@@ -26,6 +26,14 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 #[map]
 pub static BLOCKED_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(65536, 0);
+/// User-initiated IP blocks (`ring0ctl block`). Feed CIDRs (spamhaus-drop,
+/// et-compromised…) identify malicious SOURCES and are only enforced
+/// INBOUND; blocking OUTBOUND destinations against them would silently drop
+/// the user's own traffic (e.g. a WireGuard VPN server whose hosting IP is
+/// on a feed list) — so user blocks live in a separate map checked for
+/// both directions.
+#[map]
+pub static USER_BLOCKED_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(16384, 0);
 
 #[map]
 pub static BLOCKED_PORTS: HashMap<u16, u32> = HashMap::with_max_entries(256, 0);
@@ -291,16 +299,20 @@ fn ktime_get_ns() -> u64 {
 
 fn check_blocked(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16) -> u32 {
     let drop = xdp_action::XDP_DROP;
+    // Inbound: drop traffic FROM feed-listed + user-blocked sources.
     if unsafe {
         BLOCKED_IPS
             .get(&Key::new(32, u32::from_be(src_ip)))
             .is_some()
-    } || unsafe {
-        BLOCKED_IPS
-            .get(&Key::new(32, u32::from_be(dst_ip)))
-            .is_some()
     } || unsafe { BLOCKED_PORTS.get_ptr(&src_port).is_some() }
         || unsafe { BLOCKED_PORTS.get_ptr(&dst_port).is_some() }
+        // Outbound: only USER-initiated destination blocks (never feed
+        // CIDRs) so VPN tunnels / legitimate hosts on listed ranges work.
+        || unsafe {
+            USER_BLOCKED_IPS
+                .get(&Key::new(32, u32::from_be(dst_ip)))
+                .is_some()
+        }
     {
         return drop;
     }
@@ -967,8 +979,11 @@ pub fn ring0_lsm_socket_connect(ctx: LsmContext) -> i32 {
     let ip = unsafe { aya_ebpf::helpers::bpf_probe_read_user::<u32>(addr_ptr.add(4).cast()) }
         .map(u32::from_be)
         .unwrap_or(0);
-    if unsafe { BLOCKED_IPS.get(&Key::new(32, u32::from_be(ip))).is_some() }
-        || unsafe { BLOCKED_PORTS.get_ptr(&port).is_some() }
+    if unsafe {
+        USER_BLOCKED_IPS
+            .get(&Key::new(32, u32::from_be(ip)))
+            .is_some()
+    } || unsafe { BLOCKED_PORTS.get_ptr(&port).is_some() }
     {
         let evt = LsmEvent {
             kind: KIND_LSM,
