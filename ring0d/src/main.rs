@@ -47,10 +47,12 @@ async fn main() -> Result<()> {
 
     let shutdown = Arc::new(Notify::new());
     let sig_shutdown = shutdown.clone();
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let sig_cmd_tx = cmd_tx.clone();
 
-    tokio::spawn(async move { listen_signals(sig_shutdown).await });
+    tokio::spawn(async move { listen_signals(sig_shutdown, sig_cmd_tx).await });
 
-    let mut daemon = match Daemon::new(shutdown.clone()).await {
+    let mut daemon = match Daemon::new(shutdown.clone(), cmd_tx, cmd_rx).await {
         Ok(d) => d,
         Err(e) => {
             error!("daemon init failed: {e:?}");
@@ -70,7 +72,10 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn listen_signals(shutdown: Arc<Notify>) {
+async fn listen_signals(
+    shutdown: Arc<Notify>,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<ipc::DaemonCmd>,
+) {
     use futures_util::StreamExt;
     use signal_hook::consts::*;
     use signal_hook_tokio::Signals;
@@ -83,7 +88,12 @@ async fn listen_signals(shutdown: Arc<Notify>) {
     };
     loop {
         match signals.next().await {
-            Some(SIGUSR1) => info!("SIGUSR1 — rules reload pending"),
+            // SIGUSR1 reloads the rules engine (previously it only logged
+            // 'pending' without doing anything).
+            Some(SIGUSR1) => {
+                info!("SIGUSR1 — reloading rules");
+                let _ = cmd_tx.send(ipc::DaemonCmd::ReloadRules);
+            }
             Some(_) => {
                 shutdown.notify_waiters();
                 break;
@@ -128,7 +138,11 @@ struct Daemon {
 }
 
 impl Daemon {
-    async fn new(shutdown: Arc<Notify>) -> Result<Self> {
+    async fn new(
+        shutdown: Arc<Notify>,
+        cmd_tx: tokio::sync::mpsc::UnboundedSender<ipc::DaemonCmd>,
+        cmd_rx: tokio::sync::mpsc::UnboundedReceiver<ipc::DaemonCmd>,
+    ) -> Result<Self> {
         let lsm_enforce = std::env::var("RING0_LSM_ENFORCE").as_deref() == Ok("1");
         let mut ebpf = ebpf::EbpfManager::load(lsm_enforce)?;
         // Fast-path DPI: sync literal patterns into the kernel map. Observe-only
@@ -147,7 +161,6 @@ impl Daemon {
         let correlation = correlation::CorrelationEngine::new();
         let self_defense = self_defense::SelfDefense::new();
         self_defense.lock_ebpf_maps();
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let ipc = ipc::IpcServer::bind(
             &ring0_common::socket_path(),
             storage.clone(),
