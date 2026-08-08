@@ -626,18 +626,35 @@ impl EbpfManager {
 
     /// Set DPI enforcement (drop on match). Off by default = observe-only.
     pub fn set_dpi_enforce(&mut self, enforce: bool) {
-        if let Some(ebpf) = self.ebpf.as_mut() {
+        // Only act (map write + log) when the mode actually changes — the
+        // governor tick used to call this every 5s, writing the map and
+        // logging every time (17k+ log lines/day) regardless of state.
+        let changed = if let Some(ebpf) = self.ebpf.as_mut() {
             if let Some(map) = ebpf.map_mut("DPI_MODE") {
                 if let Ok(mut map) = HashMap::<&mut MapData, u32, u8>::try_from(map) {
-                    let value = if enforce { 1u8 } else { 0u8 };
-                    let _ = map.insert(&1, &value, 0);
+                    let current = map.get(&1, 0).ok().unwrap_or(0);
+                    let next = if enforce { 1u8 } else { 0u8 };
+                    if current == next {
+                        false
+                    } else {
+                        let _ = map.insert(&1, &next, 0);
+                        true
+                    }
+                } else {
+                    false
                 }
+            } else {
+                false
             }
-        }
-        if enforce {
-            info!("DPI enforcement enabled — matching traffic will be dropped");
         } else {
-            info!("DPI in observe mode — matching traffic is reported, not dropped");
+            false
+        };
+        if changed {
+            if enforce {
+                info!("DPI enforcement enabled — matching traffic will be dropped");
+            } else {
+                info!("DPI in observe mode — matching traffic is reported, not dropped");
+            }
         }
     }
 

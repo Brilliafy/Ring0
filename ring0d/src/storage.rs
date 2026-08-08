@@ -32,7 +32,9 @@ impl RocksManager {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
-        opts.set_write_buffer_size(64 * 1024 * 1024);
+        // 16 MB memtable (was 64 MB x 4 = up to 256 MB in-process): with raw
+        // events no longer persisted, this bounds the alerts-CF footprint.
+        opts.set_write_buffer_size(16 * 1024 * 1024);
         opts.set_max_write_buffer_number(4);
         opts.set_min_write_buffer_number_to_merge(2);
         opts.set_target_file_size_base(64 * 1024 * 1024);
@@ -163,7 +165,20 @@ impl RocksManager {
 
     /// Non-blocking enqueue of a raw event record. Never blocks the caller;
     /// when the queue is full the write is counted as dropped.
+    ///
+    /// DISABLED BY DEFAULT: raw events (packet/exec/connect) are persisted to
+    /// the `events` column family, but nothing ever reads them (query_events
+    /// has no callers — the GUI/CLI query alerts). Writing them saturates the
+    /// RocksDB memtable (64 MB x 4 buffers) on slow disks, which looked like a
+    /// memory leak (steady RSS growth at the event-write rate) and hammered
+    /// the disk. Set RING0_EVENT_LOG=1 to persist raw events again.
     pub fn write_raw(&self, data: &[u8]) {
+        static EVENT_LOG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*EVENT_LOG_ENABLED
+            .get_or_init(|| std::env::var("RING0_EVENT_LOG").as_deref() == Ok("1"))
+        {
+            return;
+        }
         match self
             .write_tx
             .as_ref()

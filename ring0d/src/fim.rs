@@ -8,14 +8,25 @@ use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+// /etc first: tiny, high-value config hashes land before the (large) binary
+// trees, so a byte-capped first run still covers the configs.
 const FIM_DIRS: &[&str] = &[
+    "/etc/pam.d",
+    "/etc/security",
+    "/etc/ssh",
     "/usr/bin",
     "/usr/sbin",
     "/usr/lib64",
     "/usr/lib",
-    "/etc/pam.d",
-    "/etc/security",
 ];
+
+/// Cap on total bytes hashed by the FIRST baseline run. A full /usr tree is
+/// multi-GB; on a spinning disk an uncapped scan saturates the disk for many
+/// minutes and makes every other program on the machine freeze. The baseline
+/// is used for exec-anomaly integrity checks, so capping to the configs +
+/// the most common executables degrades gracefully (large binaries simply
+/// have no stored hash until a later incremental pass).
+const MAX_FIM_BASELINE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Files larger than this are skipped by the baseline scan: hashing a
 /// multi-hundred-MB shared library adds little detection value while making
@@ -48,6 +59,7 @@ impl FimEngine {
 
     pub fn scan_and_baseline(&self) -> usize {
         let mut count = 0usize;
+        let mut hashed_bytes = 0u64;
         let mut baseline = self.baseline.write();
         baseline.clear();
 
@@ -56,16 +68,32 @@ impl FimEngine {
             if !path.is_dir() {
                 continue;
             }
-            count += self.hash_directory(path, &mut baseline);
+            if hashed_bytes >= MAX_FIM_BASELINE_BYTES {
+                info!(
+                    "FIM: baseline byte budget exhausted ({MAX_FIM_BASELINE_BYTES} MB) — remaining dirs deferred"
+                );
+                break;
+            }
+            let (n, bytes) = self.hash_directory(path, &mut baseline, hashed_bytes);
+            count += n;
+            hashed_bytes = hashed_bytes.saturating_add(bytes);
         }
 
         self.persist_baseline(&baseline);
-        info!("FIM: scanned and baselined {count} files");
+        info!(
+            "FIM: scanned and baselined {count} files ({hashed_bytes} MB) — budget {MAX_FIM_BASELINE_BYTES} MB"
+        );
         count
     }
 
-    fn hash_directory(&self, dir: &Path, baseline: &mut HashMap<String, Vec<u8>>) -> usize {
+    fn hash_directory(
+        &self,
+        dir: &Path,
+        baseline: &mut HashMap<String, Vec<u8>>,
+        budget_used: u64,
+    ) -> (usize, u64) {
         let mut count = 0usize;
+        let mut bytes = 0u64;
         if let Ok(entries) = fs::read_dir(dir) {
             let mut batch_start = std::time::Instant::now();
             for entry in entries.flatten() {
@@ -85,13 +113,26 @@ impl FimEngine {
                     continue;
                 }
                 // /usr/bin, /usr/sbin, /usr/lib64, /usr/lib contain mostly
-                // data (locales, icons, gconv, …) that has no integrity
-                // value and made the baseline hash GBs of it. Restrict those
-                // trees to ELF binaries; the /etc config trees stay fully
-                // tracked. (The baseline's other consumer — exec anomaly
-                // checks — only ever compares executed binaries.)
-                if !dir.starts_with("/etc") && !Self::is_elf_file(&path) {
-                    continue;
+                // data (locales, icons, gconv, …) and shared libraries that
+                // have no exec-anomaly value: libraries are dlopen'd, never
+                // exec'd, so the baseline's only consumer (exec anomaly
+                // checks) can never consult their hashes. Hashing 6.5 GB of
+                // them (libLLVM, libxul, …) made the startup baseline take
+                // ~15 minutes on a spinning disk at the throttled duty cycle.
+                // Restrict those trees to ELF EXECUTABLES; the /etc config
+                // trees stay fully tracked.
+                if !dir.starts_with("/etc") {
+                    let is_elf = Self::is_elf_file(&path);
+                    let is_shared_lib = path.to_string_lossy().contains(".so");
+                    if !is_elf || is_shared_lib {
+                        continue;
+                    }
+                }
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                if budget_used + bytes >= MAX_FIM_BASELINE_BYTES {
+                    // Budget exhausted mid-directory: stop hashing. The
+                    // caller breaks out of the dir loop on the next iteration.
+                    return (count, bytes);
                 }
                 let hash = match Self::sha256_file(&path) {
                     Some(h) => h,
@@ -100,6 +141,7 @@ impl FimEngine {
                 let path_str = path.display().to_string();
                 baseline.insert(path_str, hash);
                 count += 1;
+                bytes = bytes.saturating_add(size);
                 // Duty-cycle throttle: an unthrottled baseline over /usr/lib64
                 // saturates a core for minutes, which trips the power governor
                 // into Critical (sampling off) and starves the very security
@@ -115,7 +157,7 @@ impl FimEngine {
                 }
             }
         }
-        count
+        (count, bytes)
     }
 
     /// True when `path` starts with the ELF magic bytes (\x7fELF).
