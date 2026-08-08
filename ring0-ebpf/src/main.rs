@@ -297,8 +297,29 @@ fn ktime_get_ns() -> u64 {
 
 // ── IP/PORT blocking check ───────────────────────────────────
 
-fn check_blocked(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16) -> u32 {
+fn check_blocked(
+    src_ip: u32,
+    dst_ip: u32,
+    src_port: u16,
+    dst_port: u16,
+    is_wireguard: bool,
+) -> u32 {
     let drop = xdp_action::XDP_DROP;
+    // WireGuard tunnel packets are end-to-end encrypted UDP; the fast path
+    // cannot inspect them, and feed/port drops would silently kill the user's
+    // VPN (the tunnel server's INBOUND responses match feed CIDRs all the
+    // time - commercial VPNs live on hosting ranges). Only an EXPLICIT user
+    // destination block applies to tunnel traffic.
+    if is_wireguard {
+        if unsafe {
+            USER_BLOCKED_IPS
+                .get(&Key::new(32, u32::from_be(dst_ip)))
+                .is_some()
+        } {
+            return drop;
+        }
+        return xdp_action::XDP_PASS;
+    }
     // Inbound: drop traffic FROM feed-listed + user-blocked sources.
     if unsafe {
         BLOCKED_IPS
@@ -317,6 +338,25 @@ fn check_blocked(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16) -> u32 
         return drop;
     }
     xdp_action::XDP_PASS
+}
+
+/// WireGuard detection: the first byte of the UDP payload is the message
+/// type (1 = handshake initiation, 2 = handshake response, 3 = cookie
+/// reply, 4 = transport data). Bounds-checked.
+unsafe fn is_wireguard_packet<T: PktData>(
+    ctx: &T,
+    ip: usize,
+    proto: u8,
+    l4: usize,
+) -> bool {
+    if proto != 17 {
+        return false;
+    }
+    if ctx.data_end() < l4 + 9 {
+        return false;
+    }
+    let t = *(l4 as *const u8).add(8);
+    (1..=4).contains(&t)
 }
 
 // ── DNS domain hash blocklist ──────────────────────────────
@@ -465,7 +505,9 @@ unsafe fn try_ring0_xdp(ctx: &XdpContext) -> Result<u32, u32> {
         (0, 0)
     };
 
-    if check_blocked(src_ip, dst_ip, sp, dp) == xdp_action::XDP_DROP {
+    let l4 = if proto == 6 || proto == 17 { ip + 20 } else { 0 };
+    let is_wg = l4 != 0 && unsafe { is_wireguard_packet(ctx, ip, proto, l4) };
+    if check_blocked(src_ip, dst_ip, sp, dp, is_wg) == xdp_action::XDP_DROP {
         // Log the drop (rate-limited) so blocked traffic is visible instead
         // of vanishing silently. action=1 marks the event as a drop.
         if should_log_drop() {
