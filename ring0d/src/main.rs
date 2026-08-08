@@ -6,6 +6,16 @@ pub mod contextual_security;
 pub mod correlation;
 pub mod desktop_sandbox;
 pub mod dpi;
+pub mod lineage;
+pub mod risk;
+
+/// Monotonic-ish wall clock in nanoseconds, shared by lineage/risk modules.
+pub fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
 pub mod ebpf;
 pub mod enrichment;
 pub mod fastpath;
@@ -107,6 +117,8 @@ struct Daemon {
     ebpf: ebpf::EbpfManager,
     storage: Arc<storage::RocksManager>,
     dpi: dpi::DpiEngine,
+    lineage: lineage::LineageTree,
+    response_mode: risk::ResponseMode,
     rules: rules::RuleEngine,
     correlation: correlation::CorrelationEngine,
     self_defense: self_defense::SelfDefense,
@@ -153,6 +165,8 @@ impl Daemon {
         info!("DPI fast path: {dpi_synced} literal patterns synced");
         let storage = Arc::new(storage::RocksManager::open(&ring0_common::db_path())?);
         let dpi = dpi::DpiEngine::new()?;
+        let lineage = lineage::LineageTree::new();
+        let response_mode = risk::ResponseMode::from_env();
         let rules_path = bundled_config_path("rules.yaml");
         let rules = rules::RuleEngine::load(&rules_path).unwrap_or_else(|e| {
             warn!("no rules file: {e:?}");
@@ -266,6 +280,8 @@ impl Daemon {
             ebpf,
             storage,
             dpi,
+            lineage,
+            response_mode,
             rules,
             correlation,
             self_defense,
@@ -319,7 +335,10 @@ impl Daemon {
                 Ok(lsm_data) = lsm_rx.recv() => { self.on_lsm_event(&lsm_data).await; }
                 Ok(rk_data) = rootkit_rx.recv() => { self.on_rootkit_event(&rk_data).await; }
                 Ok(pv_data) = privesc_rx.recv() => { self.on_privesc_event(&pv_data).await; }
-                _ = corr_tick.tick() => { self.eval_correlations().await; }
+                _ = corr_tick.tick() => {
+                    self.eval_correlations().await;
+                    self.lineage.maybe_prune();
+                }
                 _ = baseline_tick.tick() => { self.tick_baseline().await; }
                 _ = forensics_tick.tick() => { self.tick_forensics(); }
                 _ = rootkit_tick.tick() => { self.tick_rootkit_scan(); }
@@ -503,6 +522,7 @@ impl Daemon {
             self.ipc.broadcast_raw(&evt).await;
         }
         self.correlation.push_exec(pid, ppid, &binary, &cmdline);
+        self.lineage.record_exec(pid, ppid, &binary, &cmdline);
         if let Some(pb) = &parent_binary {
             for rid in self.rules.check_process_anomaly(&binary, Some(pb)) {
                 let a = build_alert_bytes_rule(rid, 3, "process anomaly");
@@ -577,6 +597,7 @@ impl Daemon {
         let proto = raw[30];
         crate::process::ProcessResolver::push_socket(pid, dip, dp, proto);
         self.correlation.push_connect(pid, dip, dp);
+        self.lineage.record_connect(pid, dip, dp);
         self.baseline.record_connection(dip, dp);
         if let Some(anomaly) = self.baseline.check_connection_anomaly(dip, dp) {
             let a = build_alert_bytes_rule(8002, 2, &anomaly);
@@ -755,7 +776,7 @@ impl Daemon {
         }
     }
 
-    async fn on_tls_event(&self, raw: &[u8]) {
+    async fn on_tls_event(&mut self, raw: &[u8]) {
         self.event_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if raw.len() < 24 {
@@ -763,7 +784,9 @@ impl Daemon {
         }
         let payload = if raw.len() > 36 { &raw[36..] } else { &[] };
         let tpid = u32::from_le_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
-        for m in self.dpi.scan_payload(payload) {
+        let direction = raw[28]; // 0 = SSL_write (upload), 1 = SSL_read
+        let hits = self.dpi.scan_payload(payload);
+        for m in &hits {
             // Surface the process that triggered the match — in consumer
             // security the WHO matters as much as the bytes.
             let binary = crate::process::ProcessResolver::binary_path(tpid)
@@ -772,6 +795,108 @@ impl Daemon {
             let alert = build_alert_bytes_rule(m.rule_id, m.severity, &msg);
             self.storage.write_alert(&alert);
             self.broadcast_alert_record(&alert).await;
+        }
+
+        // Risk evaluation: combine process lineage, destination, and payload
+        // evidence. Only non-pass verdicts surface as risk alerts; active
+        // enforcement is strictly opt-in (RING0_RESPONSE, default Notify).
+        // Prefer the binary recorded at exec time (the lineage tree): a
+        // short-lived process (e.g. curl) may be gone by the time this runs,
+        // making a live /proc resolution return "unknown" and inflating the
+        // untrusted factor.
+        let binary = self
+            .lineage
+            .lookup(tpid)
+            .map(|i| i.binary)
+            .unwrap_or_else(|| {
+                crate::process::ProcessResolver::binary_path(tpid)
+                    .unwrap_or_else(|| "unknown".into())
+            });
+        let trust_status = self.trust.verify_binary_async(&binary, tpid).await;
+        let untrusted = matches!(
+            trust_status,
+            trust::TrustStatus::Untrusted | trust::TrustStatus::Unknown
+        );
+        let (dst_ip, dst_port) = self
+            .lineage
+            .latest_connection(tpid)
+            .map(|c| (Some(c.dst_ip), c.dst_port))
+            .unwrap_or((None, 0));
+        let risk = risk::RiskEngine::score(
+            &self.lineage,
+            tpid,
+            dst_ip,
+            dst_port,
+            direction == 0,
+            payload,
+            &hits,
+            untrusted,
+        );
+        if risk.verdict != risk::Verdict::Pass {
+            let bin_short = binary.rsplit('/').next().unwrap_or(&binary);
+            let msg = format!(
+                "risk={} ({}) pid={} binary={} dst={}{}",
+                risk.score,
+                match risk.verdict {
+                    risk::Verdict::HighRisk => "HIGH",
+                    risk::Verdict::Flagged => "suspicious",
+                    risk::Verdict::Pass => "pass",
+                },
+                tpid,
+                bin_short,
+                dst_ip.map(|ip| ip.to_string()).unwrap_or_default(),
+                if dst_port != 0 {
+                    format!(":{}", dst_port)
+                } else {
+                    String::new()
+                }
+            );
+            // A connection emits up to ~32 TLS events; the risk verdict is
+            // the same for all of them, so throttle the alert per rule id.
+            if !self.alert_due(11001) {
+                return;
+            }
+            let sev = if risk.verdict == risk::Verdict::HighRisk {
+                4
+            } else {
+                2
+            };
+            let alert = build_alert_bytes_rule(11001, sev, &msg);
+            self.storage.write_alert(&alert);
+            self.broadcast_alert_record(&alert).await;
+            if risk.verdict == risk::Verdict::HighRisk {
+                self.enforce_high_risk(tpid, &binary, risk.score, dst_ip)
+                    .await;
+            }
+        }
+    }
+
+    /// Apply the configured response to a high-risk event. Default is
+    /// Notify — freezing/killing can destroy real work, so enforcement is
+    /// opt-in via RING0_RESPONSE=block|freeze|kill.
+    async fn enforce_high_risk(&mut self, pid: u32, binary: &str, score: i32, dst_ip: Option<u32>) {
+        match self.response_mode {
+            risk::ResponseMode::Notify => {
+                info!("[RISK] notify-only: {binary} (pid {pid}, score {score})");
+            }
+            risk::ResponseMode::BlockNetwork => {
+                if let Some(ip) = dst_ip {
+                    match self.ebpf.block_ip(std::net::IpAddr::V4(ip.into())) {
+                        Ok(()) => info!(
+                            "[ENFORCE] blocked network for {binary} (pid {pid}, score {score}) -> {ip}"
+                        ),
+                        Err(e) => warn!("[ENFORCE] block failed for pid {pid}: {e:?}"),
+                    }
+                }
+            }
+            risk::ResponseMode::Freeze => {
+                let stopped = containment::ContainmentManager::quarantine_pid_checked(pid, None);
+                info!("[ENFORCE] freeze {binary} (pid {pid}, score {score}): stopped={stopped}");
+            }
+            risk::ResponseMode::Kill => {
+                let killed = containment::ContainmentManager::kill_tree(pid);
+                info!("[ENFORCE] kill {binary} (pid {pid}, score {score}): killed={killed} procs");
+            }
         }
     }
 
