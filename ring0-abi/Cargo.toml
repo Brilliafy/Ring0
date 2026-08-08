@@ -1,0 +1,8 @@
+[package]
+name = "ring0-abi"
+description = "Shared ABI contract between ring0-ebpf (kernel) and ring0d (userspace): event kinds and fixed ring-buffer layouts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
