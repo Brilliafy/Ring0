@@ -287,12 +287,26 @@ impl RocksManager {
         self.db.clone()
     }
 
-    pub fn flush(&self) {
-        if let Err(e) = self.db.flush_wal(true) {
+    /// Best-effort periodic flush: sync the WAL without an fsync (fast) so
+    /// the write-ahead log stays small. The full memtable->SST flush
+    /// (`db.flush()`) can block for minutes on a slow spinning disk, which
+    /// used to hang systemd shutdown — it is only ever run by the Drop path.
+    pub fn flush_bounded(&self) {
+        if let Err(e) = self.db.flush_wal(false) {
             error!("RocksDB WAL flush failed: {e}");
         }
+    }
+
+    /// Full flush used at shutdown. NEVER call this on the main thread during
+    /// a system shutdown: `db.flush()` blocks until the memtable reaches the
+    /// disk, which on an HDD can hang the poweroff for minutes. The Drop
+    /// impl already drains the queue and flushes, so cleanup() only calls
+    /// [`Self::flush_bounded`].
+    #[allow(dead_code)]
+    pub fn flush_full(&self) {
+        self.flush_bounded();
         if let Err(e) = self.db.flush() {
-            error!("RocksDB flush failed: {e}");
+            error!("RocksDB full flush failed: {e}");
         }
     }
 }
@@ -305,6 +319,6 @@ impl Drop for RocksManager {
         if let Some(handle) = self.writer.take() {
             let _ = handle.join();
         }
-        self.flush();
+        self.flush_full();
     }
 }

@@ -218,11 +218,28 @@ impl EbpfManager {
         // (they are dynamically layered on the generic `sys_enter` tracepoint),
         // so raw/btf tracepoint programs can only attach to `sys_enter`. The
         // eBPF program dispatches on the syscall number internally.
-        for name in ["tp_btf/sched_process_exec", "tp_btf/sys_enter"] {
-            match attach_tracepoint(&mut ebpf, name, &btf) {
-                Ok(()) => {}
-                Err(e) => warn!("tracepoint {name} attach failed: {e}"),
+        // sched_process_exec (on every exec) stays attached — it is cheap and
+        // feeds the process lineage tree.
+        match attach_tracepoint(&mut ebpf, "tp_btf/sched_process_exec", &btf) {
+            Ok(()) => {}
+            Err(e) => warn!("tracepoint tp_btf/sched_process_exec attach failed: {e}"),
+        }
+        // The generic `sys_enter` tracepoint fires on EVERY syscall
+        // system-wide; its dispatcher + handlers (openat/connect/kill/mmap/
+        // setuid/memfd/finit_module probes) ran on every process and was the
+        // prime suspect for the system-wide slowdowns and lock-screen hangs
+        // (every syscall pays the dispatch + probe cost, and a hiccup in any
+        // handler stalls the whole machine). Gated behind
+        // RING0_SYSCALL_MONITOR=1 (opt-in) — the XDP/TC blocklist, TLS
+        // uprobes and exec tracepoint still provide the core protection
+        // without a per-syscall hook.
+        if std::env::var("RING0_SYSCALL_MONITOR").as_deref() == Ok("1") {
+            match attach_tracepoint(&mut ebpf, "tp_btf/sys_enter", &btf) {
+                Ok(()) => info!("sys_enter syscall monitor attached (RING0_SYSCALL_MONITOR=1)"),
+                Err(e) => warn!("tracepoint tp_btf/sys_enter attach failed: {e}"),
             }
+        } else {
+            info!("sys_enter syscall monitor NOT attached (opt-in: RING0_SYSCALL_MONITOR=1)");
         }
 
         // ── Attach LSM programs (by section name) ──

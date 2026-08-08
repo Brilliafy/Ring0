@@ -365,6 +365,7 @@ impl Daemon {
                 }
                 _ = fastpath_tick.tick() => {
                     self.fastpath.purge_idle_flows();
+                    self.storage.flush_bounded();
                     // Per-pid TLS budget overrides only matter for live
                     // processes; reap them every minute so short-lived
                     // process churn (scripted curl bursts) cannot fill the
@@ -1533,8 +1534,11 @@ impl Daemon {
         }
     }
     fn cleanup(&mut self) {
+        // Detach eBPF first so the kernel is never held by us, then only a
+        // bounded WAL sync — the full memtable->SST flush can block shutdown
+        // for minutes on a slow disk (the Drop path drains + flushes anyway).
         self.ebpf.detach();
-        self.storage.flush();
+        self.storage.flush_bounded();
         std::fs::remove_file(ring0_common::socket_path()).ok();
     }
 }
