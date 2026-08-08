@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,27 +11,21 @@ use aya::{Ebpf, EbpfLoader};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-// Event kinds — must match ring0-ebpf/src/main.rs
-pub const KIND_PACKET: u8 = 0;
-pub const KIND_PROCESS_EXEC: u8 = 1;
-pub const KIND_FILE_ACCESS: u8 = 2;
-pub const KIND_CONNECT: u8 = 3;
-pub const KIND_KILL: u8 = 4;
-pub const KIND_UNLINK: u8 = 5;
-pub const KIND_TLS: u8 = 6;
-pub const KIND_LSM: u8 = 10;
-pub const KIND_CANARY: u8 = 11;
-pub const KIND_SETUID: u8 = 12;
-pub const KIND_CAP: u8 = 13;
-pub const KIND_PTRACE: u8 = 14;
-pub const KIND_MEMFD: u8 = 20;
-pub const KIND_MMAP: u8 = 21;
-pub const KIND_MODULE: u8 = 22;
-pub const KIND_DPI: u8 = 30;
+// Event kinds — canonical definitions live in the ring0-abi crate (shared with
+// ring0-ebpf); re-exported here for convenience.
+pub use ring0_abi::{
+    KIND_CAP, KIND_CONNECT, KIND_DPI, KIND_FILE_ACCESS, KIND_KILL, KIND_LSM, KIND_MEMFD, KIND_MMAP,
+    KIND_MODULE, KIND_PACKET, KIND_PROCESS_EXEC, KIND_PTRACE, KIND_SETUID, KIND_TLS, KIND_UNLINK,
+};
 
-/// Literal DPI signatures synced into the kernel DPI_PATTERNS map (rule id,
-/// bytes). These mirror the literal patterns of the hyperscan rule set so the
-/// fast path can observe/drop them without userspace reassembly.
+/// Literal DPI signatures synced into the kernel DPI_PATTERNS map.
+///
+/// The kernel scanner probes keys `0..N` (see `dpi_scan_packet` in
+/// ring0-ebpf), so the *map key* is the sequential index here — NOT the rule
+/// id. The parallel `BPF_DPI_RULE_IDS` array maps index → real signature rule
+/// id, which the daemon uses to look up the signature name. (Previously the
+/// rule ids themselves were used as keys, so the kernel scan range 0..64 never
+/// matched any pattern and the fast path was dead.)
 pub const BPF_DPI_SIGNATURES: &[(u32, &[u8])] = &[
     (5001, b"/bin/sh"),
     (5008, b"/etc/passwd"),
@@ -44,6 +39,10 @@ pub const BPF_DPI_SIGNATURES: &[(u32, &[u8])] = &[
     (5007, b"nmap"),
 ];
 
+/// Real signature rule id for each sequential kernel DPI pattern key above.
+/// Must stay index-aligned with `BPF_DPI_SIGNATURES`.
+pub const BPF_DPI_RULE_IDS: &[u32] = &[5001, 5008, 5009, 5010, 5013, 5017, 5018, 5005, 5006, 5007];
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct DpiPattern {
@@ -53,6 +52,14 @@ struct DpiPattern {
 
 // Plain old data: all fields are byte arrays/ints, so this is sound.
 unsafe impl aya::Pod for DpiPattern {}
+
+// aya::Pod cannot be implemented for the shared (external) FlowKey type
+// (orphan rule); a repr(transparent) local wrapper has identical layout, which
+// is all the kernel map key contract requires.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct KernelFlowKey(ring0_abi::FlowKey);
+unsafe impl aya::Pod for KernelFlowKey {}
 
 /// Looks for the compiled eBPF object produced by `cargo xtask build`.
 fn find_bpf_object() -> Option<String> {
@@ -95,18 +102,23 @@ fn default_interface() -> Option<String> {
 
 pub struct EbpfManager {
     ring_tx: broadcast::Sender<Vec<u8>>,
-    tls_ring_tx: broadcast::Sender<Vec<u8>>,
     lsm_tx: broadcast::Sender<Vec<u8>>,
     rootkit_tx: broadcast::Sender<Vec<u8>>,
-    canary_tx: broadcast::Sender<Vec<u8>>,
     privesc_tx: broadcast::Sender<Vec<u8>>,
     ebpf: Option<Ebpf>,
     loaded: Arc<AtomicBool>,
     lsm_attached: Arc<AtomicBool>,
+    /// Interfaces XDP/TC have been attached to (for periodic re-scan when new
+    /// interfaces appear or the default route moves).
+    attached_interfaces: parking_lot::Mutex<Vec<String>>,
     // software fallback for when the kernel maps are unavailable
     fallback_blocked_ips: parking_lot::Mutex<Vec<String>>,
     fallback_blocked_ports: parking_lot::Mutex<Vec<u16>>,
     fallback_dns_domains: parking_lot::Mutex<Vec<String>>,
+    /// Stop flags + join handles for the ring-buffer reader threads so
+    /// `detach()` can terminate them instead of leaving them spinning.
+    ring_stops: Vec<Arc<AtomicBool>>,
+    ring_handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 fn make_channels() -> (
@@ -114,29 +126,24 @@ fn make_channels() -> (
     broadcast::Sender<Vec<u8>>,
     broadcast::Sender<Vec<u8>>,
     broadcast::Sender<Vec<u8>>,
-    broadcast::Sender<Vec<u8>>,
-    broadcast::Sender<Vec<u8>>,
 ) {
     let (ring_tx, _) = broadcast::channel(4096);
-    let (tls_tx, _) = broadcast::channel(4096);
     let (lsm_tx, _) = broadcast::channel(1024);
     let (rootkit_tx, _) = broadcast::channel(1024);
-    let (canary_tx, _) = broadcast::channel(1024);
     let (privesc_tx, _) = broadcast::channel(1024);
-    (ring_tx, tls_tx, lsm_tx, rootkit_tx, canary_tx, privesc_tx)
+    (ring_tx, lsm_tx, rootkit_tx, privesc_tx)
 }
 
 impl EbpfManager {
-    pub fn load() -> Result<Self> {
-        let (ring_tx, tls_ring_tx, lsm_tx, rootkit_tx, canary_tx, privesc_tx) = make_channels();
+    pub fn load(lsm_enforce: bool) -> Result<Self> {
+        let (ring_tx, lsm_tx, rootkit_tx, privesc_tx) = make_channels();
 
         match Self::load_real(
             ring_tx.clone(),
-            tls_ring_tx.clone(),
             lsm_tx.clone(),
             rootkit_tx.clone(),
-            canary_tx.clone(),
             privesc_tx.clone(),
+            lsm_enforce,
         ) {
             Ok(mgr) => {
                 info!("eBPF manager initialized — real programs loaded");
@@ -146,17 +153,18 @@ impl EbpfManager {
                 warn!("eBPF load failed: {e:?} — continuing with fallback enforcement");
                 Ok(Self {
                     ring_tx,
-                    tls_ring_tx,
                     lsm_tx,
                     rootkit_tx,
-                    canary_tx,
                     privesc_tx,
                     ebpf: None,
                     loaded: Arc::new(AtomicBool::new(false)),
                     lsm_attached: Arc::new(AtomicBool::new(false)),
+                    attached_interfaces: parking_lot::Mutex::new(Vec::new()),
                     fallback_blocked_ips: parking_lot::Mutex::new(Vec::new()),
                     fallback_blocked_ports: parking_lot::Mutex::new(Vec::new()),
                     fallback_dns_domains: parking_lot::Mutex::new(Vec::new()),
+                    ring_stops: Vec::new(),
+                    ring_handles: Vec::new(),
                 })
             }
         }
@@ -164,11 +172,10 @@ impl EbpfManager {
 
     fn load_real(
         ring_tx: broadcast::Sender<Vec<u8>>,
-        tls_ring_tx: broadcast::Sender<Vec<u8>>,
         lsm_tx: broadcast::Sender<Vec<u8>>,
         rootkit_tx: broadcast::Sender<Vec<u8>>,
-        canary_tx: broadcast::Sender<Vec<u8>>,
         privesc_tx: broadcast::Sender<Vec<u8>>,
+        lsm_enforce: bool,
     ) -> Result<Self> {
         let path =
             find_bpf_object().context("eBPF object not found — run `cargo xtask build` first")?;
@@ -181,23 +188,29 @@ impl EbpfManager {
             .load_file(&path)
             .context("failed to load BPF program")?;
 
-        // ── Attach XDP to the default interface ──
+        let attached_interfaces = parking_lot::Mutex::new(Vec::new());
+
+        // ── Attach XDP + TC to the default interface ──
         if let Some(iface) = default_interface() {
             match attach_xdp(&mut ebpf, &iface) {
                 Ok(()) => info!("XDP attached on {iface}"),
                 Err(e) => warn!("XDP attach failed on {iface}: {e}"),
             }
-        } else {
-            warn!("no default interface found — XDP not attached");
-        }
-
-        // ── Attach TC classifier (egress monitor) ──
-        if let Some(iface) = default_interface() {
             match attach_tc(&mut ebpf, &iface) {
                 Ok(()) => info!("TC classifier attached on {iface}"),
                 Err(e) => warn!("TC attach failed on {iface}: {e}"),
             }
+            attached_interfaces.lock().push(iface);
+        } else {
+            warn!("no default interface found — XDP not attached");
         }
+        // F7: the XDP/TC fast path filters IPv4 (incl. stacked 802.1Q VLAN)
+        // only. IPv6 (0x86dd) traffic is passed without IP/port/DNS/DPI checks,
+        // and block_ip ignores V6 addresses — document the gap explicitly so
+        // it is not mistaken for a working IPv6 blocklist.
+        warn!(
+            "IPv6 traffic is NOT filtered by the XDP/TC fast path — IPv6-blocked hosts remain reachable (IPv4 + VLAN filtering is active)"
+        );
 
         // ── Attach BTF tracepoints (looked up by ELF section name) ──
         //
@@ -206,22 +219,31 @@ impl EbpfManager {
         // so raw/btf tracepoint programs can only attach to `sys_enter`. The
         // eBPF program dispatches on the syscall number internally.
         for name in ["tp_btf/sched_process_exec", "tp_btf/sys_enter"] {
-            match attach_tracepoint(&mut ebpf, name) {
+            match attach_tracepoint(&mut ebpf, name, &btf) {
                 Ok(()) => {}
                 Err(e) => warn!("tracepoint {name} attach failed: {e}"),
             }
         }
 
         // ── Attach LSM programs (by section name) ──
+        // NOTE: lsm/file_open is a compile-time no-op and is eliminated from
+        // the object entirely — do not request it here.
+        // `lsm/capable` and `lsm/ptrace_access_check` run on system-wide hot
+        // paths (every capability check, every ptrace access check) and emit a
+        // ring event per hit even in audit mode. Under normal operation that
+        // is a runaway event source (each event is written to storage by the
+        // daemon), so they are only attached when the user explicitly enables
+        // enforcement. `socket_connect` is fully audit-gated (returns 0 before
+        // doing any work) and stays attached for blocklist enforcement.
         let mut lsm_ok = false;
-        for name in [
-            "lsm/file_open",
-            "lsm/bprm_check",
-            "lsm/socket_connect",
-            "lsm/ptrace_access_check",
-            "lsm/capable",
-        ] {
-            match attach_lsm(&mut ebpf, name) {
+        let mut lsm_names: Vec<&str> = vec!["lsm/bprm_check", "lsm/socket_connect"];
+        if lsm_enforce {
+            lsm_names.extend(["lsm/ptrace_access_check", "lsm/capable"]);
+        } else {
+            info!("LSM ptrace/capable hooks not attached (audit storm risk) — set RING0_LSM_ENFORCE=1 to enable");
+        }
+        for name in lsm_names {
+            match attach_lsm(&mut ebpf, name, &btf) {
                 Ok(()) => lsm_ok = true,
                 Err(e) => warn!("LSM {name} attach failed: {e}"),
             }
@@ -234,41 +256,45 @@ impl EbpfManager {
         }
 
         // ── Spawn ring buffer readers ──
-        spawn_ring_reader(&mut ebpf, "RING_BUF", ring_tx.clone());
-        spawn_ring_reader(&mut ebpf, "LSM_EVENTS", lsm_tx.clone());
-        spawn_ring_reader(&mut ebpf, "ROOTKIT_EVENTS", rootkit_tx.clone());
-        spawn_ring_reader(&mut ebpf, "PRIVESC_EVENTS", privesc_tx.clone());
+        let mut ring_stops = Vec::new();
+        let mut ring_handles = Vec::new();
+        for (map_name, tx) in [
+            ("RING_BUF", ring_tx.clone()),
+            ("LSM_EVENTS", lsm_tx.clone()),
+            ("ROOTKIT_EVENTS", rootkit_tx.clone()),
+            ("PRIVESC_EVENTS", privesc_tx.clone()),
+        ] {
+            if let Some((stop, handle)) = spawn_ring_reader(&mut ebpf, map_name, tx) {
+                ring_stops.push(stop);
+                ring_handles.push(handle);
+            }
+        }
 
         Ok(Self {
             ring_tx,
-            tls_ring_tx,
             lsm_tx: lsm_tx.clone(),
             rootkit_tx: rootkit_tx.clone(),
-            canary_tx: canary_tx.clone(),
             privesc_tx: privesc_tx.clone(),
             ebpf: Some(ebpf),
             loaded: Arc::new(AtomicBool::new(true)),
             lsm_attached: Arc::new(AtomicBool::new(lsm_ok)),
+            attached_interfaces,
             fallback_blocked_ips: parking_lot::Mutex::new(Vec::new()),
             fallback_blocked_ports: parking_lot::Mutex::new(Vec::new()),
             fallback_dns_domains: parking_lot::Mutex::new(Vec::new()),
+            ring_stops,
+            ring_handles,
         })
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
         self.ring_tx.subscribe()
     }
-    pub fn subscribe_tls(&self) -> broadcast::Receiver<Vec<u8>> {
-        self.tls_ring_tx.subscribe()
-    }
     pub fn subscribe_lsm(&self) -> broadcast::Receiver<Vec<u8>> {
         self.lsm_tx.subscribe()
     }
     pub fn subscribe_rootkit(&self) -> broadcast::Receiver<Vec<u8>> {
         self.rootkit_tx.subscribe()
-    }
-    pub fn subscribe_canary(&self) -> broadcast::Receiver<Vec<u8>> {
-        self.canary_tx.subscribe()
     }
     pub fn subscribe_privesc(&self) -> broadcast::Receiver<Vec<u8>> {
         self.privesc_tx.subscribe()
@@ -297,13 +323,25 @@ impl EbpfManager {
 
     pub fn block_binary(&mut self, name: &str) -> Result<()> {
         if let Some(ebpf) = self.ebpf.as_mut() {
-            if let Some(map) = ebpf.map_mut("BLOCKED_BINARIES") {
+            // Insert BOTH the full path (matched by the userspace exec
+            // handler via `binary_blocked`) AND the basename (matched by
+            // the kernel LSM `bprm_check`, which only has the 16-byte
+            // `comm` — a full path can never match a comm prefix).
+            for key_name in [
+                name,
+                Path::new(name)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(name),
+            ] {
                 let mut key = [0u8; 64];
-                let b = name.as_bytes();
+                let b = key_name.as_bytes();
                 let n = b.len().min(63);
                 key[..n].copy_from_slice(&b[..n]);
-                if let Ok(mut map) = HashMap::<&mut MapData, [u8; 64], u8>::try_from(map) {
-                    map.insert(&key, &1, 0)?;
+                if let Some(map) = ebpf.map_mut("BLOCKED_BINARIES") {
+                    if let Ok(mut map) = HashMap::<&mut MapData, [u8; 64], u8>::try_from(map) {
+                        map.insert(&key, &1, 0)?;
+                    }
                 }
             }
         }
@@ -312,13 +350,21 @@ impl EbpfManager {
 
     pub fn unblock_binary(&mut self, name: &str) -> Result<()> {
         if let Some(ebpf) = self.ebpf.as_mut() {
-            if let Some(map) = ebpf.map_mut("BLOCKED_BINARIES") {
+            for key_name in [
+                name,
+                Path::new(name)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(name),
+            ] {
                 let mut key = [0u8; 64];
-                let b = name.as_bytes();
+                let b = key_name.as_bytes();
                 let n = b.len().min(63);
                 key[..n].copy_from_slice(&b[..n]);
-                if let Ok(mut map) = HashMap::<&mut MapData, [u8; 64], u8>::try_from(map) {
-                    let _ = map.remove(&key);
+                if let Some(map) = ebpf.map_mut("BLOCKED_BINARIES") {
+                    if let Ok(mut map) = HashMap::<&mut MapData, [u8; 64], u8>::try_from(map) {
+                        let _ = map.remove(&key);
+                    }
                 }
             }
         }
@@ -330,7 +376,7 @@ impl EbpfManager {
             let inserted = if let Some(ebpf) = self.ebpf.as_mut() {
                 if let Some(map) = ebpf.map_mut("BLOCKED_IPS") {
                     if let Ok(mut map) = LpmTrie::<&mut MapData, u32, u8>::try_from(map) {
-                        let key = LpmTrieKey::new(32, u32::from(v4));
+                        let key = LpmTrieKey::new(32, u32::from_be(u32::from(v4)));
                         map.insert(&key, &1, 0)?;
                         true
                     } else {
@@ -342,23 +388,35 @@ impl EbpfManager {
             } else {
                 false
             };
+            // Mirror into the reporting list on BOTH outcomes so status views
+            // (blocked_ips / DaemonStatus) reflect reality whether or not the
+            // kernel map insert succeeded (previously the list was only
+            // populated on kernel failure, making status under-report).
+            let mut list = self.fallback_blocked_ips.lock();
+            let s = ip.to_string();
+            if !list.contains(&s) {
+                list.push(s);
+            }
             if !inserted {
-                let mut list = self.fallback_blocked_ips.lock();
-                let s = ip.to_string();
-                if !list.contains(&s) {
-                    list.push(s);
-                }
+                warn!("kernel BLOCKED_IPS insert failed for {ip} — enforcement degraded to userspace mirror only");
             }
             info!("blocked {ip}");
+        } else {
+            // IPv6 enforcement is not implemented in the XDP/TC fast path
+            // (documented limitation). A silent no-op here would make an
+            // administrator believe ::1/::ffff blocks are effective.
+            warn!(
+                "IPv6 address {ip}: blocking IPv6 is not supported by the XDP/TC fast path — request ignored"
+            );
         }
         Ok(())
     }
     pub fn unblock_ip(&mut self, ip: IpAddr) -> Result<()> {
         if let IpAddr::V4(v4) = ip {
-            let removed = if let Some(ebpf) = self.ebpf.as_mut() {
+            let _removed = if let Some(ebpf) = self.ebpf.as_mut() {
                 if let Some(map) = ebpf.map_mut("BLOCKED_IPS") {
                     if let Ok(mut map) = LpmTrie::<&mut MapData, u32, u8>::try_from(map) {
-                        let key = LpmTrieKey::new(32, u32::from(v4));
+                        let key = LpmTrieKey::new(32, u32::from_be(u32::from(v4)));
                         let _ = map.remove(&key);
                         true
                     } else {
@@ -370,12 +428,13 @@ impl EbpfManager {
             } else {
                 false
             };
-            if !removed {
-                let mut list = self.fallback_blocked_ips.lock();
-                let s = ip.to_string();
-                list.retain(|x| x != &s);
-            }
+            // Always remove from the reporting mirror.
+            let mut list = self.fallback_blocked_ips.lock();
+            let s = ip.to_string();
+            list.retain(|x| x != &s);
             info!("unblocked {ip}");
+        } else {
+            warn!("IPv6 address {ip}: IPv6 blocking is not supported — nothing to unblock");
         }
         Ok(())
     }
@@ -456,7 +515,7 @@ impl EbpfManager {
             if let Some(map) = ebpf.map_mut("BLOCKED_IPS") {
                 if let Ok(mut map) = LpmTrie::<&mut MapData, u32, u8>::try_from(map) {
                     for (ip, prefix) in cidrs {
-                        let key = LpmTrieKey::new(*prefix as u32, *ip);
+                        let key = LpmTrieKey::new(*prefix as u32, u32::from_be(*ip));
                         if map.insert(&key, &1, 0).is_ok() {
                             added += 1;
                         }
@@ -464,13 +523,19 @@ impl EbpfManager {
                 }
             }
         }
+        // Mirror into the reporting list on BOTH outcomes so status views
+        // (blocked_ips / DaemonStatus) reflect reality whether or not the
+        // kernel map insert succeeded (previously the list was only
+        // populated on kernel failure, making status under-report).
+        // Dedup via HashSet — `list.contains` per entry is O(n²) and a feed
+        // with 100k CIDRs stalls the daemon for minutes.
         let mut list = self.fallback_blocked_ips.lock();
+        let mut seen: std::collections::HashSet<String> = list.iter().cloned().collect();
         for (ip, prefix) in cidrs {
             let s = format!("{}/{}", std::net::Ipv4Addr::from(*ip), prefix);
-            if !list.contains(&s) {
-                list.push(s);
-            }
+            seen.insert(s);
         }
+        *list = seen.into_iter().collect();
         added
     }
 
@@ -490,11 +555,11 @@ impl EbpfManager {
             }
         }
         let mut list = self.fallback_dns_domains.lock();
+        let mut seen: std::collections::HashSet<String> = list.iter().cloned().collect();
         for d in domains {
-            if !list.contains(d) {
-                list.push(d.clone());
-            }
+            seen.insert(d.clone());
         }
+        *list = seen.into_iter().collect();
         added
     }
 
@@ -513,11 +578,11 @@ impl EbpfManager {
             }
         }
         let mut list = self.fallback_blocked_ports.lock();
+        let mut seen: std::collections::HashSet<u16> = list.iter().copied().collect();
         for p in ports {
-            if !list.contains(p) {
-                list.push(*p);
-            }
+            seen.insert(*p);
         }
+        *list = seen.into_iter().collect();
         added
     }
 
@@ -527,19 +592,29 @@ impl EbpfManager {
     }
 
     /// Sync the literal DPI patterns into the kernel DPI_PATTERNS map.
+    ///
+    /// Patterns are stored under *sequential* keys 0..N because the kernel
+    /// scanner iterates that range (see `dpi_scan_packet`). The real signature
+    /// rule id for each index lives in `BPF_DPI_RULE_IDS`, index-aligned with
+    /// `BPF_DPI_SIGNATURES`.
     pub fn sync_dpi_patterns(&mut self, patterns: &[(u32, &[u8])]) -> usize {
+        debug_assert_eq!(
+            patterns.len(),
+            BPF_DPI_RULE_IDS.len(),
+            "BPF_DPI_RULE_IDS must stay index-aligned with BPF_DPI_SIGNATURES"
+        );
         let mut added = 0usize;
         if let Some(ebpf) = self.ebpf.as_mut() {
             if let Some(map) = ebpf.map_mut("DPI_PATTERNS") {
                 if let Ok(mut map) = HashMap::<&mut MapData, u32, DpiPattern>::try_from(map) {
-                    for (rule_id, bytes) in patterns {
+                    for (idx, (_rule_id, bytes)) in patterns.iter().enumerate() {
                         let n = bytes.len().min(32);
                         let mut pat = DpiPattern {
                             len: n as u8,
                             data: [0u8; 32],
                         };
                         pat.data[..n].copy_from_slice(&bytes[..n]);
-                        if map.insert(rule_id, &pat, 0).is_ok() {
+                        if map.insert(idx as u32, &pat, 0).is_ok() {
                             added += 1;
                         }
                     }
@@ -571,51 +646,182 @@ impl EbpfManager {
         self.fallback_blocked_ports.lock().len()
     }
 
+    /// Toggle per-packet event sampling in the kernel. `enabled=false`
+    /// (governor critical) writes key 1 value 0 to SAMPLING_ENABLED, which
+    /// suppresses PacketEvent emission while keeping all block checks active.
+    pub fn set_sampling_enabled(&mut self, enabled: bool) {
+        if let Some(ebpf) = self.ebpf.as_mut() {
+            if let Some(map) = ebpf.map_mut("SAMPLING_ENABLED") {
+                if let Ok(mut map) = HashMap::<&mut MapData, u32, u8>::try_from(map) {
+                    if enabled {
+                        let _ = map.remove(&1);
+                    } else {
+                        let _ = map.insert(&1, &0, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mark a 5-tuple as established/trusted in the kernel `ESTABLISHED_FLOWS`
+    /// map so the XDP/TC fast path skips per-packet DPI + event emission for
+    /// that flow. This is what makes "flow offloaded" real: previously the
+    /// kernel map was never populated, so no flow was ever skipped.
+    pub fn mark_flow_established(&mut self, key: &ring0_abi::FlowKey) -> Result<()> {
+        if let Some(ebpf) = self.ebpf.as_mut() {
+            if let Some(map) = ebpf.map_mut("ESTABLISHED_FLOWS") {
+                if let Ok(mut map) = HashMap::<&mut MapData, KernelFlowKey, u32>::try_from(map) {
+                    map.insert(&KernelFlowKey(*key), &1, 0)?;
+                    return Ok(());
+                }
+                anyhow::bail!("ESTABLISHED_FLOWS map type mismatch");
+            }
+            anyhow::bail!("ESTABLISHED_FLOWS map not found");
+        }
+        // Fallback mode (no kernel programs): nothing to mark; offload is a
+        // userspace-only mirror.
+        Ok(())
+    }
+
     pub fn detach(&mut self) {
+        // E22: signal the ring-reader threads and join them so they don't
+        // spin forever after the programs are unloaded (they wake within ~1ms).
+        for stop in &self.ring_stops {
+            stop.store(true, Ordering::Relaxed);
+        }
+        for handle in self.ring_handles.drain(..) {
+            let _ = handle.join();
+        }
         // Dropping the Ebpf object detaches all programs.
         if let Some(ebpf) = self.ebpf.take() {
             drop(ebpf);
             info!("eBPF programs detached");
         }
     }
+
+    /// Periodically re-scan the system for up, non-loopback interfaces and
+    /// attach XDP/TC to any that are not yet covered. Previously enforcement
+    /// was bound to the single default-route interface at startup, so a
+    /// Wi-Fi→cellular/VPN route switch silently moved traffic onto an
+    /// unattached interface.
+    pub fn scan_interfaces(&mut self) {
+        if self.ebpf.is_none() {
+            return;
+        }
+        let mut attached = self.attached_interfaces.lock();
+        for iface in list_up_interfaces() {
+            if attached.contains(&iface) {
+                continue;
+            }
+            if let Some(ebpf) = self.ebpf.as_mut() {
+                match attach_xdp(ebpf, &iface) {
+                    Ok(()) => {
+                        let _ = attach_tc(ebpf, &iface);
+                        info!("XDP/TC attached on newly seen interface {iface}");
+                        attached.push(iface.clone());
+                    }
+                    Err(e) => {
+                        // Not every driver supports XDP; don't re-try forever,
+                        // but remember it so we only warn once per interface.
+                        attached.push(iface.clone());
+                        warn!("XDP attach skipped on {iface}: {e}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Enumerate up, non-loopback interfaces from /sys/class/net.
+fn list_up_interfaces() -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/sys/class/net") else {
+        return out;
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "lo" {
+            continue;
+        }
+        let operstate =
+            std::fs::read_to_string(format!("/sys/class/net/{name}/operstate")).unwrap_or_default();
+        if operstate.trim() == "up" {
+            out.push(name);
+        }
+    }
+    out
 }
 
 type LpmTrieKey = aya::maps::lpm_trie::Key<u32>;
 
 fn attach_xdp(ebpf: &mut Ebpf, iface: &str) -> Result<()> {
+    // aya 0.14 names programs by their ELF symbol (the Rust fn name), NOT the
+    // section name — `program_mut("xdp")` never matched and no program ever
+    // attached, silently disabling all kernel enforcement.
     let program: &mut Xdp = ebpf
-        .program_mut("xdp")
+        .program_mut("ring0_xdp")
         .context("xdp program not found")?
         .try_into()?;
+    program.load()?; // aya >= 0.13 requires an explicit load before attach
     program.attach(iface, XdpMode::default())?;
     Ok(())
 }
 
 fn attach_tc(ebpf: &mut Ebpf, iface: &str) -> Result<()> {
     use aya::programs::tc;
-    tc::qdisc_add_clsact(iface)?;
+    // clsact is not idempotent to add: a daemon restart (or scan_interfaces
+    // re-run) hits "Exclusivity flag on, cannot modify" because the qdisc
+    // already exists — treat "already attached" as success.
+    if let Err(e) = tc::qdisc_add_clsact(iface) {
+        let already = matches!(&e, aya::programs::tc::TcError::AlreadyAttached)
+            || e.to_string().contains("Exclusivity");
+        if !already {
+            return Err(e.into());
+        }
+    }
     let program: &mut SchedClassifier = ebpf
-        .program_mut("classifier")
+        .program_mut("ring0_tc")
         .context("tc classifier not found")?
         .try_into()?;
+    program.load()?; // aya >= 0.13 requires an explicit load before attach
     program.attach(iface, TcAttachType::Ingress)?;
     Ok(())
 }
 
-fn attach_tracepoint(ebpf: &mut Ebpf, name: &str) -> Result<()> {
+fn attach_tracepoint(ebpf: &mut Ebpf, name: &str, btf: &aya::Btf) -> Result<()> {
+    // Section name -> (program symbol, tracepoint name). aya 0.14 names
+    // programs by symbol and BtfTracePoint::load requires the BTF id of the
+    // kernel tracepoint.
+    let (symbol, tp) = match name {
+        "tp_btf/sched_process_exec" => ("ring0_sched_exec", "sched_process_exec"),
+        "tp_btf/sys_enter" => ("ring0_sys_enter", "sys_enter"),
+        other => (other, other),
+    };
     let program: &mut BtfTracePoint = ebpf
-        .program_mut(name)
+        .program_mut(symbol)
         .context("program not found")?
         .try_into()?;
+    program.load(tp, btf)?;
     program.attach()?;
     Ok(())
 }
 
-fn attach_lsm(ebpf: &mut Ebpf, name: &str) -> Result<()> {
+fn attach_lsm(ebpf: &mut Ebpf, name: &str, btf: &aya::Btf) -> Result<()> {
+    // Section name -> (program symbol, LSM hook name). aya 0.14 names
+    // programs by symbol and Lsm::load requires the bpf_lsm_* hook BTF id.
+    let (symbol, hook) = match name {
+        "lsm/file_open" => ("ring0_lsm_file_open", "file_open"),
+        "lsm/bprm_check" => ("ring0_lsm_bprm_check", "bprm_check"),
+        "lsm/socket_connect" => ("ring0_lsm_socket_connect", "socket_connect"),
+        "lsm/ptrace_access_check" => ("ring0_lsm_ptrace", "ptrace_access_check"),
+        "lsm/capable" => ("ring0_lsm_capable", "capable"),
+        other => (other, other),
+    };
     let program: &mut Lsm = ebpf
-        .program_mut(name)
+        .program_mut(symbol)
         .context("program not found")?
         .try_into()?;
+    program.load(hook, btf)?;
     program.attach()?;
     Ok(())
 }
@@ -624,22 +830,28 @@ fn attach_uprobes(ebpf: &mut Ebpf) -> Result<()> {
     use aya::programs::uprobe::UProbeScope;
     use aya::programs::UProbe;
     let libssl = find_libssl()?;
-    let program: &mut UProbe = ebpf
-        .program_mut("uprobe")
-        .context("uprobe program not found")?
-        .try_into()?;
-    // The uprobe section covers both ssl_write and ssl_read hooks.
-    match program.attach("SSL_write", &libssl, UProbeScope::AllProcesses) {
-        Ok(_) => {
-            let _ = program.attach("SSL_read", &libssl, UProbeScope::AllProcesses);
+    // Each #[uprobe] fn is its own program named by symbol (aya 0.14).
+    // Attach both independently; a failure on one must not drop the other.
+    let pairs = [
+        ("ring0_ssl_write", "SSL_write"),
+        ("ring0_ssl_read", "SSL_read"),
+    ];
+    for (symbol, fn_name) in pairs {
+        let result = (|| -> Result<()> {
+            let program: &mut UProbe = ebpf
+                .program_mut(symbol)
+                .with_context(|| format!("uprobe program {symbol} not found"))?
+                .try_into()?;
+            program.load()?; // aya >= 0.13 requires an explicit load
+            program.attach(fn_name, &libssl, UProbeScope::AllProcesses)?;
             Ok(())
-        }
-        Err(e) => {
-            let _ = program.attach("SSL_read", &libssl, UProbeScope::AllProcesses);
-            warn!("TLS uprobe attach failed: {e}");
-            Ok(())
+        })();
+        match result {
+            Ok(()) => info!("uprobe {symbol} -> {fn_name} attached"),
+            Err(e) => warn!("uprobe {symbol} attach failed: {e}"),
         }
     }
+    Ok(())
 }
 
 fn find_libssl() -> Result<String> {
@@ -656,29 +868,41 @@ fn find_libssl() -> Result<String> {
     anyhow::bail!("libssl not found")
 }
 
-fn spawn_ring_reader(ebpf: &mut Ebpf, map_name: &str, tx: broadcast::Sender<Vec<u8>>) {
-    let Some(map) = ebpf.take_map(map_name) else {
-        warn!("ring buffer map {map_name} not found");
-        return;
-    };
+fn spawn_ring_reader(
+    ebpf: &mut Ebpf,
+    map_name: &str,
+    tx: broadcast::Sender<Vec<u8>>,
+) -> Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)> {
+    let map = ebpf.take_map(map_name)?;
     let mut ring = match RingBuf::try_from(map) {
         Ok(r) => r,
         Err(e) => {
             warn!("ring buffer {map_name} setup failed: {e}");
-            return;
+            return None;
         }
     };
-    std::thread::Builder::new()
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = stop.clone();
+    let handle = std::thread::Builder::new()
         .name(format!("ring0-{map_name}-reader"))
-        .spawn(move || loop {
-            while let Some(item) = ring.next() {
-                let bytes = item.to_vec();
-                if tx.send(bytes).is_err() {
-                    return;
+        .spawn(move || {
+            while !stop_for_thread.load(Ordering::Relaxed) {
+                while let Some(item) = ring.next() {
+                    let bytes = item.to_vec();
+                    // The broadcast channel drops messages when there are no
+                    // receivers; a send error must NOT kill the reader. The
+                    // daemon's run loop subscribes a moment after this reader
+                    // starts (the attach phase races the subscription), and an
+                    // exec/packet event in that window used to terminate the
+                    // RING_BUF reader permanently — after which the daemon ran
+                    // with zero live packet/process events while the "ring
+                    // reader started" log said otherwise.
+                    let _ = tx.send(bytes);
                 }
+                std::thread::sleep(Duration::from_millis(1));
             }
-            std::thread::sleep(Duration::from_millis(1));
         })
-        .ok();
+        .ok()?;
     info!("ring reader started for {map_name}");
+    Some((stop, handle))
 }
