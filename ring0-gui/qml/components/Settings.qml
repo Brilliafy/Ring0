@@ -3,14 +3,16 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Controls.Material 2.15
 
+// Settings panel. Every control here is either wired to the daemon through the
+// bridge, or clearly informational. (The previous Slack/Discord/Syslog
+// "SIEM exporters" fields were cosmetic — the daemon had no such feature, so
+// they were removed rather than pretending to configure them.)
 Rectangle {
     id: settingsRoot
     color: "#161b22"
     radius: 6
     border.color: "#30363d"
     border.width: 1
-
-    property bool darkMode: true
 
     ColumnLayout {
         anchors.fill: parent
@@ -30,28 +32,79 @@ Rectangle {
             color: "#30363d"
         }
 
-        // Appearance
-        Label { text: "Appearance"; color: "#d2a8ff"; font.pixelSize: 13; font.bold: true }
+        // ── Enforcement mode (informational — set at daemon start) ──
+        Label { text: "Detection Modes"; color: "#d2a8ff"; font.pixelSize: 13; font.bold: true }
+        Label {
+            Layout.fillWidth: true
+            wrapMode: Text.WordWrap
+            color: "#8b949e"
+            font.pixelSize: 11
+            text: "LSM (ptrace/capable) and fast-path DPI default to AUDIT — they report matches and never break the flow. "
+                  + "To drop matching traffic / deny capability usage, restart the daemon with RING0_DPI_ENFORCE=1 and/or RING0_LSM_ENFORCE=1."
+        }
+
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 1
+            color: "#30363d"
+        }
+
+        // ── Response: block / kill ──
+        Label { text: "Threat Response"; color: "#d2a8ff"; font.pixelSize: 13; font.bold: true }
 
         RowLayout {
             Layout.fillWidth: true
-            spacing: 12
-            Label { text: "Theme:"; color: "#8b949e"; font.pixelSize: 12 }
-            ButtonGroup { id: themeGroup }
-            RadioButton {
-                text: "Dark"; checked: true
-                ButtonGroup.group: themeGroup
-                onCheckedChanged: if (checked) { settingsRoot.darkMode = true }
+            spacing: 8
+            TextField {
+                id: blockIpField
+                placeholderText: "IP address (e.g. 10.0.0.1)"
+                color: "#c9d1d9"
+                placeholderTextColor: "#484f58"
+                background: Rectangle { color: "#0d1117"; radius: 4; border.color: "#30363d"; border.width: 1 }
+                Layout.fillWidth: true
+                Layout.preferredHeight: 28
             }
-            RadioButton {
-                text: "Light"
-                ButtonGroup.group: themeGroup
-                onCheckedChanged: if (checked) { settingsRoot.darkMode = false }
+            Button {
+                text: "Block IP"
+                highlighted: true
+                onClicked: {
+                    if (blockIpField.text.trim().length > 0) {
+                        bridge.blockIp(blockIpField.text.trim())
+                        settingsStatus.text = "Block sent (requires root/ring0)"
+                    }
+                }
+            }
+            Button {
+                text: "Unblock"
+                flat: true
+                onClicked: {
+                    if (blockIpField.text.trim().length > 0) {
+                        bridge.unblockIp(blockIpField.text.trim())
+                        settingsStatus.text = "Unblock sent (requires root/ring0)"
+                    }
+                }
+            }
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 8
+            Label { text: "Reload rules:"; color: "#8b949e"; font.pixelSize: 12 }
+            Button {
+                text: "Reload"
+                onClicked: {
+                    bridge.reloadRules()
+                    settingsStatus.text = "Reload sent"
+                }
             }
             Item { Layout.fillWidth: true }
-            Switch {
-                text: "System Tray Notifications"
-                checked: true
+            Button {
+                text: "Shutdown Daemon"
+                flat: true
+                onClicked: {
+                    bridge.shutdownDaemon()
+                    settingsStatus.text = "Shutdown sent"
+                }
             }
         }
 
@@ -61,65 +114,15 @@ Rectangle {
             color: "#30363d"
         }
 
-        // SIEM Exporters
-        Label { text: "SIEM & Telemetry Exporters"; color: "#d2a8ff"; font.pixelSize: 13; font.bold: true }
-
-        GridLayout {
-            columns: 2
-            columnSpacing: 12
-            rowSpacing: 8
-            Layout.fillWidth: true
-
-            Label { text: "Syslog Endpoint:"; color: "#8b949e"; font.pixelSize: 12 }
-            TextField {
-                id: syslogEndpoint
-                placeholderText: "logs.example.com"
-                color: "#c9d1d9"
-                placeholderTextColor: "#484f58"
-                background: Rectangle { color: "#0d1117"; radius: 4; border.color: "#30363d"; border.width: 1 }
-                Layout.fillWidth: true
-                Layout.preferredHeight: 28
-            }
-
-            Label { text: "Syslog Port:"; color: "#8b949e"; font.pixelSize: 12 }
-            SpinBox {
-                id: syslogPort
-                from: 1; to: 65535; value: 514
-                editable: true
-                Layout.preferredWidth: 100
-            }
-
-            Label { text: "Slack Webhook:"; color: "#8b949e"; font.pixelSize: 12 }
-            TextField {
-                id: slackWebhook
-                placeholderText: "https://hooks.slack.com/services/..."
-                color: "#c9d1d9"
-                placeholderTextColor: "#484f58"
-                background: Rectangle { color: "#0d1117"; radius: 4; border.color: "#30363d"; border.width: 1 }
-                Layout.fillWidth: true
-                Layout.preferredHeight: 28
-            }
-
-            Label { text: "Discord Webhook:"; color: "#8b949e"; font.pixelSize: 12 }
-            TextField {
-                id: discordWebhook
-                placeholderText: "https://discord.com/api/webhooks/..."
-                color: "#c9d1d9"
-                placeholderTextColor: "#484f58"
-                background: Rectangle { color: "#0d1117"; radius: 4; border.color: "#30363d"; border.width: 1 }
-                Layout.fillWidth: true
-                Layout.preferredHeight: 28
-            }
-        }
-
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.preferredHeight: 1
-            color: "#30363d"
-        }
-
-        // Sensitivity & Thresholds
+        // ── Sensitivity (sent to the daemon; daemon-side persistence is TODO) ──
         Label { text: "Sensitivity & Thresholds"; color: "#d2a8ff"; font.pixelSize: 13; font.bold: true }
+        Label {
+            Layout.fillWidth: true
+            wrapMode: Text.WordWrap
+            color: "#484f58"
+            font.pixelSize: 10
+            text: "Note: the daemon currently logs these values; live enforcement wiring is not implemented yet."
+        }
 
         GridLayout {
             columns: 3
@@ -135,23 +138,6 @@ Rectangle {
                 Layout.preferredHeight: 20
             }
             Label { text: cpuSlider.value.toFixed(1) + "%"; color: "#c9d1d9"; font.pixelSize: 12 }
-
-            Label { text: "DGA Entropy Sensitivity:"; color: "#8b949e"; font.pixelSize: 12 }
-            Slider {
-                id: entropySlider
-                from: 0.0; to: 1.0; value: 0.5; stepSize: 0.05
-                Layout.fillWidth: true
-                Layout.preferredHeight: 20
-            }
-            Label { text: entropySlider.value.toFixed(2); color: "#c9d1d9"; font.pixelSize: 12 }
-
-            Label { text: "Syslog TLS:"; color: "#8b949e"; font.pixelSize: 12 }
-            CheckBox {
-                id: syslogTls
-                text: "Enable TLS"
-                checked: false
-            }
-            Item { }
         }
 
         Rectangle {
@@ -160,7 +146,7 @@ Rectangle {
             color: "#30363d"
         }
 
-        // Actions
+        // ── Actions ──
         RowLayout {
             Layout.fillWidth: true
             spacing: 12
@@ -169,23 +155,12 @@ Rectangle {
                 highlighted: true
                 onClicked: {
                     var cfg = {
-                        syslogEndpoint: syslogEndpoint.text,
-                        syslogPort: syslogPort.value,
-                        syslogTls: syslogTls.checked,
-                        slackWebhook: slackWebhook.text,
-                        discordWebhook: discordWebhook.text,
                         cpuThreshold: cpuSlider.value,
-                        dgaSensitivity: entropySlider.value,
                         darkMode: settingsRoot.darkMode
                     }
                     bridge.updateSettings(JSON.stringify(cfg))
-                    settingsStatus.text = "Saved"
+                    settingsStatus.text = "Saved (daemon logs; not yet enforced)"
                 }
-            }
-            Button {
-                text: "Export Config"
-                flat: true
-                onClicked: { /* export to file */ }
             }
             Item { Layout.fillWidth: true }
             Label {
@@ -193,13 +168,6 @@ Rectangle {
                 text: ""
                 color: "#3fb950"
                 font.pixelSize: 11
-            }
-            Button {
-                text: "Test Webhook"
-                flat: true
-                onClicked: {
-                    settingsStatus.text = "Test sent (check your channel)"
-                }
             }
         }
     }
