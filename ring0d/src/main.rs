@@ -344,7 +344,16 @@ impl Daemon {
                     self.tick_governor();
                     self.ebpf.scan_interfaces();
                 }
-                _ = fastpath_tick.tick() => { self.fastpath.purge_idle_flows(); }
+                _ = fastpath_tick.tick() => {
+                    self.fastpath.purge_idle_flows();
+                    // Per-pid TLS budget overrides only matter for live
+                    // processes; reap them every minute so short-lived
+                    // process churn (scripted curl bursts) cannot fill the
+                    // 4096-entry map and starve new pids of their budgets.
+                    // Active flows keep their allocated windows; the override
+                    // is re-established on each new connect.
+                    self.ebpf.clear_pid_budgets();
+                }
                 _ = prompt_tick.tick() => { self.prompt.check_timeouts(); }
                 _ = blocklist_tick.tick() => { self.apply_blocklist_payload().await; }
                 Some(cmd) = self.cmd_rx.recv() => { self.handle_command(cmd).await; }
@@ -752,8 +761,8 @@ impl Daemon {
         if raw.len() < 24 {
             return;
         }
-        let payload = if raw.len() > 28 { &raw[28..] } else { &[] };
-        let tpid = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
+        let payload = if raw.len() > 36 { &raw[36..] } else { &[] };
+        let tpid = u32::from_le_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
         for m in self.dpi.scan_payload(payload) {
             // Surface the process that triggered the match — in consumer
             // security the WHO matters as much as the bytes.

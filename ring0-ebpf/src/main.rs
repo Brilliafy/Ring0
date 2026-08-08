@@ -260,6 +260,11 @@ pub struct ModuleEvent {
 pub struct TlsEvent {
     pub kind: u8,
     pub timestamp: u64,
+    /// Stable per-connection flow identifier = (pid << 32) | ssl_low32.
+    /// Exposed now so the userspace daemon can address individual flows in a
+    /// future state machine (mute / budget-bump / strided sampling per flow)
+    /// without a ring-buffer schema break. Not yet consumed by the daemon.
+    pub flow_id: u64,
     pub pid: u32,
     pub direction: u8,
     pub len: u32,
@@ -1215,6 +1220,7 @@ fn capture_tls_event(ctx: &ProbeContext, direction: u8) {
             entry.write(TlsEvent {
                 kind: KIND_TLS,
                 timestamp: ktime_get_ns(),
+                flow_id: key,
                 pid,
                 direction,
                 len,
