@@ -15,6 +15,7 @@ capnp-rpc = "0.26"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ring0-abi = { path = "../ring0-abi" }
 ring0-common = { path = "../ring0-common" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
@@ -29,7 +30,7 @@ shellexpand = "3"
 parking_lot = "0.12"
 dashmap = "6"
 sha2 = "0.11"
-reqwest = { version = "0.13", features = ["rustls", "webpki-roots", "json"], default-features = false }
+reqwest = { version = "0.13", features = ["rustls", "webpki-roots", "json", "stream"], default-features = false }
 arc-swap = "1"
 hickory-resolver = "0.26"
 maxminddb = "0.30"
@@ -40,6 +41,7 @@ hex = "0.4"
 flate2 = "1"
 tar = "0.4"
 zbus = "5"
+zbus_polkit = "5"
 
 [dev-dependencies]
 divan = "0.1"
