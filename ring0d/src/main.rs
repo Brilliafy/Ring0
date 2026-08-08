@@ -1138,6 +1138,9 @@ impl Daemon {
                 p += self.ebpf.sync_blocked_ports(chunk);
                 tokio::task::yield_now().await;
             }
+            // Compile the Suricata-derived literal signatures into the DPI
+            // engine (observe-only). A failed compile keeps the previous set.
+            self.dpi.set_dynamic_patterns(payload.dpi_patterns.clone());
             info!("Kernel sync complete: {c} cidrs, {d} domains, {p} ports in eBPF maps");
         }
     }

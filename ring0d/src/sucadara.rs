@@ -38,6 +38,10 @@ pub struct SyncPayload {
     pub cidrs: Vec<(u32, u8)>,
     pub domains: Vec<String>,
     pub ports: Vec<u16>,
+    /// Literal `content:` signatures extracted from the Suricata ruleset,
+    /// compiled into the userspace DPI engine (observe-only). (sid, pattern,
+    /// severity).
+    pub dpi_patterns: Vec<(u32, String, u8)>,
 }
 
 pub struct SyncReport {
@@ -45,6 +49,7 @@ pub struct SyncReport {
     pub domains: usize,
     pub cidrs: usize,
     pub ports: usize,
+    pub dpi_patterns: usize,
     pub sources_ok: usize,
     pub sources_failed: usize,
 }
@@ -56,6 +61,7 @@ impl SyncReport {
             domains: 0,
             cidrs: 0,
             ports: 0,
+            dpi_patterns: 0,
             sources_ok: 0,
             sources_failed: 0,
         }
@@ -96,14 +102,34 @@ const SURICATA_RULESETS: &[(&str, &str)] = &[(
     "https://rules.emergingthreats.net/open/suricata-7.0/emerging-all.rules",
 )];
 
+/// Max literal content signatures promoted to the DPI engine from one
+/// ruleset fetch. Bounds compile time and FP surface.
+const MAX_DPI_PATTERNS: usize = 2000;
+
+/// Max bytes accepted from a blocklist feed. A hijacked or oversized feed
+/// (e.g. oisd's multi-hundred-MB list) must not exhaust daemon memory (E10).
+const MAX_FEED_BYTES: usize = 256 * 1024 * 1024;
+
 async fn fetch_text(client: &reqwest::Client, url: &str) -> Option<String> {
-    match client.get(url).send().await {
-        Ok(resp) => match resp.text().await {
-            Ok(t) => Some(t),
-            Err(_) => None,
-        },
-        Err(_) => None,
+    let resp = client.get(url).send().await.ok()?;
+    if let Some(cl) = resp.content_length() {
+        if cl > MAX_FEED_BYTES as u64 {
+            warn!("feed {url}: content-length {cl} exceeds cap {MAX_FEED_BYTES} — skipping");
+            return None;
+        }
     }
+    use futures_util::StreamExt;
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        if body.len().saturating_add(chunk.len()) > MAX_FEED_BYTES {
+            warn!("feed {url}: exceeded {MAX_FEED_BYTES} byte cap — aborting download");
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).ok()
 }
 
 /// Parse a hosts-file style blocklist (lines like `0.0.0.0 domain` or bare domains).
@@ -187,15 +213,145 @@ fn parse_ip_cidrs(text: &str, cidrs: &mut HashSet<(u32, u8)>) -> usize {
 }
 
 /// Parse a Suricata/ET rule line, extracting kernel-primitive constraints.
+///
+/// CRITICAL SEMANTIC: only `drop`/`reject` rules may feed the kernel
+/// blocklists. `alert` rules express detection intent — promoting their ports
+/// into `BLOCKED_PORTS` previously made the kernel drop ALL traffic on common
+/// ports (80/443/53/…) the moment the ET ruleset synced, a self-inflicted
+/// connectivity outage.
+/// Common Suricata port variables (ET/default fasttrack config). Rules use
+/// `$HTTP_PORTS` etc. in place of literal port lists; resolving them lets the
+/// port-blocklist catch rules that would otherwise contribute nothing.
+fn port_var(name: &str) -> &'static [u16] {
+    match name {
+        "$HTTP_PORTS" | "$SHELLCODE_PORTS" => &[80, 8080, 443],
+        "$FTP_PORTS" => &[21],
+        "$SSH_PORTS" => &[22],
+        "$SMTP_PORTS" => &[25, 465, 587],
+        "$DNS_SERVERS" => &[53],
+        "$MYSQL_PORTS" => &[3306],
+        "$ORACLE_PORTS" => &[1521],
+        "$MSSQL_PORTS" => &[1433, 1434],
+        "$SIP_PORTS" => &[5060, 5061],
+        "$RDP_PORTS" => &[3389],
+        "$TELNET_PORTS" => &[23],
+        "$POP3_PORTS" => &[110, 995],
+        "$IMAP_PORTS" => &[143, 993],
+        "$IKE_PORTS" => &[500, 4500],
+        _ => &[],
+    }
+}
+
+/// Extract blockable ports from a Suricata port token: a bare number, a
+/// bracket list `[443,8443]`, a range `1024:65535` (blocked as a range is not
+/// representable in the exact-port kernel map, so ranges are skipped), or a
+/// known `$VAR`.
+fn extract_ports_tokens(tok: &str, ports: &mut HashSet<u16>) {
+    let tok = tok.trim();
+    if tok.is_empty() || tok == "any" {
+        return;
+    }
+    let inner = tok.trim_matches(['[', ']', '"']);
+    for part in inner.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if part.starts_with('$') {
+            for &p in port_var(part) {
+                if is_blockable_port(p) {
+                    ports.insert(p);
+                }
+            }
+            continue;
+        }
+        if part.contains(':') {
+            // Range (e.g. 1024:65535) — the exact-port kernel map cannot
+            // represent it; skip rather than block one endpoint.
+            continue;
+        }
+        if let Ok(p) = part.parse::<u16>() {
+            if is_blockable_port(p) {
+                ports.insert(p);
+            }
+        }
+    }
+}
+
+/// Extract `sid:<n>;` from a rule; falls back to a FNV-derived id so
+/// DPI matches always carry a stable-ish identifier.
+fn extract_sid(line: &str) -> u32 {
+    for (i, _) in line.match_indices("sid:") {
+        let rest = &line[i + 4..];
+        let end = rest.find(';').unwrap_or(rest.len());
+        if let Ok(sid) = rest[..end].trim().parse::<u32>() {
+            return sid;
+        }
+    }
+    (fnv1a_hash(line) & 0xFFFF) as u32
+}
+
+/// First literal `content:"..."` pattern (no `|..|` hex escapes, length >= 4,
+/// printable ASCII) plus whether the `nocase` modifier follows it. Returns
+/// None when the rule's first content is hex-encoded or unsuitable.
+fn first_literal_content(line: &str) -> Option<String> {
+    for (m0, _) in line.match_indices("content:") {
+        let rest = &line[m0 + 8..];
+        let rest = rest.trim_start();
+        if !rest.starts_with('"') {
+            continue;
+        }
+        let q = &rest[1..];
+        let end = q.find('"')?;
+        let content = &q[..end];
+        if content.contains('|')
+            || content.len() < 4
+            || content.bytes().any(|b| b < 0x20 || b == 0x7f || b == b'\\')
+        {
+            return None; // hex-encoded or regex-y literal — skip the rule
+        }
+        let tail = &q[end + 1..];
+        let nocase = tail.starts_with(';') && tail[..tail.len().min(32)].contains("nocase");
+        // Hyperscan compiles these as regexes, so regex metacharacters in the
+        // literal must be escaped; `(?i)` encodes Suricata's `nocase` inline.
+        let mut pattern = String::with_capacity(content.len() + 8);
+        if nocase {
+            pattern.push_str("(?i)");
+        }
+        for c in content.chars() {
+            if "\\^$.|?*+()[]{}".contains(c) {
+                pattern.push('\\');
+            }
+            pattern.push(c);
+        }
+        return Some(pattern);
+    }
+    None
+}
+
 fn parse_suricata_rule(
     line: &str,
     cidrs: &mut HashSet<(u32, u8)>,
     ports: &mut HashSet<u16>,
     domains: &mut HashSet<String>,
+    patterns: &mut Vec<(u32, String, u8)>,
 ) -> bool {
     let line = line.trim();
-    if !line.starts_with("alert") && !line.starts_with("drop") && !line.starts_with("reject") {
+    let enforce = line.starts_with("drop") || line.starts_with("reject");
+    if !enforce && !line.starts_with("alert") {
         return false;
+    }
+    let sid = extract_sid(line);
+    // Every rule contributes its first literal `content:` signature to the
+    // DPI engine (observe-only detection), not just enforce rules.
+    if let Some(pat) = first_literal_content(line) {
+        if !patterns.iter().any(|(_, p, _)| p == &pat) {
+            patterns.push((sid, pat, if enforce { 3 } else { 2 }));
+        }
+    }
+    if !enforce {
+        // Detection-only rule: nothing may be promoted to a kernel block map.
+        return true;
     }
     // IPv4 CIDRs from ip:/srcip:/dstip: options.
     for opt in ["ip:", "srcip:", "dstip:"] {
@@ -214,19 +370,15 @@ fn parse_suricata_rule(
             }
         }
     }
-    // Ports in the rule head: `-> $EXTERNAL_NET 443,8443 (msg:...`
+    // Ports in the rule head: `-> $EXTERNAL_NET 443,8443 (msg:...` or
+    // `-> $EXTERNAL_NET [443,8443,8080]` or `-> any [1024:65535]`.
+    // Suricata allows bracket lists and ranges; bare variables ($HTTP_PORTS)
+    // resolve through the small ET-default table below.
     if let Some(arrow) = line.find("->") {
         if let Some(paren) = line.find('(') {
             let head = &line[arrow + 2..paren];
             if let Some(last_tok) = head.split_whitespace().last() {
-                for tok in last_tok.split(',') {
-                    let tok = tok.trim();
-                    if let Ok(p) = tok.parse::<u16>() {
-                        if p > 0 {
-                            ports.insert(p);
-                        }
-                    }
-                }
+                extract_ports_tokens(last_tok, ports);
             }
         }
     }
@@ -235,14 +387,7 @@ fn parse_suricata_rule(
         if let Some(start) = line.find(opt) {
             let rest = &line[start + opt.len()..];
             let end = rest.find(';').unwrap_or(rest.len());
-            for tok in rest[..end].split(',') {
-                let tok = tok.trim().trim_matches(['[', ']', '"']);
-                if let Ok(p) = tok.parse::<u16>() {
-                    if p > 0 {
-                        ports.insert(p);
-                    }
-                }
-            }
+            extract_ports_tokens(&rest[..end], ports);
         }
     }
     // DNS domains from content:"..." on rules with the dns.query keyword.
@@ -252,7 +397,9 @@ fn parse_suricata_rule(
             if let Some(q) = rest.strip_prefix('"') {
                 let end = q.find('"').unwrap_or(q.len());
                 let content = &q[..end];
-                // A domain-looking literal (contains a dot, letters/digits/hyphen/underscore).
+                // Reject hex-escaped (|..|), whitespace-containing, or
+                // punctuation-laden literals — they are not domains and would
+                // only poison the hash blocklist.
                 let is_domain = content.contains('.')
                     && content
                         .chars()
@@ -266,15 +413,29 @@ fn parse_suricata_rule(
     true
 }
 
+/// Ports that must never be kernel-blocked: the daemon's XDP path drops any
+/// packet where EITHER endpoint uses a blocked port, so blocking common
+/// service ports would disable the host's own connectivity (DNS, HTTPS, SSH…).
+fn is_blockable_port(p: u16) -> bool {
+    if p == 0 || p == 53 || p == 80 || p == 443 || p == 853 || p == 22 || p == 8080 || p == 8443 {
+        return false;
+    }
+    !matches!(
+        p,
+        20 | 21 | 23 | 25 | 110 | 143 | 465 | 587 | 993 | 995 | 4433
+    )
+}
+
 fn parse_suricata_ruleset(
     text: &str,
     cidrs: &mut HashSet<(u32, u8)>,
     ports: &mut HashSet<u16>,
     domains: &mut HashSet<String>,
+    patterns: &mut Vec<(u32, String, u8)>,
 ) -> usize {
     let mut parsed = 0;
     for line in text.lines() {
-        if parse_suricata_rule(line, cidrs, ports, domains) {
+        if parse_suricata_rule(line, cidrs, ports, domains, patterns) {
             parsed += 1;
         }
     }
@@ -293,6 +454,8 @@ pub async fn fetch_all() -> (SyncReport, SyncPayload) {
     let mut domains: HashSet<String> = HashSet::new();
     let mut cidrs: HashSet<(u32, u8)> = HashSet::new();
     let mut ports: HashSet<u16> = HashSet::new();
+    let mut dpi_patterns: Vec<(u32, String, u8)> = Vec::new();
+    let mut pattern_seen: HashSet<String> = HashSet::new();
 
     // ── DNS blocklist providers ──
     for (name, url) in DNS_PROVIDERS {
@@ -332,14 +495,27 @@ pub async fn fetch_all() -> (SyncReport, SyncPayload) {
     for (name, url) in SURICATA_RULESETS {
         match fetch_text(&client, url).await {
             Some(text) => {
-                let n = parse_suricata_ruleset(&text, &mut cidrs, &mut ports, &mut domains);
+                let mut ruleset_patterns = Vec::new();
+                let n = parse_suricata_ruleset(
+                    &text,
+                    &mut cidrs,
+                    &mut ports,
+                    &mut domains,
+                    &mut ruleset_patterns,
+                );
+                for (sid, pat, sev) in ruleset_patterns {
+                    if pattern_seen.insert(pat.clone()) && dpi_patterns.len() < MAX_DPI_PATTERNS {
+                        dpi_patterns.push((sid, pat, sev));
+                    }
+                }
                 report.sources_ok += 1;
                 report.rules_parsed += n;
                 info!(
-                    "[sucadara] {name}: parsed {n} rules → {} cidrs, {} ports, {} domains",
+                    "[sucadara] {name}: parsed {n} rules → {} cidrs, {} ports, {} domains, {} dpi patterns",
                     cidrs.len(),
                     ports.len(),
-                    domains.len()
+                    domains.len(),
+                    dpi_patterns.len()
                 );
             }
             None => {
@@ -352,10 +528,12 @@ pub async fn fetch_all() -> (SyncReport, SyncPayload) {
     report.domains = domains.len();
     report.cidrs = cidrs.len();
     report.ports = ports.len();
+    report.dpi_patterns = dpi_patterns.len();
     let payload = SyncPayload {
         cidrs: cidrs.into_iter().collect(),
         domains: domains.into_iter().collect(),
         ports: ports.into_iter().collect(),
+        dpi_patterns,
     };
     (report, payload)
 }
@@ -371,6 +549,46 @@ mod tests {
         assert_eq!(h, fnv1a_hash("EVIL.COM"), "hash must be case-insensitive");
         assert_eq!(h, fnv1a_hash("evil.com."), "trailing dot must be stripped");
         assert_ne!(h, fnv1a_hash("notevil.com"));
+    }
+
+    /// Simulate the (corrected) kernel DNS qname hasher from ring0-ebpf
+    /// `dns_query_blocked`: the wire name `\x04evil\x03com\0` is hashed by
+    /// synthesizing one '.' between labels, then FNV-1a over the lowercased
+    /// bytes. This MUST produce the same values as `fnv1a_hash` on the same
+    /// textual name — that is the parity contract the kernel fix restores.
+    fn kernel_style_qname_hash(labels: &[&str]) -> u64 {
+        let mut name = String::new();
+        for (i, l) in labels.iter().enumerate() {
+            if i > 0 {
+                name.push('.');
+            }
+            name.push_str(l);
+        }
+        fnv1a_hash(&name)
+    }
+
+    #[test]
+    fn fnv_parity_with_kernel_qname_hasher() {
+        // Full name.
+        assert_eq!(
+            kernel_style_qname_hash(&["www", "evil", "com"]),
+            fnv1a_hash("www.evil.com")
+        );
+        // Last-two-labels (what the kernel checks for "www.evil.com").
+        assert_eq!(
+            kernel_style_qname_hash(&["evil", "com"]),
+            fnv1a_hash("evil.com")
+        );
+        // Last-three-labels for a ccTLD-style name.
+        assert_eq!(
+            kernel_style_qname_hash(&["example", "co", "uk"]),
+            fnv1a_hash("example.co.uk")
+        );
+        // Case normalization on the wire must match the userspace lowercase.
+        assert_eq!(
+            kernel_style_qname_hash(&["WWW", "EVIL", "COM"]),
+            fnv1a_hash("www.evil.com")
+        );
     }
 
     #[test]
@@ -391,31 +609,100 @@ mod tests {
         assert!(!domains.contains("127.0.0.1"));
     }
 
-    #[test]
-    fn parses_suricata_rule_ip_port_domain() {
-        let rule = r#"alert dns $HOME_NET any -> $EXTERNAL_NET any (msg:"ET MALWARE CnC"; dns.query; content:"malware-c2.example"; nocase; classtype:trojan-activity; sid:2024242; rev:1;)"#;
+    fn parse_with_patterns(
+        rule: &str,
+    ) -> (
+        HashSet<(u32, u8)>,
+        HashSet<u16>,
+        HashSet<String>,
+        Vec<(u32, String, u8)>,
+    ) {
         let mut cidrs = HashSet::new();
         let mut ports = HashSet::new();
         let mut domains = HashSet::new();
-        assert!(parse_suricata_rule(
-            rule,
-            &mut cidrs,
-            &mut ports,
-            &mut domains
-        ));
+        let mut patterns = Vec::new();
+        parse_suricata_rule(rule, &mut cidrs, &mut ports, &mut domains, &mut patterns);
+        (cidrs, ports, domains, patterns)
+    }
+
+    #[test]
+    fn parses_suricata_rule_ip_port_domain() {
+        let rule = r#"drop dns $HOME_NET any -> $EXTERNAL_NET any (msg:"ET MALWARE CnC"; dns.query; content:"malware-c2.example"; nocase; classtype:trojan-activity; sid:2024242; rev:1;)"#;
+        let (cidrs, ports, domains, patterns) = parse_with_patterns(rule);
         assert!(domains.contains("malware-c2.example"));
+        // The content literal must also become a DPI pattern with the rule sid.
+        assert!(patterns.iter().any(|(sid, _, _)| *sid == 2024242));
+        // Regex metacharacters in the literal are escaped and nocase becomes (?i).
+        assert!(patterns
+            .iter()
+            .any(|(_, p, _)| p.contains(r"malware-c2\.example") && p.starts_with("(?i)")));
+        let _ = (cidrs, ports);
     }
 
     #[test]
     fn parses_suricata_rule_ports() {
-        let rule =
-            "alert tcp $HOME_NET any -> $EXTERNAL_NET 443,8443 (msg:\"test\"; sid:1; rev:1;)";
-        let mut cidrs = HashSet::new();
-        let mut ports = HashSet::new();
-        let mut domains = HashSet::new();
-        parse_suricata_rule(rule, &mut cidrs, &mut ports, &mut domains);
-        assert!(ports.contains(&443));
-        assert!(ports.contains(&8443));
+        // A *drop* rule's blockable ports feed the blocklist…
+        let drop_rule =
+            "drop tcp $HOME_NET any -> $EXTERNAL_NET 4444,5555 (msg:\"test\"; sid:1; rev:1;)";
+        let (_, ports, _, _) = parse_with_patterns(drop_rule);
+        assert!(ports.contains(&4444));
+        assert!(ports.contains(&5555));
+
+        // …but an *alert* rule must NOT promote ports into kernel blocklists.
+        let alert_rule =
+            "alert tcp $HOME_NET any -> $EXTERNAL_NET 4444 (msg:\"test\"; sid:2; rev:1;)";
+        let (_, ports, _, _) = parse_with_patterns(alert_rule);
+        assert!(
+            ports.is_empty(),
+            "alert rules must not feed kernel blocklists"
+        );
+
+        // …and well-known service ports are never blockable even on drop rules.
+        let dangerous = "drop tcp $HOME_NET any -> $EXTERNAL_NET 443,53,22 (msg:\"x\"; sid:3;)";
+        let (_, ports, _, _) = parse_with_patterns(dangerous);
+        assert!(ports.is_empty(), "well-known ports must be protected");
+    }
+
+    #[test]
+    fn parses_bracket_and_variable_ports() {
+        // Suricata bracket lists + ranges + variables.
+        let (_, ports, _, _) = parse_with_patterns(
+            "drop tcp any any -> any [4444,5555,6666:9999] (msg:\"x\"; sid:4;)",
+        );
+        assert!(ports.contains(&4444));
+        assert!(ports.contains(&5555));
+        assert!(
+            !ports.contains(&6666),
+            "ranges must be skipped, not blocked"
+        );
+        assert!(
+            !ports.contains(&9999),
+            "ranges must be skipped, not blocked"
+        );
+
+        let (_, ports, _, _) =
+            parse_with_patterns("drop tcp any any -> any $MYSQL_PORTS (msg:\"x\"; sid:5;)");
+        assert!(ports.contains(&3306));
+    }
+
+    #[test]
+    fn extracts_dpi_content_patterns() {
+        // Literal content becomes an escaped regex pattern; hex/too-short is skipped.
+        let (_, _, _, patterns) = parse_with_patterns(
+            "alert http any any -> any any (msg:\"x\"; content:\"GET /cgi-bin/\"; sid:10;)",
+        );
+        assert!(patterns.iter().any(|(_, p, _)| p == "GET /cgi-bin/"));
+        let (_, _, _, patterns) = parse_with_patterns(
+            "alert http any any -> any any (msg:\"x\"; content:\"|68 65 6c 6c 6f|\"; sid:11;)",
+        );
+        assert!(patterns.is_empty(), "hex-encoded content must be skipped");
+        let (_, _, _, patterns) = parse_with_patterns(
+            "alert http any any -> any any (msg:\"x\"; content:\"hi\"; sid:12;)",
+        );
+        assert!(
+            patterns.is_empty(),
+            "patterns shorter than 4 bytes must be skipped"
+        );
     }
 
     #[test]
