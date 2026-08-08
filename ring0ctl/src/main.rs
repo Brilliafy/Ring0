@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use colored::*;
 use ring0_common::proto as capnp_schema;
@@ -120,16 +120,46 @@ fn send_command(frame: &[u8]) -> Result<Vec<u8>> {
     Ok(resp)
 }
 
-/// Send a fire-and-forget command frame. The daemon does not send a reply for
-/// these commands, so we must NOT block waiting for a response frame (there may
-/// be none for a long time, which used to make every command hang for the read
-/// timeout even though the command had succeeded).
+/// Send a fire-and-forget command frame, then wait for the daemon's ack.
+///
+/// Privileged commands are gated by polkit in the daemon: the daemon answers
+/// with an `OK`/`DENIED` frame once the authorization (and possible desktop
+/// dialog) has completed. We must keep the connection — and therefore our
+/// /proc/<pid> entry — alive until then, or the polkit subject lookup races
+/// our exit and the first command is spuriously denied. A 5-minute read
+/// timeout covers the user taking their time with the dialog; a timeout
+/// degrades gracefully (the command may still have been applied).
 fn send_command_no_response(frame: &[u8]) -> Result<()> {
     let mut stream = connect_timeout()?;
+    stream.set_read_timeout(Some(Duration::from_secs(300)))?;
     let len = (frame.len() as u32).to_le_bytes();
     stream.write_all(&len)?;
     stream.write_all(frame)?;
     stream.flush()?;
+    let mut len_buf = [0u8; 4];
+    match stream.read_exact(&mut len_buf) {
+        Ok(_) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(e).context("failed to read command ack"),
+    }
+    let resp_len = u32::from_le_bytes(len_buf) as usize;
+    if resp_len == 0 || resp_len > 65536 {
+        return Ok(());
+    }
+    let mut resp = vec![0u8; resp_len];
+    stream
+        .read_exact(&mut resp)
+        .context("failed to read command ack body")?;
+    if resp == b"DENIED" {
+        bail!("denied by the daemon (polkit authorization failed)");
+    }
     Ok(())
 }
 
