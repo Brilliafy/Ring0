@@ -77,6 +77,9 @@ struct DaemonStatus {
     blockedDomains @4 : UInt32;
     blockedCidrs @5 : UInt32;
     blockedPorts @6 : UInt32;
+    droppedEvents @7 : UInt64;
+    onBattery @8 : Bool;
+    fimThrottled @9 : Bool;
 }
 struct Ring0Event {
     union {

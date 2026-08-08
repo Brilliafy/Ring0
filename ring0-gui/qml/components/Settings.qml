@@ -108,6 +108,108 @@ Rectangle {
             }
         }
 
+        // ── Port blocking ──
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 8
+            Label { text: "Port:"; color: "#8b949e"; font.pixelSize: 12 }
+            SpinBox {
+                id: portSpin
+                from: 1; to: 65535; value: 4444
+                editable: true
+                Layout.preferredWidth: 100
+            }
+            Button {
+                text: "Block Port"
+                highlighted: true
+                onClicked: {
+                    bridge.blockPort(portSpin.value)
+                    settingsStatus.text = "Block port sent (requires root/ring0)"
+                }
+            }
+            Button {
+                text: "Unblock Port"
+                flat: true
+                onClicked: {
+                    bridge.unblockPort(portSpin.value)
+                    settingsStatus.text = "Unblock port sent (requires root/ring0)"
+                }
+            }
+        }
+
+        // ── Maintenance actions ──
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 8
+            Button {
+                text: "Run Rootkit Scan"
+                onClicked: {
+                    bridge.runRootkitScan()
+                    settingsStatus.text = "Rootkit scan requested"
+                }
+            }
+            Button {
+                text: "Sync Intel Feeds"
+                onClicked: {
+                    bridge.syncIntelFeeds()
+                    settingsStatus.text = "Intel feed sync requested"
+                }
+            }
+            Button {
+                text: "Power Status"
+                onClicked: {
+                    bridge.powerStatus()
+                    settingsStatus.text = "Power status requested"
+                }
+            }
+            Button {
+                text: "Load Alerts…"
+                highlighted: true
+                onClicked: {
+                    var json = bridge.queryLogs(60, 0, 500)
+                    if (json.length === 0) {
+                        settingsStatus.text = "No response from daemon"
+                        return
+                    }
+                    var parsed = JSON.parse(json)
+                    alertHistoryList.model = parsed.alerts || []
+                    alertHistoryDialog.open()
+                    settingsStatus.text = "Loaded " + (parsed.count || 0) + " alerts"
+                }
+            }
+        }
+
+        Dialog {
+            id: alertHistoryDialog
+            modal: true
+            x: Math.round((parent.width - width) / 2)
+            y: Math.round((parent.height - height) / 2)
+            width: Math.min(parent.width - 40, 760)
+            height: Math.min(parent.height - 60, 480)
+            background: Rectangle { color: "#0d1117"; border.color: "#30363d"; border.width: 1 }
+            header: Label { text: "Recent Alerts (last 60 min)"; color: "#58a6ff"; font.pixelSize: 14; padding: 8 }
+            ListView {
+                id: alertHistoryList
+                anchors.fill: parent
+                anchors.margins: 8
+                clip: true
+                delegate: Rectangle {
+                    width: parent.width
+                    height: 24
+                    color: index % 2 === 0 ? "#161b22" : "#0d1117"
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.margins: 2
+                        spacing: 6
+                        Label { text: new Date(modelData.timestamp / 1000000).toLocaleTimeString(); color: "#8b949e"; font.pixelSize: 10; Layout.preferredWidth: 100 }
+                        Label { text: modelData.severity || ""; color: modelData.severity === "CRITICAL" ? "#f85149" : modelData.severity === "HIGH" ? "#f0883e" : "#8b949e"; font.pixelSize: 10; Layout.preferredWidth: 70 }
+                        Label { text: "Rule " + (modelData.rule_id || ""); color: "#58a6ff"; font.pixelSize: 10; Layout.preferredWidth: 80 }
+                        Label { text: modelData.signature || ""; color: "#c9d1d9"; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
+                    }
+                }
+            }
+        }
+
         Rectangle {
             Layout.fillWidth: true
             Layout.preferredHeight: 1

@@ -13,6 +13,30 @@ Item {
         { name: "Defense Evasion", color: "#ff7b72", count: 0, techniques: ["T1070", "T1562"] },
     ]
 
+    // Increment the count of the tactic that contains `technique`
+    // (e.g. "T1059.004"). Unknown techniques are ignored; the technique
+    // string from a correlation event usually embeds "T####" (e.g. "T1003 / T1041").
+    function addTechnique(technique) {
+        if (!technique) return
+        var t = String(technique)
+        for (var i = 0; i < tactics.length; i++) {
+            var techs = tactics[i].techniques
+            for (var j = 0; j < techs.length; j++) {
+                if (t.indexOf(techs[j]) !== -1) {
+                    tactics[i].count++
+                    return
+                }
+            }
+        }
+    }
+
+    // Reset all counters (e.g. when reconnecting).
+    function reset() {
+        for (var i = 0; i < tactics.length; i++) {
+            tactics[i].count = 0
+        }
+    }
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 4

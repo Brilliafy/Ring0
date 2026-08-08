@@ -192,7 +192,8 @@ ApplicationWindow {
             TabButton { text: "Network"; background: Rectangle { color: mainTabBar.currentIndex === 0 ? "#21262d" : "#161b22" } }
             TabButton { text: "Processes"; background: Rectangle { color: mainTabBar.currentIndex === 1 ? "#21262d" : "#161b22" } }
             TabButton { text: "DNS & Security"; background: Rectangle { color: mainTabBar.currentIndex === 2 ? "#21262d" : "#161b22" } }
-            TabButton { text: "Settings"; background: Rectangle { color: mainTabBar.currentIndex === 3 ? "#21262d" : "#161b22" } }
+            TabButton { text: "MITRE"; background: Rectangle { color: mainTabBar.currentIndex === 3 ? "#21262d" : "#161b22" } }
+            TabButton { text: "Settings"; background: Rectangle { color: mainTabBar.currentIndex === 4 ? "#21262d" : "#161b22" } }
         }
 
         StackLayout {
@@ -208,7 +209,11 @@ ApplicationWindow {
                     color: "#161b22"; radius: 6
                     Layout.fillWidth: true; Layout.preferredHeight: 160
                     border.color: "#30363d"; border.width: 1
-                    Label { anchors.centerIn: parent; text: "Live Traffic (MB/s)"; color: "#484f58"; font.pixelSize: 14 }
+                    LiveTrafficChart {
+                        id: liveChart
+                        anchors.fill: parent
+                        anchors.margins: 8
+                    }
                 }
                 Rectangle {
                     color: "#161b22"; radius: 6
@@ -229,10 +234,13 @@ ApplicationWindow {
 
             // Tab 2: DNS & Security
             ColumnLayout { spacing: 6
-                DnsSecurityInspector { Layout.fillWidth: true; Layout.fillHeight: true }
+                DnsSecurityInspector { id: dnsInspector; Layout.fillWidth: true; Layout.fillHeight: true }
             }
 
-            // Tab 3: Settings
+            // Tab 3: MITRE
+            MitreMatrix { id: mitreMatrix }
+
+            // Tab 4: Settings
             Settings { id: settingsComponent }
         }
     }
@@ -255,7 +263,7 @@ ApplicationWindow {
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 8
-                Button { text: "Block IP"; highlighted: true; onClicked: { doBlockIp(pendingAlertIp); alertPopup.close() } }
+                Button { text: "Block IP"; highlighted: true; enabled: pendingAlertIp.length > 0; onClicked: { doBlockIp(pendingAlertIp); alertPopup.close() } }
                 // Note: AlertEvent carries no pid in the schema, so "Kill Process"
                 // would have nothing to act on — removed rather than left inert.
                 Button { text: "Dismiss"; flat: true; onClicked: alertPopup.close() }
@@ -323,9 +331,13 @@ ApplicationWindow {
             alertCount++
             alertCountLabel.text = alertCount.toString()
             pendingAlertMsg = evt.signature + " [Rule " + evt.rule_id + "]"
-            pendingAlertIp = evt.src_ip
+            pendingAlertIp = evt.src_ip || ""
             alertMsg.text = pendingAlertMsg
             alertPopup.open()
+            // Fast-path DPI matches also surface in the DNS & Security tab.
+            if (evt.signature && evt.signature.indexOf("DPI match") === 0) {
+                dnsInspector.addDpiMatch("Rule " + evt.rule_id, evt.signature)
+            }
             bridge.sendDesktopNotification(evt.severity === "CRITICAL" ? 3 : 2, "RingZero Alert", pendingAlertMsg)
             if (evt.severity === "CRITICAL") { appWindow.setStatusThreat() }
         } else if (evt.type === "connectionPrompt") {
@@ -346,6 +358,24 @@ ApplicationWindow {
                 proto: evt.protocol || "TCP"
             })
             if (processTreeComponent.socketModel.count > 200) processTreeComponent.socketModel.remove(200, processTreeComponent.socketModel.count - 200)
+        } else if (evt.type === "correlation") {
+            // Correlation alerts feed the MITRE matrix and the alert counter.
+            mitreMatrix.addTechnique(evt.mitre_technique)
+            alertCount++
+            alertCountLabel.text = alertCount.toString()
+            pendingAlertMsg = "[" + (evt.pattern_name || "correlation") + "] " + (evt.description || "")
+            pendingAlertIp = ""
+            alertMsg.text = pendingAlertMsg
+            alertPopup.open()
+        } else if (evt.type === "selfDefense") {
+            alertCount++
+            alertCountLabel.text = alertCount.toString()
+            pendingAlertMsg = "Self-defense: PID " + evt.attacker_pid + " " + (evt.syscall || "")
+            pendingAlertIp = ""
+            alertMsg.text = pendingAlertMsg
+            alertPopup.open()
+        } else if (evt.type === "dns") {
+            dnsInspector.addDpiMatch("DNS", evt.domain || "")
         } else if (evt.type === "fileAccess") {
             alertCount++
             alertCountLabel.text = alertCount.toString()
@@ -358,8 +388,19 @@ ApplicationWindow {
             filterCountLabel.text = filters.length.toString()
             if (typeof evt.cpuUsagePercent === "number")
                 cpuLabel.text = "CPU " + evt.cpuUsagePercent.toFixed(1) + "%"
-            if (typeof evt.eventsPerSec === "number")
+            if (typeof evt.eventsPerSec === "number") {
                 epsLabel.text = evt.eventsPerSec >= 100 ? evt.eventsPerSec.toFixed(0) + " eps" : evt.eventsPerSec.toFixed(1) + " eps"
+                liveChart.addValue(evt.eventsPerSec)
+            }
+            // Power + blocklist state → labels and DNS inspector.
+            batteryLabel.text = evt.onBattery ? "⚡ Battery" : "⚡ AC"
+            batteryLabel.color = evt.onBattery ? "#d29922" : "#3fb950"
+            batteryLabel.visible = true
+            if (typeof evt.fimThrottled === "boolean")
+                batteryLabel.text += evt.fimThrottled ? " · FIM throttled" : ""
+            dnsInspector.blockedDomains = evt.blockedDomains || 0
+            dnsInspector.blockedCidrs = evt.blockedCidrs || 0
+            dnsInspector.blockedPorts = evt.blockedPorts || 0
         }
     }
 
@@ -399,8 +440,8 @@ ApplicationWindow {
         }
     }
 
-    onDoBlockIp: { bridge.blockIp(ip) }
-    onDoKillProcess: { bridge.killProcess(pid) }
+    onDoBlockIp: { if (ip && ip.length > 0) bridge.blockIp(ip) }
+    onDoKillProcess: { if (pid > 0) bridge.killProcess(pid) }
 
     Component.onCompleted: {
         if (bridge) {
