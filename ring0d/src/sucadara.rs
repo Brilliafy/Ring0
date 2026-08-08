@@ -102,9 +102,12 @@ const SURICATA_RULESETS: &[(&str, &str)] = &[(
     "https://rules.emergingthreats.net/open/suricata-7.0/emerging-all.rules",
 )];
 
-/// Max literal content signatures promoted to the DPI engine from one
-/// ruleset fetch. Bounds compile time and FP surface.
-const MAX_DPI_PATTERNS: usize = 2000;
+/// Ceiling on literal content signatures promoted to the DPI engine from one
+/// ruleset fetch. This is a RESOURCE guard only (compile time / hyperscan
+/// memory), not a throughput or coverage cap: it never skips or queues
+/// packets, and the full et-open ruleset (~28.5k unique literals) fits far
+/// below this bound so every extractable signature is compiled.
+const MAX_DPI_PATTERNS: usize = 65536;
 
 /// Max bytes accepted from a blocklist feed. A hijacked or oversized feed
 /// (e.g. oisd's multi-hundred-MB list) must not exhaust daemon memory (E10).
