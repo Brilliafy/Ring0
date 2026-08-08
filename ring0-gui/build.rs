@@ -5,6 +5,7 @@ fn main() {
             .qml_files([
                 "qml/main.qml",
                 "qml/components/ConnectionPrompt.qml",
+                "qml/components/DnsSecurityInspector.qml",
                 "qml/components/EventLogTable.qml",
                 "qml/components/LiveTrafficChart.qml",
                 "qml/components/MitreMatrix.qml",

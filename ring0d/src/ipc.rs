@@ -25,7 +25,14 @@ pub enum DaemonCmd {
     Quarantine(u32),
     RunRootkitScan,
     SyncIntelFeeds,
-    SubmitPromptDecision(u64, String, String),
+    /// Internal command (daemon-generated only, never parsed from the wire):
+    /// mark the flow owned by `pid` as allowed in the kernel fast path after
+    /// a user "allow once" decision.
+    MarkFlowAllowed(u32, u16, u8, u32),
+    /// `caller_pid` is the kernel-verified SO_PEERCRED pid of the process that
+    /// submitted the decision — used to reject self-approval by the process
+    /// under scrutiny (defense in depth on top of the privilege gate).
+    SubmitPromptDecision(u64, String, String, u32),
     FlatpakList,
     PowerStatus,
     UpdateSettings(String),
@@ -46,11 +53,69 @@ impl IpcServer {
         storage: Arc<RocksManager>,
         cmd_tx: tokio::sync::mpsc::UnboundedSender<DaemonCmd>,
     ) -> Result<Self> {
+        // E11: a NUL byte in the socket path would make CString::new unwrap
+        // panic in the daemon init path (env-controlled RING0_SOCKET).
+        if path.as_bytes().contains(&0) {
+            return Err(anyhow::anyhow!("socket path contains a NUL byte: {path:?}"));
+        }
         let _ = std::fs::remove_file(path);
         let listener =
             UnixListener::bind(path).map_err(|e| anyhow::anyhow!("failed to bind {path}: {e}"))?;
-        // Allow any local user to talk to the daemon (CLI, GUI, scripts).
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+        // Socket permissions:
+        //  * production (daemon runs as root): restrict to root + the "ring0"
+        //    admin group (0660, chowned root:ring0). The event stream carries
+        //    process/network telemetry of every local user; a world-writable
+        //    socket (0666) leaked it to any local process and enabled prompt
+        //    self-approval (the subject process can read its own prompt id).
+        //  * dev/test (daemon not root, or no ring0 group): fall back to the
+        //    historical 0666 but log loudly so the exposure is visible.
+        //
+        // E11: chown/chmod by path would follow a symlink if an attacker could
+        // swap the path between bind and chown. Verify the path still refers
+        // to the exact socket inode we bound (lstat vs fstat of the fd) before
+        // touching it by path.
+        let bound_inode = {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(listener.as_raw_fd(), &mut st) } == 0 {
+                Some((st.st_dev, st.st_ino))
+            } else {
+                None
+            }
+        };
+        let path_matches_fd = match std::fs::symlink_metadata(path) {
+            Ok(m) => {
+                use std::os::unix::fs::MetadataExt;
+                bound_inode
+                    .map(|(dev, ino)| (m.dev(), m.ino()) == (dev, ino))
+                    .unwrap_or(false)
+            }
+            Err(_) => false,
+        };
+        let group_gid = ring0_group_gid();
+        let is_root = unsafe { libc::geteuid() } == 0;
+        if is_root && group_gid.is_some() {
+            if path_matches_fd {
+                let gid = group_gid.unwrap();
+                unsafe {
+                    libc::chown(
+                        std::ffi::CString::new(path.as_bytes()).unwrap().as_ptr(),
+                        0,
+                        gid,
+                    );
+                }
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
+            } else {
+                warn!(
+                    "IPC socket path {path} changed after bind — refusing chown/chmod (possible symlink swap)"
+                );
+            }
+        } else {
+            warn!(
+                "IPC socket {path}: running {}root with no ring0 group — using permissive 0o666 mode (telemetry readable by any local process). Install creates the ring0 group and runs the daemon as root to harden this.",
+                if is_root { "" } else { "non-" }
+            );
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+        }
         let (evt_tx, _) = broadcast::channel(4096);
         let evt_tx_for_struct = evt_tx.clone();
 
@@ -70,23 +135,53 @@ impl IpcServer {
                         tokio::spawn(async move {
                             client_count.fetch_add(1, Ordering::Relaxed);
                             let (reader, writer) = stream.into_split();
-                            let evt_tx_for_read = evt_tx.clone();
+
+                            // Per-connection response channel: QueryLogs
+                            // answers go to the requesting client only, not to
+                            // every subscriber (previously responses were sent
+                            // over the shared broadcast and leaked to all peers).
+                            let (resp_tx, mut resp_rx) =
+                                tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
                             let write_handle = tokio::spawn(async move {
                                 let mut writer = writer;
                                 let mut rx = evt_tx.subscribe();
                                 loop {
-                                    match rx.recv().await {
-                                        Ok(data) => {
-                                            let len = (data.len() as u32).to_le_bytes();
-                                            if writer.write_all(&len).await.is_err() {
-                                                break;
-                                            }
-                                            if writer.write_all(&data).await.is_err() {
-                                                break;
+                                    tokio::select! {
+                                        frame = rx.recv() => {
+                                            match frame {
+                                                Ok(data) => {
+                                                    let len = (data.len() as u32).to_le_bytes();
+                                                    if writer.write_all(&len).await.is_err() {
+                                                        break;
+                                                    }
+                                                    if writer.write_all(&data).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                                // Lagged: the client fell behind the
+                                                // broadcast backlog. Resync instead of
+                                                // silently severing the connection.
+                                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                                    warn!("IPC client lagged {n} events — resynchronizing");
+                                                }
+                                                Err(_) => break,
                                             }
                                         }
-                                        Err(_) => break,
+                                        resp = resp_rx.recv() => {
+                                            match resp {
+                                                Some(data) => {
+                                                    let len = (data.len() as u32).to_le_bytes();
+                                                    if writer.write_all(&len).await.is_err() {
+                                                        break;
+                                                    }
+                                                    if writer.write_all(&data).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                                None => break,
+                                            }
+                                        }
                                     }
                                 }
                             });
@@ -97,9 +192,6 @@ impl IpcServer {
                                 loop {
                                     match reader.read_exact(&mut len_buf).await {
                                         Ok(_) => {}
-                                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                            continue;
-                                        }
                                         Err(_) => break,
                                     }
                                     let msg_len = u32::from_le_bytes(len_buf) as usize;
@@ -111,20 +203,21 @@ impl IpcServer {
                                     if reader.read_exact(&mut msg_buf).await.is_err() {
                                         break;
                                     }
-                                    match parse_command_frame(&msg_buf) {
+                                    match parse_command_frame(&msg_buf, peer_cred.pid as u32) {
                                         Ok(DaemonCmd::QueryLogs(_start, _end, sev, limit)) => {
                                             let results = storage.query_alerts(sev, limit as usize);
                                             let response = build_query_response(&results);
-                                            let _ = evt_tx_for_read.send(response);
+                                            if resp_tx.send(response).is_err() {
+                                                break;
+                                            }
                                         }
                                         Ok(cmd) => {
-                                            // The daemon runs as root; the socket is
-                                            // world-writable so the (unprivileged) GUI/CLI
-                                            // can connect. Destructive commands must be
-                                            // restricted to root or members of the "ring0"
-                                            // admin group, otherwise any local process
-                                            // can kill arbitrary processes or shut the
-                                            // daemon down.
+                                            // Destructive/sensitive commands are
+                                            // restricted to root or members of the
+                                            // "ring0" admin group, otherwise any
+                                            // local process could kill arbitrary
+                                            // processes, shut the daemon down, or
+                                            // answer prompts on behalf of the user.
                                             if is_privileged_command(&cmd)
                                                 && !peer_is_privileged(&peer_cred)
                                             {
@@ -254,6 +347,11 @@ fn peer_is_privileged(cred: &libc::ucred) -> bool {
 /// Commands that can damage the system and are therefore restricted to
 /// privileged callers (see [`peer_is_privileged`]); the unprivileged GUI/CLI
 /// can still connect for monitoring.
+///
+/// `SubmitPromptDecision` is privileged because the prompt stream is readable
+/// by any local process: without this gate, the very process being prompted
+/// could approve its own outbound connection by reading its prompt id from the
+/// broadcast event stream and echoing a decision back (self-approval attack).
 fn is_privileged_command(cmd: &DaemonCmd) -> bool {
     use DaemonCmd::*;
     matches!(
@@ -267,11 +365,12 @@ fn is_privileged_command(cmd: &DaemonCmd) -> bool {
             | Quarantine(_)
             | RunRootkitScan
             | SyncIntelFeeds
+            | SubmitPromptDecision(_, _, _, _)
             | Shutdown
     )
 }
 
-fn parse_command_frame(data: &[u8]) -> Result<DaemonCmd> {
+fn parse_command_frame(data: &[u8], caller_pid: u32) -> Result<DaemonCmd> {
     let mut data_mut = data;
     let reader = capnp::serialize::read_message_from_flat_slice(
         &mut data_mut,
@@ -312,11 +411,15 @@ fn parse_command_frame(data: &[u8]) -> Result<DaemonCmd> {
         Which::Shutdown(()) => Ok(DaemonCmd::Shutdown),
         Which::QueryLogs(query) => {
             let q = query.map_err(|e| anyhow::anyhow!("capnp query error: {e}"))?;
+            // F3: the limit drives an unbounded RocksDB iteration + collection
+            // on an unprivileged command; clamp it here so a malicious peer
+            // cannot force a full-table scan / OOM of the root daemon.
+            const MAX_LOG_LIMIT: u32 = 1000;
             Ok(DaemonCmd::QueryLogs(
                 q.getStartTimestamp(),
                 q.getEndTimestamp(),
                 q.getSeverityThreshold(),
-                q.getLimit(),
+                q.getLimit().min(MAX_LOG_LIMIT),
             ))
         }
         Which::Quarantine(pid) => Ok(DaemonCmd::Quarantine(pid)),
@@ -336,6 +439,7 @@ fn parse_command_frame(data: &[u8]) -> Result<DaemonCmd> {
                     .to_str()
                     .unwrap_or("")
                     .to_string(),
+                caller_pid,
             ))
         }
         Which::FlatpakList(()) => Ok(DaemonCmd::FlatpakList),
@@ -362,24 +466,29 @@ fn build_query_response(results: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
         let mut alerts = resp.initAlerts(count);
         for (i, (_, v)) in results.iter().enumerate().take(count as usize) {
             let mut alert = alerts.reborrow().get(i as u32);
-            // Alert byte layout: [0..8] timestamp (BE), [8] severity,
-            // [9..13] rule id, [13] message length, [14..] message.
-            if v.len() >= 8 {
-                let ts = u64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]);
-                alert.setTimestamp(ts);
-            }
-            if v.len() > 13 {
-                let sev = match v[8] {
-                    1 => capnp_schema::Severity::Low,
-                    2 => capnp_schema::Severity::Med,
-                    3 => capnp_schema::Severity::High,
-                    _ => capnp_schema::Severity::Critical,
-                };
-                alert.setSeverity(sev);
-                alert.setRuleId(u32::from_be_bytes([v[9], v[10], v[11], v[12]]));
-                let ml = v[13] as usize;
-                let msg = String::from_utf8_lossy(&v[14..14 + ml.min(v.len().saturating_sub(14))]);
-                alert.setSignatureName(&msg);
+            // Decode through the canonical alert format instead of hand-rolling
+            // offsets (see crate::alert::AlertRecord).
+            match crate::alert::AlertRecord::decode(v) {
+                Some(rec) => {
+                    alert.setTimestamp(rec.timestamp_ns);
+                    let sev = match crate::alert::AlertRecord::severity_level(rec.severity) {
+                        1 => capnp_schema::Severity::Low,
+                        2 => capnp_schema::Severity::Med,
+                        3 => capnp_schema::Severity::High,
+                        _ => capnp_schema::Severity::Critical,
+                    };
+                    alert.setSeverity(sev);
+                    alert.setRuleId(rec.rule_id);
+                    alert.setSignatureName(&rec.message);
+                }
+                None => {
+                    // Undecodable record (e.g. written by an older build):
+                    // surface it as a placeholder rather than silently shifting.
+                    alert.setTimestamp(0);
+                    alert.setSeverity(capnp_schema::Severity::Low);
+                    alert.setRuleId(0);
+                    alert.setSignatureName("<undecodable alert record>");
+                }
             }
         }
     }
@@ -396,6 +505,9 @@ pub fn build_status_event(
     blocked_domains: u32,
     blocked_cidrs: u32,
     blocked_ports: u32,
+    dropped_events: u64,
+    on_battery: bool,
+    fim_throttled: bool,
 ) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
     let evt = msg.init_root::<capnp_schema::ring0_event::Builder>();
@@ -410,6 +522,9 @@ pub fn build_status_event(
     s.setBlockedDomains(blocked_domains);
     s.setBlockedCidrs(blocked_cidrs);
     s.setBlockedPorts(blocked_ports);
+    s.setDroppedEvents(dropped_events);
+    s.setOnBattery(on_battery);
+    s.setFimThrottled(fim_throttled);
     let mut buf = Vec::new();
     let _ = capnp::serialize::write_message(&mut buf, &msg);
     buf

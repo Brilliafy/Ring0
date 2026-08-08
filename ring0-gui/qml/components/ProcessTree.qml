@@ -41,7 +41,17 @@ Rectangle {
                     Label { text: pid; color: "#f85149"; font.pixelSize: 10; Layout.preferredWidth: 45 }
                     Label { text: ppid; color: "#8b949e"; font.pixelSize: 10; Layout.preferredWidth: 45 }
                     Label { text: binary; color: "#c9d1d9"; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
-                    Label { text: cmdline; color: "#484f58"; font.pixelSize: 9; Layout.preferredWidth: 200; elide: Text.ElideRight }
+                    Label { text: cmdline; color: "#484f58"; font.pixelSize: 9; Layout.preferredWidth: 160; elide: Text.ElideRight }
+                    Button {
+                        text: "Kill"
+                        flat: true
+                        font.pixelSize: 9
+                        implicitHeight: 18
+                        onClicked: {
+                            var p = parseInt(pid)
+                            if (p > 1) bridge.killProcess(p)
+                        }
+                    }
                 }
             }
         }

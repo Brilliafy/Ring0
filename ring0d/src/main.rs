@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+pub mod alert;
 pub mod baseline;
 pub mod containment;
 pub mod contextual_security;
@@ -55,8 +56,17 @@ async fn main() -> Result<()> {
             return Err(e);
         }
     };
-    daemon.run().await?;
-    Ok(())
+    // daemon.run() performs cleanup() (eBPF detach, RocksDB flush, socket
+    // removal) on shutdown, then we exit immediately: long-running background
+    // tasks (FIM baseline scan, blocklist feed fetches, D-Bus monitors) would
+    // otherwise keep the Tokio runtime alive for minutes after SIGTERM.
+    match daemon.run().await {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            error!("daemon run failed: {e:?}");
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn listen_signals(shutdown: Arc<Notify>) {
@@ -111,6 +121,8 @@ struct Daemon {
     power: power::PowerGovernor,
     event_count: std::sync::atomic::AtomicU64,
     last_status: parking_lot::Mutex<Option<(u64, std::time::Instant)>>,
+    /// Per-rule-id alert rate limiter (prevents per-packet alert storms).
+    alert_throttle: parking_lot::Mutex<std::collections::HashMap<u32, std::time::Instant>>,
     blocklist_payload: Arc<parking_lot::Mutex<Option<sucadara::SyncPayload>>>,
 }
 
@@ -212,6 +224,7 @@ impl Daemon {
 
         let event_count = std::sync::atomic::AtomicU64::new(0);
         let last_status = parking_lot::Mutex::new(None);
+        let alert_throttle = parking_lot::Mutex::new(std::collections::HashMap::new());
 
         // Kick off the Suricata rules + DNS/IP blocklist sync in the background.
         let blocklist_payload: Arc<parking_lot::Mutex<Option<sucadara::SyncPayload>>> =
@@ -263,13 +276,13 @@ impl Daemon {
             power,
             event_count,
             last_status,
+            alert_throttle,
             blocklist_payload,
         })
     }
 
     async fn run(&mut self) -> Result<()> {
         let mut ring_rx = self.ebpf.subscribe();
-        let mut tls_rx = self.ebpf.subscribe_tls();
         let mut lsm_rx = self.ebpf.subscribe_lsm();
         let mut rootkit_rx = self.ebpf.subscribe_rootkit();
         let mut privesc_rx = self.ebpf.subscribe_privesc();
@@ -288,7 +301,6 @@ impl Daemon {
                 biased;
                 _ = self.shutdown.notified() => { info!("shutdown"); break; }
                 Ok(data) = ring_rx.recv() => { self.on_raw_event(&data).await; }
-                Ok(tls_data) = tls_rx.recv() => { self.on_tls_event(&tls_data).await; }
                 Ok(lsm_data) = lsm_rx.recv() => { self.on_lsm_event(&lsm_data).await; }
                 Ok(rk_data) = rootkit_rx.recv() => { self.on_rootkit_event(&rk_data).await; }
                 Ok(pv_data) = privesc_rx.recv() => { self.on_privesc_event(&pv_data).await; }
@@ -308,21 +320,36 @@ impl Daemon {
                         }
                     });
                 }
-                _ = governor_tick.tick() => { self.tick_governor(); }
+                _ = governor_tick.tick() => {
+                    self.tick_governor();
+                    self.ebpf.scan_interfaces();
+                }
                 _ = fastpath_tick.tick() => { self.fastpath.purge_idle_flows(); }
                 _ = prompt_tick.tick() => { self.prompt.check_timeouts(); }
-                _ = blocklist_tick.tick() => { self.apply_blocklist_payload(); }
-                Some(cmd) = self.cmd_rx.recv() => { self.handle_command(cmd); }
+                _ = blocklist_tick.tick() => { self.apply_blocklist_payload().await; }
+                Some(cmd) = self.cmd_rx.recv() => { self.handle_command(cmd).await; }
             }
         }
         self.cleanup();
         Ok(())
     }
 
-    async fn on_raw_event(&self, raw: &[u8]) {
+    async fn on_raw_event(&mut self, raw: &[u8]) {
         self.event_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if raw.len() < 16 {
+            return;
+        }
+        // ABI drift guard: every fixed-layout kind has a canonical size in the
+        // ring0-abi table. If the kernel program ever emits a shorter entry,
+        // refuse to decode it and log loudly instead of silently misparsing.
+        if !event_len_ok(raw[0], raw.len()) {
+            error!(
+                "ring-buffer ABI mismatch: kind {} expected >= {} bytes, got {} — daemon and kernel are out of sync",
+                raw[0],
+                ring0_abi::EVENT_SIZE[raw[0] as usize].map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
+                raw.len()
+            );
             return;
         }
         match raw[0] {
@@ -356,11 +383,14 @@ impl Daemon {
         self.ipc.broadcast_raw(&evt).await;
         self.pcap_buffer.push(raw, ts);
         let binary = if pid > 0 {
-            crate::process::ProcessResolver::binary_path(pid).unwrap_or_else(|| "unknown".into())
+            // F11: cached 1s-TTL path — a raw readlink per packet turns a
+            // scan into thousands of blocking syscalls on the event loop.
+            crate::process::ProcessResolver::binary_path_cached(pid)
+                .unwrap_or_else(|| "unknown".into())
         } else {
             "kernel".into()
         };
-        if self.threat_blocklist.check_ports(src_port, dst_port) {
+        if self.threat_blocklist.check_ports(src_port, dst_port) && self.alert_due(4000) {
             let a = build_alert_bytes_rule(
                 4000,
                 3,
@@ -426,7 +456,24 @@ impl Daemon {
             let a = build_alert_bytes_rule(9001, 4, &format!("blocked binary executed: {binary}"));
             self.storage.write_alert(&a);
             self.ipc.broadcast_raw(&a).await;
-            let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            // F9: capture starttime now (≈ event time) and re-verify just
+            // before the kill, so a PID recycled between the kernel
+            // tracepoint and this handler cannot make us SIGKILL an innocent
+            // process. If the PID is already gone or reused, skip the kill.
+            let starttime_at_event = crate::process::ProcessResolver::starttime(pid);
+            let still_same = match starttime_at_event {
+                Some(ev) => crate::process::ProcessResolver::starttime(pid) == Some(ev),
+                None => false,
+            };
+            if still_same {
+                if let Ok(pid_i) = i32::try_from(pid) {
+                    let _ = unsafe { libc::kill(pid_i, libc::SIGKILL) };
+                }
+            } else {
+                warn!(
+                    "refusing to SIGKILL PID {pid}: starttime changed since exec event (PID reuse?)"
+                );
+            }
         }
         let evt = ipc::build_process_exec_event(pid, ppid, uid, &binary, &cmdline);
         self.storage.write_raw(&evt);
@@ -458,7 +505,7 @@ impl Daemon {
         self.ipc.broadcast_raw(&evt).await;
     }
 
-    async fn on_connect(&self, raw: &[u8]) {
+    async fn on_connect(&mut self, raw: &[u8]) {
         if raw.len() < 32 {
             return;
         }
@@ -490,7 +537,9 @@ impl Daemon {
         self.storage.write_raw(&evt);
         self.ipc.broadcast_raw(&evt).await;
 
-        let trust_status = self.trust.verify_binary(&binary, pid);
+        // Trust verification runs on a blocking thread (whole-file hash + rpm
+        // subprocess) so a slow disk/rpm cannot stall the event pipeline.
+        let trust_status = self.trust.verify_binary_async(&binary, pid).await;
         if self.contextual.should_block_connection(pid, &binary) {
             info!("ContextualSecurity: dropping connection from PID {pid} ({binary})");
             let a = build_alert_bytes_rule(
@@ -511,13 +560,48 @@ impl Daemon {
         }
         match trust_status {
             trust::TrustStatus::TrustedSystemPackage | trust::TrustStatus::TrustedBinary => {
-                let _ = self.fastpath.mark_flow_safe(pid, dip, 0, dp, proto);
-                info!("TrustEngine: PID {pid} {binary} trusted — flow offloaded");
+                // Resolve the real 5-tuple for this socket and mark the flow
+                // established in the kernel ESTABLISHED_FLOWS map. Previously
+                // this called mark_flow_safe(pid, dip, 0, dp, proto) — the pid
+                // was stuffed into the src_ip slot, so no kernel entry ever
+                // matched and nothing was ever offloaded.
+                // F11: resolve_flow_for_dst walks /proc/*/fd for every process
+                // — a synchronous scan that must run off the event loop.
+                let flow = tokio::task::spawn_blocking(move || {
+                    crate::process::ProcessResolver::resolve_flow_for_dst(pid, dip, dp, proto)
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some(key) = flow {
+                    match self.ebpf.mark_flow_established(&key) {
+                        Ok(()) => {
+                            let _ = self.fastpath.mark_flow_safe(key);
+                            info!("TrustEngine: PID {pid} {binary} trusted — flow offloaded to kernel fast path");
+                        }
+                        Err(e) => {
+                            info!("TrustEngine: PID {pid} {binary} trusted — kernel offload unavailable: {e}");
+                        }
+                    }
+                }
             }
-            trust::TrustStatus::Untrusted => {
-                info!("TrustEngine: PID {pid} {binary} UNTRUSTED — creating user prompt");
+            trust::TrustStatus::Untrusted | trust::TrustStatus::Unknown => {
+                // F10: Unknown (any verification failure: unreadable binary,
+                // missing rpm, spawn_blocking error, …) must NOT silently
+                // allow the connection — route it through the same user
+                // prompt as Untrusted (fail-secure posture).
+                info!(
+                    "TrustEngine: PID {pid} {binary} UNTRUSTED/UNVERIFIED — creating user prompt"
+                );
                 let (country_code, country_name) = self.enrichment.lookup_country(dip);
-                let rdns_name = self.enrichment.lookup_rdns(dip).await;
+                // rDNS is a network round-trip; bound it so a hostile/resolver
+                // timeout cannot stall the event loop for seconds.
+                let rdns_name = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    self.enrichment.lookup_rdns(dip),
+                )
+                .await
+                .unwrap_or_else(|_| "unknown".into());
                 let ppid = crate::process::ProcessResolver::ppid(pid).unwrap_or(0);
                 let parent_binary = crate::process::ProcessResolver::binary_path(ppid)
                     .unwrap_or_else(|| "unknown".into());
@@ -549,7 +633,6 @@ impl Daemon {
                 );
                 self.ipc.broadcast_raw(&prompt_evt).await;
             }
-            trust::TrustStatus::Unknown => {}
         }
     }
 
@@ -607,11 +690,17 @@ impl Daemon {
         if raw.len() < 36 {
             return;
         }
-        let rule_id = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
+        let dpi_idx = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
         let src_ip = u32::from_le_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
         let dst_ip = u32::from_le_bytes(raw[28..32].try_into().unwrap_or([0; 4]));
         let dst_port = u16::from_le_bytes(raw[32..34].try_into().unwrap_or([0; 2]));
         let proto = raw[34];
+        // The kernel reports the sequential pattern index; translate it to the
+        // real signature rule id (index-aligned with BPF_DPI_SIGNATURES).
+        let rule_id = ebpf::BPF_DPI_RULE_IDS
+            .get(dpi_idx as usize)
+            .copied()
+            .unwrap_or(dpi_idx);
         let name = self
             .dpi
             .signature_name(rule_id)
@@ -630,14 +719,25 @@ impl Daemon {
             if proto == 17 { "/udp" } else { "/tcp" }
         );
         let alert = build_alert_bytes_rule(5000 + rule_id, 2, &msg);
-        self.storage.write_alert(&alert);
-        self.ipc.broadcast_raw(&alert).await;
+        if self.alert_due(5000 + rule_id) {
+            self.storage.write_alert(&alert);
+            self.ipc.broadcast_raw(&alert).await;
+        }
         info!("[DPI] {msg}");
     }
 
     async fn on_lsm_event(&self, raw: &[u8]) {
         self.event_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !event_len_ok(raw[0], raw.len()) {
+            error!(
+                "LSM ring-buffer ABI mismatch: kind {} got {} bytes (expected >= {})",
+                raw[0],
+                raw.len(),
+                ring0_abi::SIZE_LSM
+            );
+            return;
+        }
         if raw.len() < 132 {
             return;
         }
@@ -709,7 +809,14 @@ impl Daemon {
     async fn on_privesc_event(&self, raw: &[u8]) {
         self.event_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if raw.len() < 28 {
+        // Canonical size check (KIND_PTRACE needs 32 bytes; the previous
+        // `len < 28` guard could not safely read the target field).
+        if !event_len_ok(raw[0], raw.len()) {
+            error!(
+                "PRIVESC ring-buffer ABI mismatch: kind {} got {} bytes",
+                raw[0],
+                raw.len()
+            );
             return;
         }
         let pid = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
@@ -728,13 +835,23 @@ impl Daemon {
                 // A real uid escalation is the clearest privilege-escalation signal;
                 // contain the process. (Informational capable/ptrace events do not
                 // trigger containment — freezing processes for those is destructive.)
-                containment::ContainmentManager::quarantine_pid(pid);
+                // Capture starttime at event time and verify before freezing so a
+                // recycled PID cannot freeze an innocent process.
+                let starttime = crate::process::ProcessResolver::starttime(pid);
+                containment::ContainmentManager::quarantine_pid_checked(pid, starttime);
             }
             ebpf::KIND_PTRACE => {
                 let target = u32::from_le_bytes(raw[28..32].try_into().unwrap_or([0; 4]));
                 self.privesc.ingest_ptrace_attempt(pid, uid, target);
-                let a =
-                    build_alert_bytes_rule(2002, 4, &format!("ptrace PID {} -> {}", pid, target));
+                let a = build_alert_bytes_rule(
+                    2002,
+                    4,
+                    &if target != 0 {
+                        format!("ptrace PID {} -> {}", pid, target)
+                    } else {
+                        format!("ptrace access attempt PID {}", pid)
+                    },
+                );
                 self.storage.write_alert(&a);
                 self.ipc.broadcast_raw(&a).await;
             }
@@ -756,6 +873,15 @@ impl Daemon {
     async fn on_rootkit_event(&self, raw: &[u8]) {
         self.event_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Canonical size check per kind (mmap=56, module=92, memfd=60).
+        if !event_len_ok(raw[0], raw.len()) {
+            error!(
+                "ROOTKIT ring-buffer ABI mismatch: kind {} got {} bytes",
+                raw[0],
+                raw.len()
+            );
+            return;
+        }
         if raw.len() < 60 {
             return;
         }
@@ -844,9 +970,15 @@ impl Daemon {
         );
     }
 
-    fn tick_governor(&self) {
+    fn tick_governor(&mut self) {
         let state = self.governor.tick();
         let pct = self.governor.daemon_cpu_pct() + self.governor.bpf_cpu_pct();
+        // Apply the governor's decisions to the kernel. Previously the
+        // sampling/dpi flags were written by the governor but never consumed
+        // by anything — the control loop was inert.
+        self.ebpf
+            .set_sampling_enabled(self.governor.is_sampling_enabled());
+        self.ebpf.set_dpi_enforce(self.governor.is_dpi_fast_mode());
         if state != governor::GovernorState::Normal {
             info!(
                 "Governor state: {:?} (cpu={:.1}%) sampling={} dpi_fast={}",
@@ -868,7 +1000,8 @@ impl Daemon {
             self.storage.write_alert(&bytes);
             self.ipc.broadcast_raw(&bytes).await;
             if alert.severity >= 3 {
-                containment::ContainmentManager::quarantine_pid(alert.root_pid);
+                let starttime = crate::process::ProcessResolver::starttime(alert.root_pid);
+                containment::ContainmentManager::quarantine_pid_checked(alert.root_pid, starttime);
                 self.forensics.trigger_export(
                     alert.id,
                     alert.severity,
@@ -881,7 +1014,32 @@ impl Daemon {
         }
     }
 
-    fn apply_blocklist_payload(&mut self) {
+    /// Alert rate limiter: at most one alert per rule id per window, so a
+    /// flood (e.g. a scan hitting the blocked-port path, or DPI matches on
+    /// every packet of a flow) cannot amplify into a storage/IPC storm.
+    fn alert_due(&self, rule_id: u32) -> bool {
+        const ALERT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        let mut map = self.alert_throttle.lock();
+        let now = std::time::Instant::now();
+        if let Some(prev) = map.get(&rule_id) {
+            if now.duration_since(*prev) < ALERT_MIN_INTERVAL {
+                return false;
+            }
+        }
+        map.insert(rule_id, now);
+        if map.len() > 256 {
+            // E20: drop only expired entries so the throttle stays effective —
+            // clearing reopened the suppression window for every rule at once.
+            map.retain(|_, prev| now.duration_since(*prev) < ALERT_MIN_INTERVAL);
+            if map.len() > 256 {
+                map.clear(); // everything is hot — start over
+            }
+        }
+        true
+    }
+
+    async fn apply_blocklist_payload(&mut self) {
+        const SYNC_CHUNK: usize = 2048;
         let payload = self.blocklist_payload.lock().take();
         if let Some(payload) = payload {
             info!(
@@ -890,14 +1048,29 @@ impl Daemon {
                 payload.domains.len(),
                 payload.ports.len()
             );
-            let c = self.ebpf.sync_blocked_cidrs(&payload.cidrs);
-            let d = self.ebpf.sync_dns_domains(&payload.domains);
-            let p = self.ebpf.sync_blocked_ports(&payload.ports);
+            // F11: each insert is a syscall; a full feed (tens of thousands of
+            // entries) would stall the event loop for seconds. Apply in chunks
+            // and yield between them so IPC/event processing stays responsive.
+            let mut c = 0usize;
+            for chunk in payload.cidrs.chunks(SYNC_CHUNK) {
+                c += self.ebpf.sync_blocked_cidrs(chunk);
+                tokio::task::yield_now().await;
+            }
+            let mut d = 0usize;
+            for chunk in payload.domains.chunks(SYNC_CHUNK) {
+                d += self.ebpf.sync_dns_domains(chunk);
+                tokio::task::yield_now().await;
+            }
+            let mut p = 0usize;
+            for chunk in payload.ports.chunks(SYNC_CHUNK) {
+                p += self.ebpf.sync_blocked_ports(chunk);
+                tokio::task::yield_now().await;
+            }
             info!("Kernel sync complete: {c} cidrs, {d} domains, {p} ports in eBPF maps");
         }
     }
 
-    fn handle_command(&mut self, cmd: ipc::DaemonCmd) {
+    async fn handle_command(&mut self, cmd: ipc::DaemonCmd) {
         use ipc::DaemonCmd::*;
         match cmd {
             BlockIp(ip) => {
@@ -911,25 +1084,44 @@ impl Daemon {
                 }
             }
             BlockPort(port) => {
+                // E4: the wire type is u32 but the kernel map key is u16;
+                // truncating here would block the *wrong* port (e.g.
+                // 70000 → 4464). Reject out-of-range values outright.
+                let Some(port) = u16::try_from(port).ok() else {
+                    warn!("refusing to block out-of-range port {port}");
+                    return;
+                };
                 if let Err(e) = self.ebpf.block_port(port) {
                     error!("block_port: {e:?}")
                 }
                 self.threat_blocklist.block_port(port);
             }
             UnblockPort(port) => {
+                let Some(port) = u16::try_from(port).ok() else {
+                    warn!("refusing to unblock out-of-range port {port}");
+                    return;
+                };
                 if let Err(e) = self.ebpf.unblock_port(port) {
                     error!("unblock_port: {e:?}")
                 }
                 self.threat_blocklist.unblock_port(port);
             }
             KillProcess(pid) => {
+                // F1: pid_t is signed 32-bit — a u32 pid >= 0x8000_0000 casts
+                // to a negative pid_t, and kill(-1, SIGKILL) signals EVERY
+                // process the daemon may signal. Refuse anything that does not
+                // fit a positive pid_t.
+                let Some(pid_i) = i32::try_from(pid).ok().filter(|p| *p > 0) else {
+                    warn!("refusing to kill invalid PID {pid}");
+                    return;
+                };
                 // Confused-deputy hardening: never let a caller (even a
                 // privileged one) terminate critical system processes.
                 let daemon_pid = std::process::id();
                 if pid == 0 || pid == 1 || pid == daemon_pid {
                     warn!("refusing to kill protected PID {pid}");
                 } else {
-                    let r = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                    let r = unsafe { libc::kill(pid_i, libc::SIGKILL) };
                     if r == 0 {
                         info!("killed {pid}")
                     } else {
@@ -959,7 +1151,17 @@ impl Daemon {
                     let _ = i.sync_feeds().await;
                 });
             }
-            SubmitPromptDecision(prompt_id, action, scope) => {
+            SubmitPromptDecision(prompt_id, action, scope, caller_pid) => {
+                // Defense in depth on top of the privilege gate: the process
+                // under scrutiny must never be able to approve its own prompt.
+                if let Some(p) = self.prompt.pending_get(prompt_id) {
+                    if p.pid == caller_pid {
+                        warn!(
+                            "rejected self-approval: PID {caller_pid} attempted to decide prompt {prompt_id} targeting itself"
+                        );
+                        return;
+                    }
+                }
                 let act = match action.as_str() {
                     "allow_once" => prompt::PromptAction::AllowOnce,
                     "allow_always" => prompt::PromptAction::AllowAlways,
@@ -983,19 +1185,42 @@ impl Daemon {
                     },
                 );
             }
+            MarkFlowAllowed(dst_ip, dst_port, protocol, pid) => {
+                // F11: resolve_flow_for_dst walks /proc/*/fd for every process
+                // — a synchronous scan that must not run on the event loop.
+                let key = tokio::task::spawn_blocking(move || {
+                    crate::process::ProcessResolver::resolve_flow_for_dst(
+                        pid, dst_ip, dst_port, protocol,
+                    )
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some(key) = key {
+                    match self.ebpf.mark_flow_established(&key) {
+                        Ok(()) => {
+                            let _ = self.fastpath.mark_flow_safe(key);
+                            info!(
+                                "allow_once: flow {}.{}.{}.{}:{} (pid {pid}) offloaded",
+                                (dst_ip >> 24) & 0xFF,
+                                (dst_ip >> 16) & 0xFF,
+                                (dst_ip >> 8) & 0xFF,
+                                dst_ip & 0xFF,
+                                dst_port
+                            );
+                        }
+                        Err(e) => warn!("allow_once: kernel offload failed: {e}"),
+                    }
+                }
+            }
             FlatpakList => {
                 let a = self.desktop_sandbox.list_apps();
                 info!("Flatpak: {} apps", a.len());
             }
-            PowerStatus => info!(
-                "Power: battery={} fim={}",
-                self.power.is_on_battery(),
-                self.power.is_fim_throttled()
-            ),
             UpdateSettings(json) => info!("Settings: {json}"),
             RunDoctor => info!("Doctor requested"),
             Status => {
-                self.apply_blocklist_payload();
+                self.apply_blocklist_payload().await;
                 let total = self.event_count.load(std::sync::atomic::Ordering::Relaxed);
                 let mut last = self.last_status.lock();
                 let now = std::time::Instant::now();
@@ -1017,8 +1242,51 @@ impl Daemon {
                 let domains = self.ebpf.blocked_domain_count() as u32;
                 let cidrs = filters.len() as u32;
                 let ports = self.ebpf.blocked_port_count() as u32;
-                let status =
-                    ipc::build_status_event(&filters, cpu, ram, eps, domains, cidrs, ports);
+                let dropped = self.storage.dropped_count();
+                // E19: the client read path caps frames at 64 KiB — a huge
+                // blocked-CIDR list would exceed it and the client would
+                // discard the status frame. Cap the embedded list (counters
+                // still reflect the full set).
+                let filters: Vec<String> = filters.into_iter().take(500).collect();
+                let status = ipc::build_status_event(
+                    &filters,
+                    cpu,
+                    ram,
+                    eps,
+                    domains,
+                    cidrs,
+                    ports,
+                    dropped,
+                    self.power.is_on_battery(),
+                    self.power.is_fim_throttled(),
+                );
+                self.ipc.broadcast_sync(&status);
+            }
+            PowerStatus => {
+                info!(
+                    "Power: battery={} fim={}",
+                    self.power.is_on_battery(),
+                    self.power.is_fim_throttled()
+                );
+                // Reply with a status frame so the GUI can display power state.
+                let filters = self
+                    .ebpf
+                    .blocked_ips()
+                    .into_iter()
+                    .take(500)
+                    .collect::<Vec<_>>();
+                let status = ipc::build_status_event(
+                    &filters,
+                    self.governor.daemon_cpu_pct(),
+                    read_vm_rss(),
+                    0.0,
+                    self.ebpf.blocked_domain_count() as u32,
+                    filters.len() as u32,
+                    self.ebpf.blocked_port_count() as u32,
+                    self.storage.dropped_count(),
+                    self.power.is_on_battery(),
+                    self.power.is_fim_throttled(),
+                );
                 self.ipc.broadcast_sync(&status);
             }
         }
@@ -1027,6 +1295,16 @@ impl Daemon {
         self.ebpf.detach();
         self.storage.flush();
         std::fs::remove_file(ring0_common::socket_path()).ok();
+    }
+}
+
+/// Validate a ring-buffer entry against the canonical per-kind size table
+/// (ring0-abi). Unknown kinds pass (handlers may still reject them); known
+/// kinds must be at least the canonical size.
+fn event_len_ok(kind: u8, len: usize) -> bool {
+    match ring0_abi::EVENT_SIZE.get(kind as usize).copied().flatten() {
+        Some(expected) => len >= expected,
+        None => true,
     }
 }
 
@@ -1063,68 +1341,88 @@ fn read_vm_rss() -> u64 {
 }
 
 fn build_alert_bytes_hids(rid: u32, binary: &str, path: &str) -> Vec<u8> {
-    let ts = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or(0)
-        .to_be_bytes();
-    let mut buf = Vec::with_capacity(32 + 64 + 64);
-    buf.extend_from_slice(&ts);
-    buf.push(3);
-    buf.extend_from_slice(&rid.to_be_bytes());
-    let bb = binary.as_bytes();
-    let bl = bb.len().min(64) as u8;
-    buf.push(bl);
-    buf.extend_from_slice(&bb[..bl as usize]);
-    let pb = path.as_bytes();
-    let pl = pb.len().min(64) as u8;
-    buf.push(pl);
-    buf.extend_from_slice(&pb[..pl as usize]);
-    buf
+    alert::AlertRecord::new(3, rid, &format!("{binary}: {path}")).encode()
 }
 
 fn build_alert_bytes_rule(rid: u32, sev: u8, msg: &str) -> Vec<u8> {
-    let ts = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or(0)
-        .to_be_bytes();
-    let mut buf = Vec::with_capacity(32 + 64);
-    buf.extend_from_slice(&ts);
-    buf.push(sev);
-    buf.extend_from_slice(&rid.to_be_bytes());
-    let mb = msg.as_bytes();
-    let ml = mb.len().min(64) as u8;
-    buf.push(ml);
-    buf.extend_from_slice(&mb[..ml as usize]);
-    buf
+    alert::AlertRecord::new(sev, rid, msg).encode()
 }
 
 fn build_self_defense_alert(evt: &self_defense::SelfDefenseEvent) -> Vec<u8> {
-    let ts = evt.timestamp.to_be_bytes();
-    let mut buf = Vec::with_capacity(32 + 64);
-    buf.extend_from_slice(&ts);
-    buf.push(3);
-    buf.extend_from_slice(&0u32.to_be_bytes());
-    let msg = format!("self-defense: PID {} {}", evt.attacker_pid, evt.syscall);
-    let mb = msg.as_bytes();
-    let ml = mb.len().min(64) as u8;
-    buf.push(ml);
-    buf.extend_from_slice(&mb[..ml as usize]);
-    buf
+    alert::AlertRecord::new(
+        3,
+        0,
+        &format!("self-defense: PID {} {}", evt.attacker_pid, evt.syscall),
+    )
+    .encode()
 }
 
 fn build_correlation_alert_bytes(alert: &correlation::CorrelationAlert) -> Vec<u8> {
-    let ts = alert.timestamp.to_be_bytes();
-    let mut buf = Vec::with_capacity(64);
-    buf.extend_from_slice(&ts);
-    buf.push(alert.severity);
-    buf.extend_from_slice(&alert.pattern_id.to_be_bytes());
-    let msg = format!(
-        "[{}] {} — {}",
-        alert.mitre_technique, alert.pattern_name, alert.description
-    );
-    let mb = msg.as_bytes();
-    let ml = mb.len().min(128) as u8;
-    buf.push(ml);
-    buf.extend_from_slice(&mb[..ml as usize]);
-    buf
+    alert::AlertRecord::new(
+        alert.severity,
+        alert.pattern_id,
+        &format!(
+            "[{}] {} — {}",
+            alert.mitre_technique, alert.pattern_name, alert.description
+        ),
+    )
+    .encode()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_len_ok_never_panics_and_enforces_known_sizes() {
+        // E6: exhaustive kinds x lengths — the ring-buffer guard must never
+        // panic and must reject every undersized fixed-layout kind.
+        for kind in 0u8..=255u8 {
+            for len in 0..=200usize {
+                let ok = event_len_ok(kind, len);
+                match ring0_abi::EVENT_SIZE.get(kind as usize).copied().flatten() {
+                    Some(expected) => {
+                        assert_eq!(ok, len >= expected, "kind {kind} len {len}")
+                    }
+                    None => assert!(ok, "unknown kind {kind} must pass through"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alert_decode_never_panics_on_garbage() {
+        // AlertRecord::decode sits on the untrusted storage read path
+        // (query_alerts / build_query_response) — it must never panic on
+        // arbitrary bytes.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for len in 0..128usize {
+            let mut buf = vec![0u8; len];
+            for b in buf.iter_mut() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *b = seed as u8;
+            }
+            let _ = alert::AlertRecord::decode(&buf);
+        }
+    }
+
+    #[test]
+    fn negative_pid_casts_are_rejected() {
+        // F1 regression: these u32 pids cast to negative pid_t and must never
+        // reach kill(2) as process-group (-N) or all-process (-1) signals.
+        for pid in [u32::MAX, 0xFFFF_FFFE, 0x8000_0000, 0x8000_0001] {
+            assert!(
+                i32::try_from(pid).ok().filter(|p| *p > 0).is_none(),
+                "pid {pid} must be rejected"
+            );
+        }
+        for pid in [1u32, 1000u32, i32::MAX as u32] {
+            assert!(
+                i32::try_from(pid).ok().filter(|p| *p > 0).is_some(),
+                "valid pid {pid} must pass"
+            );
+        }
+    }
 }
