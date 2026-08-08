@@ -8,8 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # NOTE: the toolchain is pinned by rust-toolchain.toml (stable); the eBPF
-  # build selects nightly explicitly in xtask via RUSTUP_TOOLCHAIN.
+  # The eBPF crate is built by xtask with a pinned nightly (nightly-2025-05-01,
+  # LLVM 20 — newer nightlies emit verifier-rejected BPF code), so CI installs
+  # rustup-managed toolchains instead of relying on the distro rustc.
 
 jobs:
   lint:
@@ -17,15 +18,23 @@ jobs:
     container: fedora:41
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
-          dnf install -y rust cargo clang llvm-devel kernel-devel \
+          dnf install -y clang llvm-devel kernel-devel \
             cmake hyperscan-devel rocksdb-devel capnproto-devel \
             qt6-qtbase-devel qt6-qtdeclarative-devel
+      - name: Setup Rust (rustup stable)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable \
+              --component rustfmt,clippy,rust-src
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Rustfmt check
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        # ring0-ebpf is a BPF-target crate (nightly + bpfel-unknown-none); it is
+        # linted by the eBPF build instead of the workspace clippy pass.
+        run: cargo clippy --workspace --exclude ring0-ebpf -- -D warnings
 
   build:
     runs-on: ubuntu-latest
@@ -33,10 +42,19 @@ jobs:
     needs: lint
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
-          dnf install -y rust cargo clang llvm-devel kernel-devel \
+          dnf install -y clang llvm-devel kernel-devel \
             cmake hyperscan-devel rocksdb-devel capnproto-devel
+      - name: Setup Rust (rustup stable + pinned nightly)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable \
+              --component rustfmt,clippy,rust-src
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup toolchain install nightly-2025-05-01 --profile minimal --component rust-src
+          rustup target add bpfel-unknown-none --toolchain nightly-2025-05-01
+          rustup default stable
       - name: Build eBPF
         run: cargo xtask build
       - name: Build user-space
@@ -48,11 +66,20 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
-          dnf install -y rust cargo clang llvm-devel kernel-devel \
+          dnf install -y clang llvm-devel kernel-devel \
             cmake hyperscan-devel rocksdb-devel capnproto-devel \
             bpftool
+      - name: Setup Rust (rustup stable + pinned nightly)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable \
+              --component rustfmt,clippy,rust-src
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup toolchain install nightly-2025-05-01 --profile minimal --component rust-src
+          rustup target add bpfel-unknown-none --toolchain nightly-2025-05-01
+          rustup default stable
       - name: Build eBPF
         run: cargo xtask build
       - name: Run unit tests
@@ -68,10 +95,13 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
-      - name: Install Qt6
+      - name: Install Qt6 + Rust
         run: |
-          dnf install -y rust cargo qt6-qtbase-devel qt6-qtdeclarative-devel \
+          dnf install -y qt6-qtbase-devel qt6-qtdeclarative-devel \
             cmake clang
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Build GUI
         run: cargo build --release -p ring0-gui
 
@@ -81,9 +111,12 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
+      - name: Install dependencies + Rust
         run: |
-          dnf install -y rust cargo clang cmake hyperscan-devel rocksdb-devel capnproto-devel
+          dnf install -y clang cmake hyperscan-devel rocksdb-devel capnproto-devel
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Run benchmarks
         run: cargo bench -p ring0d || echo "Benchmarks require nightly"
 
