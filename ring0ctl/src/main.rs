@@ -40,6 +40,13 @@ enum Cli {
 }
 
 fn main() -> Result<()> {
+    // Restore default SIGPIPE so piping output into `head`/`less` terminates
+    // silently instead of panicking ("failed printing to stdout: Broken pipe").
+    // SAFETY: signal(2) with SIG_DFL is async-signal-safe and has no aliasing
+    // concerns at process start (single-threaded at this point).
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     match cli {
         Cli::Status => cmd_status(),

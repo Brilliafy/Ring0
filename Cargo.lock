@@ -2629,6 +2629,7 @@ dependencies = [
  "chrono",
  "clap",
  "colored",
+ "libc",
  "ring0-common",
  "serde_json",
  "tokio",
