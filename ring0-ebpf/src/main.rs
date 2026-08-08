@@ -56,6 +56,7 @@ pub static SAMPLING_ENABLED: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
 /// must NOT emit one event per packet or the daemon (which writes every event
 /// to storage) saturates the disk and the whole system freezes under ordinary
 /// traffic. Rate limit to one event per 20ms (~50/s).
+#[map]
 pub static PACKET_LAST_EMIT: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
 
 #[map]
