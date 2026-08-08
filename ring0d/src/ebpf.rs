@@ -881,43 +881,105 @@ fn attach_lsm(ebpf: &mut Ebpf, name: &str, btf: &aya::Btf) -> Result<()> {
 fn attach_uprobes(ebpf: &mut Ebpf) -> Result<()> {
     use aya::programs::uprobe::UProbeScope;
     use aya::programs::UProbe;
-    let libssl = find_libssl()?;
+    // Attach to EVERY libssl instance on the system, not just /usr/lib64:
+    // conda/homebrew/etc. bundle their own libssl (e.g. anaconda's curl
+    // loads ~/anaconda3/lib/libssl.so.3), which a single-path attach would
+    // silently miss.
+    let libssl_paths = find_libssl_paths();
+    if libssl_paths.is_empty() {
+        anyhow::bail!("no libssl found on the system");
+    }
+    info!(
+        "attaching TLS uprobes to {} libssl path(s)",
+        libssl_paths.len()
+    );
     // Each #[uprobe] fn is its own program named by symbol (aya 0.14).
-    // Attach both independently; a failure on one must not drop the other.
+    // Attach both independently; a failure on one must not drop the others.
     let pairs = [
         ("ring0_ssl_write", "SSL_write"),
         ("ring0_ssl_read", "SSL_read"),
     ];
+    // Each #[uprobe] fn is one program object: load it ONCE, then attach it
+    // to every libssl path (aya supports multiple managed links per probe).
     for (symbol, fn_name) in pairs {
-        let result = (|| -> Result<()> {
-            let program: &mut UProbe = ebpf
-                .program_mut(symbol)
-                .with_context(|| format!("uprobe program {symbol} not found"))?
-                .try_into()?;
-            program.load()?; // aya >= 0.13 requires an explicit load
-            program.attach(fn_name, &libssl, UProbeScope::AllProcesses)?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => info!("uprobe {symbol} -> {fn_name} attached"),
-            Err(e) => warn!("uprobe {symbol} attach failed: {e}"),
+        let program: &mut UProbe = match ebpf
+            .program_mut(symbol)
+            .with_context(|| format!("uprobe program {symbol} not found"))?
+            .try_into()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("uprobe {symbol} load failed: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = program.load() {
+            warn!("uprobe {symbol} load failed: {e}");
+            continue;
+        }
+        for libssl in &libssl_paths {
+            match program.attach(fn_name, libssl, UProbeScope::AllProcesses) {
+                Ok(_) => info!("uprobe {symbol} -> {fn_name} attached ({libssl})"),
+                Err(e) => warn!("uprobe {symbol} attach failed on {libssl}: {e}"),
+            }
         }
     }
     Ok(())
 }
 
-fn find_libssl() -> Result<String> {
-    for path in [
+/// All libssl shared-library paths on the system: common fixed locations
+/// plus every `libssl.so.3` listed by the dynamic linker cache (catches
+/// conda/homebrew/user-installed copies).
+fn find_libssl_paths() -> Vec<String> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    let mut push = |p: &str| {
+        if std::path::Path::new(p).exists() && seen.insert(p.to_string()) {
+            paths.push(p.to_string());
+        }
+    };
+    for p in [
         "/usr/lib64/libssl.so.3",
         "/usr/lib64/libssl.so",
         "/usr/lib/x86_64-linux-gnu/libssl.so.3",
         "/usr/lib/x86_64-linux-gnu/libssl.so",
+        "/lib64/libssl.so.3",
     ] {
-        if std::path::Path::new(path).exists() {
-            return Ok(path.to_string());
+        push(p);
+    }
+    // User-space copies: conda/miniconda/venvs bundle their own libssl (e.g.
+    // anaconda's curl resolves ~/anaconda3/lib/libssl.so.3, which ldconfig
+    // does not list). The daemon may run as root, so probe /home/* rather
+    // than $HOME, plus a root-local fallback.
+    for sub in [
+        "/anaconda3/lib/libssl.so.3",
+        "/miniconda3/lib/libssl.so.3",
+        "/miniconda/lib/libssl.so.3",
+        "/.local/lib/libssl.so.3",
+        "/.local/lib/x86_64-linux-gnu/libssl.so.3",
+    ] {
+        push(&format!("/root{sub}"));
+        if let Ok(entries) = std::fs::read_dir("/home") {
+            for e in entries.flatten() {
+                push(&format!("{}{}", e.path().display(), sub));
+            }
         }
     }
-    anyhow::bail!("libssl not found")
+    // Dynamic linker cache: `ldconfig -p` lines look like
+    //   libssl.so.3 (libc6,x86-64) => /path/to/libssl.so.3
+    if let Ok(out) = std::process::Command::new("ldconfig").arg("-p").output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let line = line.trim();
+            if line.contains("libssl.so") {
+                if let Some(idx) = line.rfind("=> ") {
+                    push(line[idx + 3..].trim());
+                }
+            }
+        }
+    }
+    paths
 }
 
 fn spawn_ring_reader(

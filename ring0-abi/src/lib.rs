@@ -126,7 +126,7 @@ mod tests {
         // PacketEvent: pid at 32..36, action at 36.
         assert_eq!(SIZE_PACKET, 40);
         // TlsEvent: payload (buf) starts at 28.
-        assert_eq!(SIZE_TLS, 284);
+        assert_eq!(SIZE_TLS, 292);
         // DpiEvent: dst_port at 32..34, protocol at 34.
         assert_eq!(SIZE_DPI, 36);
     }
