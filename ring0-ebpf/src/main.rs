@@ -12,7 +12,7 @@ use core::ptr;
 use aya_ebpf::{
     bindings::xdp_action,
     macros::{btf_tracepoint, classifier, lsm, map, uprobe, xdp},
-    maps::{lpm_trie::Key, HashMap, LpmTrie, LruHashMap, RingBuf},
+    maps::{lpm_trie::Key, HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf},
     programs::{BtfTracePointContext, LsmContext, ProbeContext, TcContext, XdpContext},
     EbpfContext,
 };
@@ -56,16 +56,34 @@ pub static SAMPLING_ENABLED: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
 /// traffic. Rate limit to one event per 20ms (~50/s).
 #[map]
 pub static PACKET_LAST_EMIT: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
-/// Per-connection TLS plaintext budget in bytes, keyed by (pid, SSL*).
-/// The interesting part of any flow is its START (protocol headers, the
-/// request, the first bytes of the response); everything after the budget is
-/// bulk transfer ("just download data") with little detection value. Once a
-/// connection exceeds the budget we stop emitting TLS events for it, so the
-/// daemon scans ~8KB per connection instead of the entire transfer.
-const TLS_SCAN_BUDGET_BYTES: u32 = 8192;
+/// Default per-connection TLS plaintext budget in bytes. The interesting
+/// part of any flow is its START (protocol headers, the request, the first
+/// bytes of the response); the rest is bulk transfer with little detection
+/// value. The budget is re-armed on HTTP request boundaries (Keep-Alive /
+/// HTTP/2 connection reuse) and by strided re-sampling on long flows.
+const TLS_DEFAULT_BUDGET: u32 = 8192;
+/// After a flow's budget is exhausted, re-arm a fresh window every STRIDE
+/// bytes (~16 MiB) so long-running transfers get periodic oversight
+/// (protocol shifts, C2 keep-alives, malware dropped mid-transfer) at ~0
+/// userspace cost. 10 GB of bulk -> ~640 window checks of 8 KB each.
+const TLS_STRIDE_BYTES: u32 = 16 * 1024 * 1024;
+/// Budget used for untrusted/suspicious processes (script hosts, binaries
+/// from /tmp, unsigned builds). More surface for high-risk actors.
+pub const TLS_UNTRUSTED_BUDGET: u32 = 32768;
 
 #[map]
 pub static TLS_FLOW_BUDGET: HashMap<u64, u32> = HashMap::with_max_entries(65536, 0);
+/// Per-pid TLS budget override (bytes) populated by the daemon from the
+/// trust engine: untrusted processes get TLS_UNTRUSTED_BUDGET, trusted
+/// high-throughput apps get a smaller window. Absent = TLS_DEFAULT_BUDGET.
+#[map]
+pub static TLS_PID_BUDGET: HashMap<u32, u32> = HashMap::with_max_entries(4096, 0);
+/// Per-CPU scratch for the captured TLS plaintext. A 256-byte stack buffer
+/// plus the 284-byte event struct exceeded the BPF stack limit (512 bytes);
+/// the scratch lives in a PERCPU_ARRAY so the probe touches no big stack
+/// locals.
+#[map]
+pub static TLS_SCRATCH: PerCpuArray<[u8; 256]> = PerCpuArray::with_max_entries(1, 0);
 
 #[map]
 pub static APP_QOS_MAP: HashMap<QosRateKey, QosRateVal> = HashMap::with_max_entries(256, 0);
@@ -1092,6 +1110,28 @@ unsafe fn ring0_handle_finit_module(regs: *const aya_ebpf::bindings::pt_regs) {
 
 // ── TLS uprobes ──────────────────────────────────────────────
 
+/// True when the captured SSL_write plaintext starts with an HTTP request
+/// method — the boundary of a NEW request on a reused connection. HTTP/1.1
+/// requests begin with the method verb; HTTP/2 begins with the PRI preface
+/// (not a method, so no reset — the connection-start budget already covered
+/// it).
+#[inline(always)]
+fn is_http_request_start(buf: &[u8; 256], len: usize) -> bool {
+    const METHODS: [&[u8]; 8] = [
+        b"GET ",
+        b"POST ",
+        b"PUT ",
+        b"HEAD ",
+        b"DELETE ",
+        b"PATCH ",
+        b"OPTIONS ",
+        b"CONNECT ",
+    ];
+    let n = core::cmp::min(len as usize, 8);
+    let head = &buf[..n];
+    METHODS.iter().any(|m| head.starts_with(m))
+}
+
 fn capture_tls_event(ctx: &ProbeContext, direction: u8) {
     let pid = ctx.pid();
     let ssl = ctx.arg::<*const u8>(0).unwrap_or(ptr::null()) as u64;
@@ -1111,19 +1151,53 @@ fn capture_tls_event(ctx: &ProbeContext, direction: u8) {
     if len == 0 || buf_ptr.is_null() {
         return;
     }
-    // Per-connection budget: the interesting bytes of a flow are its start.
-    // The SSL handle uniquely identifies a connection within a process, so
-    // (pid, SSL*) keys the budget. Once a connection's budget is spent we
-    // stop emitting events for it — no ring traffic, no daemon scan.
+    let is_write = direction == 0;
+    // Per-connection budget, keyed by (pid, SSL*) — the SSL handle uniquely
+    // identifies a connection within a process. Per-pid override from the
+    // daemon (trust engine) selects the budget.
     let key = ((pid as u64) << 32) | (ssl & 0xFFFF_FFFF);
-    let within_budget = unsafe {
+    let budget = unsafe {
+        TLS_PID_BUDGET
+            .get_ptr(&pid)
+            .map(|b| *b)
+            .unwrap_or(TLS_DEFAULT_BUDGET)
+    };
+    // Writes need the plaintext to detect request boundaries even in skip
+    // mode (Keep-Alive reuse); reads are probed only when emitting. The
+    // scratch is per-CPU and preemption is disabled for the duration of the
+    // probe, so it cannot be clobbered mid-program.
+    let scratch = unsafe { TLS_SCRATCH.get_ptr_mut(0) };
+    let Some(sp) = scratch else {
+        return;
+    };
+    let sp: &mut [u8; 256] = unsafe { &mut *sp };
+    if is_write {
+        if let Some(dst) = sp.get_mut(..len as usize) {
+            let _ = unsafe { aya_ebpf::helpers::bpf_probe_read_user_buf(buf_ptr, dst) };
+        }
+    }
+    let new_request = is_write && is_http_request_start(sp, len as usize);
+    let emit = unsafe {
         match TLS_FLOW_BUDGET.get_ptr_mut(&key) {
-            Some(b) => {
-                if *b >= TLS_SCAN_BUDGET_BYTES {
-                    false
-                } else {
-                    *b = (*b).saturating_add(len);
+            Some(v) => {
+                if new_request && *v >= budget {
+                    // New request on an exhausted connection: re-arm a fresh
+                    // window (catches Keep-Alive / HTTP-2 exfiltration).
+                    *v = len;
                     true
+                } else if *v < budget {
+                    // Inside the interesting window: capture.
+                    *v = (*v).saturating_add(len);
+                    true
+                } else if *v >= budget + TLS_STRIDE_BYTES {
+                    // Strided re-sampling: long flows get periodic 8 KB
+                    // oversight instead of a permanent mute.
+                    *v = len;
+                    true
+                } else {
+                    // Bulk phase: count bytes toward the stride, emit nothing.
+                    *v = (*v).saturating_add(len);
+                    false
                 }
             }
             // First capture for this connection. E2BIG (map full) degrades to
@@ -1131,25 +1205,23 @@ fn capture_tls_event(ctx: &ProbeContext, direction: u8) {
             None => TLS_FLOW_BUDGET.insert(&key, &len, 0).is_ok(),
         }
     };
-    if !within_budget {
-        return;
-    }
-    if let Some(mut entry) = unsafe { RING_BUF.reserve::<TlsEvent>(0) } {
-        let mut buf = [0u8; 256];
-        // Read the TLS plaintext from user space with a probe-read helper.
-        // Direct dereference of user pointers is rejected by the verifier.
-        if let Some(dst) = buf.get_mut(..len as usize) {
-            let _ = unsafe { aya_ebpf::helpers::bpf_probe_read_user_buf(buf_ptr, dst) };
+    if emit {
+        if !is_write {
+            if let Some(dst) = sp.get_mut(..len as usize) {
+                let _ = unsafe { aya_ebpf::helpers::bpf_probe_read_user_buf(buf_ptr, dst) };
+            }
         }
-        entry.write(TlsEvent {
-            kind: KIND_TLS,
-            timestamp: ktime_get_ns(),
-            pid,
-            direction,
-            len,
-            buf,
-        });
-        entry.submit(0);
+        if let Some(mut entry) = unsafe { RING_BUF.reserve::<TlsEvent>(0) } {
+            entry.write(TlsEvent {
+                kind: KIND_TLS,
+                timestamp: ktime_get_ns(),
+                pid,
+                direction,
+                len,
+                buf: *sp,
+            });
+            entry.submit(0);
+        }
     }
 }
 
