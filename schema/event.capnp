@@ -140,6 +140,19 @@ struct SocketEntry {
 struct SocketListResponse {
     sockets @0 : List(SocketEntry); count @1 : UInt32;
 }
+# Discriminated envelope for every synchronous IPC reply. Cap'n Proto does
+# NOT type-check get_root::<T>() - a 2-field QueryResponse, ProcessListResponse
+# and SocketListResponse are indistinguishable to a naive reader, so a
+# client that tried each parser in turn would misclassify (e.g. stash a
+# process list into the query slot). The union tag is encoded, so which()
+# unambiguously selects the right parser.
+struct Response {
+    union {
+        query @0 : QueryResponse;
+        processes @1 : ProcessListResponse;
+        sockets @2 : SocketListResponse;
+    }
+}
 struct PromptDecisionCommand {
     promptId @0 : UInt64;
     action @1 : Text;

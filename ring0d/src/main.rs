@@ -26,14 +26,14 @@ pub mod hotswap;
 pub mod intel;
 // NextDNS/VirusTotal domain-reputation client. Parsed/compiled but not yet
 // wired into the event pipeline (see IntelApiClient).
-pub mod intel_api;
-pub mod ipc;
 #[cfg(test)]
 mod fuzz;
+pub mod intel_api;
+pub mod ipc;
 pub mod polkit;
-pub mod proc_snapshot;
 pub mod power;
 pub mod privesc;
+pub mod proc_snapshot;
 pub mod process;
 pub mod prompt;
 pub mod rootkit;
@@ -75,11 +75,19 @@ async fn main() -> Result<()> {
         Ok(journald_layer) => registry
             .with(env_filter)
             .with(journald_layer)
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).json())
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .json(),
+            )
             .init(),
         Err(_) => registry
             .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).json())
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .json(),
+            )
             .init(),
     }
 
@@ -583,6 +591,12 @@ impl Daemon {
         self.lineage.record_exec(pid, ppid, &binary, &cmdline);
         if let Some(pb) = &parent_binary {
             for rid in self.rules.check_process_anomaly(&binary, Some(pb)) {
+                // Rate-limit per rule: the anomaly matcher fires on EVERY exec
+                // of a matching pattern (e.g. scripts spawned from /tmp), which
+                // flooded storage and desktop notifications during testing.
+                if !self.alert_due(200 + rid) {
+                    continue;
+                }
                 let a = build_alert_bytes_rule(rid, 3, "process anomaly");
                 self.storage.write_alert(&a);
                 self.broadcast_alert_record(&a).await;
@@ -653,6 +667,22 @@ impl Daemon {
         let dip = u32::from_le_bytes(raw[24..28].try_into().unwrap_or([0; 4]));
         let dp = u16::from_le_bytes(raw[28..30].try_into().unwrap_or([0; 2]));
         let proto = raw[30];
+        self.handle_connect(pid, uid, dip, dp, proto, None).await;
+    }
+
+    /// Shared connect pipeline (trust check, contextual rules, approve
+    /// prompt). Both the kernel ConnectEvent (RING_BUF kind 3) and the LSM
+    /// socket_connect hook route here - the LSM was previously logged and
+    /// dropped, so the approve/disapprove window never appeared.
+    async fn handle_connect(
+        &mut self,
+        pid: u32,
+        uid: u32,
+        dip: u32,
+        dp: u16,
+        proto: u8,
+        binary_hint: Option<String>,
+    ) {
         crate::process::ProcessResolver::push_socket(pid, dip, dp, proto);
         self.correlation.push_connect(pid, dip, dp);
         self.lineage.record_connect(pid, dip, dp);
@@ -663,8 +693,10 @@ impl Daemon {
             let evt = ipc::build_alert_event(8002, 2, &anomaly);
             self.ipc.broadcast_raw(&evt).await;
         }
-        let binary =
-            crate::process::ProcessResolver::binary_path(pid).unwrap_or_else(|| "unknown".into());
+        let binary = binary_hint
+            .filter(|b| !b.is_empty())
+            .or_else(|| crate::process::ProcessResolver::binary_path(pid))
+            .unwrap_or_else(|| "unknown".into());
         let cmdline =
             crate::process::ProcessResolver::cmdline(pid).unwrap_or_else(|| "unknown".into());
         self.desktop_sandbox.resolve_pid(pid, &binary, &cmdline);
@@ -1002,9 +1034,10 @@ impl Daemon {
         info!("[DPI] {msg}");
     }
 
-    async fn on_lsm_event(&self, raw: &[u8]) {
+    async fn on_lsm_event(&mut self, raw: &[u8]) {
         self.event_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         if !event_len_ok(raw[0], raw.len()) {
             error!(
                 "LSM ring-buffer ABI mismatch: kind {} got {} bytes (expected >= {})",
@@ -1020,6 +1053,7 @@ impl Daemon {
         let event_type = raw[24];
         let denied = raw[25];
         let pid = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
+        let uid = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
         // LsmEvent layout: kind(0), ts(8..16), pid(16..20), uid(20..24),
         // event_type(24), denied(25), path(26..122), dst_ip(124..128),
         // dst_port(128..130). Note the path starts at byte 26.
@@ -1060,6 +1094,13 @@ impl Daemon {
             self.broadcast_alert_record(&alert).await;
         } else {
             info!("[LSM_ALLOW] {} pid={} path={}", event_name, pid, path);
+            // socket_connect in audit mode: route into the connect pipeline
+            // so untrusted/unknown binaries surface the approve/disapprove
+            // window (previously these events were logged and dropped).
+            if event_type == 2 {
+                self.handle_connect(pid, uid, dst_ip, dst_port, 6, Some(path))
+                    .await;
+            }
         }
     }
 

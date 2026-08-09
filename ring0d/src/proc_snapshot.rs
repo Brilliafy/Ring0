@@ -42,7 +42,9 @@ pub fn list_processes() -> Vec<ProcessInfo> {
     for entry in proc_dir.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Ok(pid) = name.parse::<u32>() else { continue };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
         let base = format!("/proc/{pid}");
         // stat: pid (comm) state ppid ...
         let mut stat = String::new();
@@ -51,7 +53,9 @@ pub fn list_processes() -> Vec<ProcessInfo> {
         let fields: Vec<&str> = stat.split_whitespace().collect();
         // comm may contain spaces/parens; find the last ')' instead of using
         // field indices.
-        let Some(close) = stat.rfind(')') else { continue };
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
         let tail: Vec<&str> = stat[close + 1..].split_whitespace().collect();
         if tail.len() < 3 {
             continue;
@@ -89,7 +93,13 @@ pub fn list_processes() -> Vec<ProcessInfo> {
             binary = p.to_string_lossy().to_string();
         });
         if binary.is_empty() {
-            binary = fields.get(1).copied().unwrap_or("?").trim_matches('(').trim_end_matches(')').to_string();
+            binary = fields
+                .get(1)
+                .copied()
+                .unwrap_or("?")
+                .trim_matches('(')
+                .trim_end_matches(')')
+                .to_string();
         }
 
         out.push(ProcessInfo {
@@ -117,15 +127,21 @@ fn inode_to_pid() -> HashMap<u64, (u32, String)> {
     for entry in proc_dir.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Ok(pid) = name.parse::<u32>() else { continue };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
         let fd_dir = format!("/proc/{pid}/fd");
-        let Ok(fds) = std::fs::read_dir(&fd_dir) else { continue };
+        let Ok(fds) = std::fs::read_dir(&fd_dir) else {
+            continue;
+        };
         let mut binary = String::new();
         let _ = std::fs::read_link(format!("/proc/{pid}/exe")).map(|p| {
             binary = p.to_string_lossy().to_string();
         });
         for fd in fds.flatten() {
-            let Ok(target) = std::fs::read_link(fd.path()) else { continue };
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
             let t = target.to_string_lossy();
             if let Some(rest) = t.strip_prefix("socket:[") {
                 if let Some(inode) = rest.trim_end_matches(']').parse::<u64>().ok() {
@@ -144,7 +160,9 @@ fn parse_net_file(
     map: &HashMap<u64, (u32, String)>,
     out: &mut Vec<SocketInfo>,
 ) {
-    let Ok(content) = std::fs::read_to_string(path) else { return };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
     for line in content.lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 10 {
@@ -154,8 +172,12 @@ fn parse_net_file(
         let Some(inode) = fields.get(9).and_then(|v| v.parse::<u64>().ok()) else {
             continue;
         };
-        let Some((local_ip, local_port)) = parse_addr(local) else { continue };
-        let Some((remote_ip, remote_port)) = parse_addr(remote) else { continue };
+        let Some((local_ip, local_port)) = parse_addr(local) else {
+            continue;
+        };
+        let Some((remote_ip, remote_port)) = parse_addr(remote) else {
+            continue;
+        };
         let (pid, binary) = map.get(&inode).cloned().unwrap_or((0, String::new()));
         out.push(SocketInfo {
             local_ip,
@@ -180,7 +202,13 @@ fn parse_addr(s: &str) -> Option<(String, u16)> {
     if ip_hex.len() == 8 {
         // v4 little-endian: 0100007F -> 127.0.0.1
         let raw = u32::from_str_radix(ip_hex, 16).ok()?;
-        let ip = format!("{}.{}.{}.{}", raw & 0xff, (raw >> 8) & 0xff, (raw >> 16) & 0xff, (raw >> 24) & 0xff);
+        let ip = format!(
+            "{}.{}.{}.{}",
+            raw & 0xff,
+            (raw >> 8) & 0xff,
+            (raw >> 16) & 0xff,
+            (raw >> 24) & 0xff
+        );
         Some((ip, port))
     } else if ip_hex.len() == 32 {
         // /proc/net/tcp6 prints each 32-bit group as a host-byte-order (LE on
@@ -243,7 +271,10 @@ mod tests {
 
     #[test]
     fn parse_v4_addr() {
-        assert_eq!(parse_addr("0100007F:1F90"), Some(("127.0.0.1".into(), 8080)));
+        assert_eq!(
+            parse_addr("0100007F:1F90"),
+            Some(("127.0.0.1".into(), 8080))
+        );
     }
 
     #[test]
