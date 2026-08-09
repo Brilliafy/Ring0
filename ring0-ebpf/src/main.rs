@@ -285,6 +285,31 @@ pub struct TlsEvent {
     pub buf: [u8; 256],
 }
 
+/// DNS query observed on the wire (UDP 53). The XDP fast path parses the
+/// qname (bounded walk, no pointers followed beyond the header) and emits a
+/// rate-limited event so the daemon can render live DNS history.
+#[repr(C)]
+pub struct DnsQueryEvent {
+    pub kind: u8,
+    pub timestamp: u64,
+    pub pid: u32,
+    pub query_type: u16,
+    pub dga_score: f32,
+    pub name: [u8; 96],
+}
+
+/// Rate limit for DNS query emission (one event per 250ms).
+#[map]
+pub static DNS_LAST_EMIT: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
+
+/// ifindex -> 1 for VIRTUAL/tunnel interfaces (wg*, tun*, veth*, br*,
+/// corporate tunnels like edr-*): the fast path runs in CAPTURE-ONLY mode
+/// there - telemetry (DNS, packets) flows, but nothing is ever dropped, so
+/// attaching to the user's VPN tunnel can never break connectivity.
+#[map]
+pub static CAPTURE_ONLY: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
+
+
 // ── Helper functions ─────────────────────────────────────────
 
 #[inline(always)]
@@ -302,6 +327,58 @@ fn ktime_get_ns() -> u64 {
 }
 
 // ── IP/PORT blocking check ───────────────────────────────────
+
+/// Capture a DNS query qname (UDP 53). Copies the raw label bytes with a
+/// CONSTANT +1 increment per iteration (the verifier bounds q = l4+12+i),
+/// stopping at the root terminator or a compression pointer; the daemon
+/// decodes the length-prefixed labels.
+#[inline(always)]
+unsafe fn capture_dns<T: PktData>(ctx: &T, l4: usize) {
+    let now = ktime_get_ns();
+    if let Some(last) = DNS_LAST_EMIT.get_ptr(&0) {
+        if now.saturating_sub(*last) < 250_000_000 {
+            return;
+        }
+    }
+    if DNS_LAST_EMIT.insert(&0, &now, 0).is_err() {
+        return;
+    }
+    let end = ctx.data_end();
+    // `l4` is the UDP header; the DNS header starts 8 bytes later.
+    let dns = l4 + 8;
+    if end < dns + 12 {
+        return;
+    }
+    // QDCOUNT at DNS header offset 4; question section starts at 12.
+    let qdcount = u16::from_be(read_u16(dns as *const u8, 4));
+    if qdcount == 0 {
+        return;
+    }
+    let mut q = dns + 12;
+    let mut name = [0u8; 96];
+    for i in 0..96usize {
+        if end < q + 1 {
+            break;
+        }
+        let b = *(q as *const u8);
+        if b == 0 || b & 0xC0 == 0xC0 {
+            break;
+        }
+        name[i] = b;
+        q += 1;
+    }
+    if let Some(mut entry) = RING_BUF.reserve::<DnsQueryEvent>(0) {
+        entry.write(DnsQueryEvent {
+            kind: ring0_abi::KIND_DNS,
+            timestamp: now,
+            pid: 0,
+            query_type: 0,
+            dga_score: 0.0,
+            name,
+        });
+        entry.submit(0);
+    }
+}
 
 fn check_blocked(
     src_ip: u32,
@@ -484,18 +561,28 @@ pub fn ring0_xdp(ctx: XdpContext) -> u32 {
 
 unsafe fn try_ring0_xdp(ctx: &XdpContext) -> Result<u32, u32> {
     let eth = ctx.data();
-    let (ip, ethertype) = l3_info(ctx, eth);
-    if ip == 0 {
-        return Err(xdp_action::XDP_ABORTED);
+    // Tunnel interfaces (WireGuard & co) use link-type RAW (no Ethernet
+    // header): the frame starts directly with the IP header. Detect by the
+    // Ethernet ethertype field at offset 12 - when absent, parse RAW-IP.
+    let is_eth = ctx.data_end() >= eth + 14 && read_u16(eth as *const u8, 12) == 0x0800;
+    let mut ip = eth;
+    if is_eth {
+        let (l3, ethertype) = l3_info(ctx, eth);
+        if l3 == 0 {
+            return Err(xdp_action::XDP_ABORTED);
+        }
+        if ethertype != 0x0800 {
+            // IPv6 (0x86dd) and other non-IPv4 frames are not filtered by the
+            // XDP fast path (documented limitation  -  the daemon warns).
+            return Ok(xdp_action::XDP_PASS);
+        }
+        ip = l3;
     }
-    if ethertype != 0x0800 {
-        // IPv6 (0x86dd) and other non-IPv4 frames are not filtered by the
-        // XDP fast path (documented limitation  -  the daemon warns at load).
-        return Ok(xdp_action::XDP_PASS);
-    }
-
     if ctx.data_end() < ip + 20 {
         return Err(xdp_action::XDP_ABORTED);
+    }
+    if !is_eth && (*(eth as *const u8) >> 4) != 4 {
+        return Ok(xdp_action::XDP_PASS); // RAW-IP but not IPv4
     }
     let proto = *(ip as *const u8).add(9);
     let src_ip = u32::from_be(read_u32(ip as *const u8, 12));
@@ -516,7 +603,10 @@ unsafe fn try_ring0_xdp(ctx: &XdpContext) -> Result<u32, u32> {
 
     let l4 = if proto == 6 || proto == 17 { ip + 20 } else { 0 };
     let is_wg = l4 != 0 && unsafe { is_wireguard_packet(ctx, ip, proto, l4) };
-    if check_blocked(src_ip, dst_ip, sp, dp, proto, is_wg) == xdp_action::XDP_DROP {
+    // Tunnel/virtual interfaces are capture-only: never drop on them, but
+    // still capture DNS/packet telemetry.
+    let passive = unsafe { CAPTURE_ONLY.get(&(ctx.ingress_ifindex() as u32)).is_some() };
+    if !passive && check_blocked(src_ip, dst_ip, sp, dp, proto, is_wg) == xdp_action::XDP_DROP {
         // Log the drop (rate-limited) so blocked traffic is visible instead
         // of vanishing silently. action=1 marks the event as a drop.
         if should_log_drop() {
@@ -536,6 +626,18 @@ unsafe fn try_ring0_xdp(ctx: &XdpContext) -> Result<u32, u32> {
             }
         }
         return Ok(xdp_action::XDP_DROP);
+    }
+
+    // DNS history: capture queries (dst 53) and responses (src 53).
+    if proto == 17 && (dp == 53 || sp == 53) && l4 != 0 {
+        unsafe { capture_dns(ctx, l4) };
+    }
+
+    // DNS history: capture queries (dst 53) and responses (src 53). The TC
+    // ingress hook runs for every received packet (unlike XDP, which tunnel
+    // drivers may not invoke), so this covers tunnel-decap traffic.
+    if proto == 17 && (dp == 53 || sp == 53) {
+        unsafe { capture_dns(ctx, ip + 20) };
     }
 
     let flow_key = FlowKey {
@@ -580,17 +682,27 @@ pub fn ring0_tc(ctx: TcContext) -> i32 {
 }
 
 unsafe fn try_ring0_tc(ctx: &TcContext) -> Result<i32, i32> {
+    // Note: the TC classifier only returns TC_ACT_SHOT for malformed frames
+    // (no blocklist drops), so tunnel interfaces need no passive guard here -
+    // valid traffic always passes.
     let eth = ctx.data();
-    let (ip, ethertype) = l3_info(ctx, eth);
-    if ip == 0 {
-        return Err(-1);
+    let is_eth = ctx.data_end() >= eth + 14 && read_u16(eth as *const u8, 12) == 0x0800;
+    let mut ip = eth;
+    if is_eth {
+        let (l3, ethertype) = l3_info(ctx, eth);
+        if l3 == 0 {
+            return Err(-1);
+        }
+        if ethertype != 0x0800 {
+            return Ok(0);
+        }
+        ip = l3;
     }
-    if ethertype != 0x0800 {
-        return Ok(0);
-    }
-
     if ctx.data_end() < ip + 20 {
         return Err(-1);
+    }
+    if !is_eth && (*(eth as *const u8) >> 4) != 4 {
+        return Ok(0);
     }
     let src_ip = u32::from_be(read_u32(ip as *const u8, 12));
     let dst_ip = u32::from_be(read_u32(ip as *const u8, 16));

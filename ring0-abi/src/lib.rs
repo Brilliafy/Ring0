@@ -23,6 +23,10 @@ pub const KIND_CONNECT: u8 = 3;
 pub const KIND_KILL: u8 = 4;
 pub const KIND_UNLINK: u8 = 5;
 pub const KIND_TLS: u8 = 6;
+/// DNS query observed on the wire (UDP 53). Produced by the XDP fast path
+/// (rate-limited); the daemon surfaces it as the capnp `dns` event so the GUI
+/// can render live DNS history.
+pub const KIND_DNS: u8 = 7;
 pub const KIND_LSM: u8 = 10;
 pub const KIND_CANARY: u8 = 11;
 pub const KIND_SETUID: u8 = 12;
@@ -70,6 +74,9 @@ pub const SIZE_MODULE: usize = 92;
 /// `TlsEvent`: kind(1)+pad(7)+ts(8)+flowId(8)+pid(4)+direction(1)+pad(3)
 ///             +len(4)+buf(256) = 292
 pub const SIZE_TLS: usize = 292;
+/// DnsQueryEvent: kind(1)+pad(7)+ts(8)+pid(4)+qtype(2)+pad(2)+dga(4)+name(96)
+/// = 124, but repr(C) pads the tail [u8;96] to an 8-byte boundary: 128.
+pub const SIZE_DNS: usize = 128;
 /// `DpiEvent`: kind(1)+pad(7)+ts(8)+pid(4)+ruleId(4)+srcIp(4)+dstIp(4)
 ///             +dstPort(2)+protocol(1)+pad(1) = 36
 pub const SIZE_DPI: usize = 36;
@@ -85,6 +92,7 @@ pub const EVENT_SIZE: [Option<usize>; 31] = {
     t[KIND_KILL as usize] = Some(SIZE_KILL);
     t[KIND_UNLINK as usize] = Some(SIZE_UNLINK);
     t[KIND_TLS as usize] = Some(SIZE_TLS);
+    t[KIND_DNS as usize] = Some(SIZE_DNS);
     t[KIND_LSM as usize] = Some(SIZE_LSM);
     t[KIND_SETUID as usize] = Some(SIZE_SETUID);
     t[KIND_CAP as usize] = Some(SIZE_CAP);
