@@ -1,5 +1,5 @@
 import QtQuick 2.15
-import Qt.labs.settings 1.1
+import QtCore
 
 // RingZero design-system theme tokens (see Design system.md). Every view
 // reads these properties; never hard-code colors in components.
