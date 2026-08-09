@@ -13,7 +13,6 @@ fn main() {
                 "qml/components/Settings.qml",
                 "qml/components/SocketTable.qml",
                 "qml/components/SystemStatus.qml",
-                "qml/components/Theme.qml",
                             ]),
     )
     .file("src/lib.rs")
