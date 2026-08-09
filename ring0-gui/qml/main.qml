@@ -498,6 +498,17 @@ ApplicationWindow {
     onDoKillProcess: { if (pid > 0) bridge.killProcess(pid) }
 
     Timer {
+        id: primeTimer
+        interval: 100
+        repeat: false
+        onTriggered: {
+            processTreeComponent.refresh()
+            socketTable.refresh()
+            alertHistory.loadHistory()
+        }
+    }
+
+    Timer {
         id: snapshotTimer
         interval: 3000
         running: daemonConnected
@@ -514,10 +525,12 @@ ApplicationWindow {
             daemonConnected = bridge.connectDaemon(daemonSocket || "/run/ring0d.sock");
             bridge.initDbusNotifications();
             if (daemonConnected) {
-                // Prime the process tree immediately + load persisted alerts.
-                processTreeComponent.refresh()
-                socketTable.refresh()
-                alertHistory.loadHistory()
+                // Never block the startup on synchronous snapshot polls: the
+                // daemon can be mid feed-sync (a fresh start takes ~30s), so
+                // a listProcesses/listSockets/queryLogs call would stall the
+                // window for up to 15s. The 3s snapshotTimer + a one-shot
+                // history load populate everything a moment later.
+                primeTimer.start()
             }
         }
     }

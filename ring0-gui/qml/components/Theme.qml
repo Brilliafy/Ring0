@@ -9,14 +9,20 @@ QtObject {
 
     property string mode: "system"
 
-    // Persist the chosen mode.
-    Settings {
-        id: store
+    // Persist the chosen mode. (QtObject has no default child property, so
+    // the Settings element must be declared as a property value.)
+    property Settings store: Settings {
         category: "theme"
         property string mode: "system"
-        onModeChanged: theme.mode = store.mode
     }
-    onModeChanged: { if (theme.mode !== store.mode) store.mode = theme.mode }
+
+    // Load persisted mode at startup; write back on changes.
+    onModeChanged: {
+        if (store.mode !== mode) store.mode = mode
+    }
+    Component.onCompleted: {
+        mode = store.mode
+    }
 
     readonly property bool isDark: mode === "dark"
         || (mode === "system" && Qt.styleHints.colorScheme === Qt.Dark)
