@@ -75,7 +75,12 @@ Rectangle {
 
     function refresh() {
         if (bridge && bridge.isConnected()) {
-            setSnapshot(bridge.listSockets())
+            bridge.listSockets() // fire-and-forget
         }
+    }
+
+    function collect() {
+        var json = bridge.takeSockets()
+        if (json.length > 0) setSnapshot(json)
     }
 }

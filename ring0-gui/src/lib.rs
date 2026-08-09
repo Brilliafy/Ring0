@@ -73,10 +73,19 @@ pub mod qobject {
         ) -> QString;
         #[auto_wrap]
         #[qinvokable]
-        fn listProcesses(self: Pin<&mut Ring0Bridge>) -> QString;
+        fn listProcesses(self: Pin<&mut Ring0Bridge>);
         #[auto_wrap]
         #[qinvokable]
-        fn listSockets(self: Pin<&mut Ring0Bridge>) -> QString;
+        fn takeProcesses(self: Pin<&mut Ring0Bridge>) -> QString;
+        #[auto_wrap]
+        #[qinvokable]
+        fn listSockets(self: Pin<&mut Ring0Bridge>);
+        #[auto_wrap]
+        #[qinvokable]
+        fn takeSockets(self: Pin<&mut Ring0Bridge>) -> QString;
+        #[auto_wrap]
+        #[qinvokable]
+        fn takeQuery(self: Pin<&mut Ring0Bridge>) -> QString;
         #[auto_wrap]
         #[qinvokable]
         fn reloadRules(self: Pin<&mut Ring0Bridge>);
@@ -505,24 +514,26 @@ impl Ring0BridgeRust {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         this.send_frame(&buf);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if let Some(resp) = this
-                .pending_query_response
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
-                return cxx_qt_lib::QString::from(resp);
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
         cxx_qt_lib::QString::from("")
+    }
+
+    /// Non-blocking: return (and clear) the latest QueryLogs response JSON.
+    pub fn takeQuery(self: Pin<&mut Self>) -> cxx_qt_lib::QString {
+        let resp = self
+            .get_mut()
+            .pending_query_response
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        cxx_qt_lib::QString::from(resp.unwrap_or_default())
     }
 
     /// Request a live /proc process snapshot from the daemon (read-only,
     /// answered inline by the IPC handler). Returns JSON or "" on timeout.
-    pub fn listProcesses(self: Pin<&mut Self>) -> cxx_qt_lib::QString {
+    /// Request a live /proc process snapshot (fire-and-forget). The response
+    /// lands in `pending_processes` and is collected by the QML poll timer via
+    /// [`Self::takeProcesses`] - NEVER block the Qt GUI thread on the reply.
+    pub fn listProcesses(self: Pin<&mut Self>) {
         let this = self.get_mut();
         let mut message = capnp::message::Builder::new_default();
         {
@@ -536,23 +547,23 @@ impl Ring0BridgeRust {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         this.send_frame(&buf);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if let Some(resp) = this
-                .pending_processes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
-                return cxx_qt_lib::QString::from(resp);
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        cxx_qt_lib::QString::from("")
     }
 
-    /// Request a live TCP/UDP socket snapshot (with owning processes).
-    pub fn listSockets(self: Pin<&mut Self>) -> cxx_qt_lib::QString {
+    /// Non-blocking: return (and clear) the latest ProcessListResponse JSON,
+    /// or "" if not arrived yet.
+    pub fn takeProcesses(self: Pin<&mut Self>) -> cxx_qt_lib::QString {
+        let resp = self
+            .get_mut()
+            .pending_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        cxx_qt_lib::QString::from(resp.unwrap_or_default())
+    }
+
+    /// Request a live TCP/UDP socket snapshot (fire-and-forget); collect via
+    /// [`Self::takeSockets`].
+    pub fn listSockets(self: Pin<&mut Self>) {
         let this = self.get_mut();
         let mut message = capnp::message::Builder::new_default();
         {
@@ -566,19 +577,17 @@ impl Ring0BridgeRust {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         this.send_frame(&buf);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if let Some(resp) = this
-                .pending_sockets
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
-                return cxx_qt_lib::QString::from(resp);
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        cxx_qt_lib::QString::from("")
+    }
+
+    /// Non-blocking: return (and clear) the latest SocketListResponse JSON.
+    pub fn takeSockets(self: Pin<&mut Self>) -> cxx_qt_lib::QString {
+        let resp = self
+            .get_mut()
+            .pending_sockets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        cxx_qt_lib::QString::from(resp.unwrap_or_default())
     }
 
     pub fn reloadRules(self: Pin<&mut Self>) {

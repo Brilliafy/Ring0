@@ -298,6 +298,10 @@ ApplicationWindow {
         running: daemonConnected
         repeat: true
         onTriggered: {
+            // Collect any pending snapshot/query responses without blocking.
+            processTreeComponent.collect()
+            socketTable.collect()
+            alertHistory.collect()
             var events = bridge.pollEvents()
             if (events.length === 0) return
             var lines = events.split("\n")

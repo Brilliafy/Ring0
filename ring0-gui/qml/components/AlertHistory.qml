@@ -33,10 +33,15 @@ Rectangle {
         })
     }
 
-    // Load persisted history via queryLogs.
+    // Load persisted history via queryLogs (fire-and-forget; collect() picks
+    // the response up on the poll timer).
     function loadHistory() {
         if (!bridge || !bridge.isConnected()) return
-        var json = bridge.queryLogs(120, 0, 500)
+        bridge.queryLogs(120, 0, 500)
+    }
+
+    function collect() {
+        var json = bridge.takeQuery()
         if (json.length === 0) return
         try {
             var data = JSON.parse(json)
