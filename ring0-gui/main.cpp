@@ -7,6 +7,11 @@
 int main(int argc, char *argv[])
 {
     QGuiApplication app(argc, argv);
+    // Required by QSettings (Qt.labs.settings in Theme.qml): without these the
+    // Settings object fails to initialize, Theme.qml fails to create and every
+    // Theme.* token resolves undefined.
+    QCoreApplication::setOrganizationName(QStringLiteral("RingZero"));
+    QCoreApplication::setOrganizationDomain(QStringLiteral("ring0.local"));
     QQmlApplicationEngine engine;
 
     qmlRegisterType<ring0::Ring0Bridge>("ring0", 1, 0, "Ring0Bridge");
