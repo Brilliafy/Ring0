@@ -252,33 +252,46 @@ impl IpcServer {
                                             // turning every first command into a
                                             // spurious denial).
                                             let privileged = is_privileged_command(&cmd);
-                                            let allowed =
-                                                if privileged && !peer_is_privileged(&peer_cred) {
-                                                    crate::polkit::check_authorization(
-                                                        peer_cred.pid as u32,
-                                                        peer_cred.uid,
+                                            let needs_polkit =
+                                                privileged && !peer_is_privileged(&peer_cred);
+                                            if needs_polkit {
+                                                // The polkit dialog can stay open
+                                                // for minutes. Awaiting it INLINE
+                                                // froze this connection's read loop:
+                                                // the GUI's snapshot/status queries
+                                                // queued behind the dialog, their
+                                                // synchronous polls timed out and
+                                                // the whole Qt UI blocked for the
+                                                // dialog's lifetime. Dispatch the
+                                                // check on a separate task so the
+                                                // read loop keeps serving.
+                                                let cmd_tx = cmd_tx.clone();
+                                                let resp_tx = resp_tx.clone();
+                                                let caller_pid = peer_cred.pid as u32;
+                                                let caller_uid = peer_cred.uid;
+                                                tokio::spawn(async move {
+                                                    if crate::polkit::check_authorization(
+                                                        caller_pid, caller_uid,
                                                     )
                                                     .await
-                                                } else {
-                                                    true
-                                                };
-                                            if allowed {
-                                                if cmd_tx.send(cmd).is_err() {
-                                                    break;
-                                                }
-                                                if privileged
-                                                    && resp_tx.send(b"OK".to_vec()).is_err()
-                                                {
-                                                    break;
-                                                }
-                                            } else {
-                                                warn!(
-                                                    "denied privileged command {cmd:?} from uid {}",
-                                                    peer_cred.uid
-                                                );
-                                                if resp_tx.send(b"DENIED".to_vec()).is_err() {
-                                                    break;
-                                                }
+                                                    {
+                                                        if cmd_tx.send(cmd).is_err() {
+                                                            return;
+                                                        }
+                                                        let _ = resp_tx.send(b"OK".to_vec());
+                                                    } else {
+                                                        warn!(
+                                                            "denied privileged command from uid {caller_uid}"
+                                                        );
+                                                        let _ = resp_tx.send(b"DENIED".to_vec());
+                                                    }
+                                                });
+                                            } else if cmd_tx.send(cmd).is_err() {
+                                                break;
+                                            } else if privileged
+                                                && resp_tx.send(b"OK".to_vec()).is_err()
+                                            {
+                                                break;
                                             }
                                         }
                                         Err(e) => {

@@ -11,7 +11,7 @@ ApplicationWindow {
     width: 1280
     height: 800
     title: "RingZero — Security Command Center"
-    color: "#0d1117"
+    color: Theme.bgBase
 
     property bool daemonConnected: false
     property int alertCount: 0
@@ -65,7 +65,7 @@ ApplicationWindow {
     function setStatusThreat() { protectionStatus = 2 }
 
     header: ToolBar {
-        background: Rectangle { color: "#161b22" }
+        background: Rectangle { color: Theme.bgSurface }
         RowLayout {
             anchors.fill: parent
             spacing: 8
@@ -73,20 +73,20 @@ ApplicationWindow {
                 text: "⭕ RingZero"
                 font.pixelSize: 18
                 font.bold: true
-                color: "#58a6ff"
+                color: Theme.accentInfo
                 leftPadding: 12
             }
             Item { Layout.fillWidth: true }
             Label {
                 text: daemonConnected ? "● Connected" : "○ Disconnected"
-                color: daemonConnected ? "#3fb950" : "#f85149"
+                color: daemonConnected ? Theme.accentSuccess : Theme.accentDanger
                 font.pixelSize: 12
                 rightPadding: 12
             }
             Label {
                 id: cpuLabel
                 text: ""
-                color: "#8b949e"
+                color: Theme.textSecondary
                 font.pixelSize: 11
                 rightPadding: 8
                 visible: daemonConnected
@@ -94,19 +94,19 @@ ApplicationWindow {
             Label {
                 id: epsLabel
                 text: ""
-                color: "#8b949e"
+                color: Theme.textSecondary
                 font.pixelSize: 11
                 rightPadding: 8
                 visible: daemonConnected
             }
             Rectangle {
                 width: 8; height: 8; radius: 4
-                color: protectionStatus === 0 ? "#3fb950" : protectionStatus === 1 ? "#d29922" : "#f85149"
+                color: protectionStatus === 0 ? Theme.accentSuccess : protectionStatus === 1 ? Theme.accentWarning : Theme.accentDanger
                 Layout.alignment: Qt.AlignVCenter
             }
             Label {
                 text: protectionStatus === 0 ? "Protected" : protectionStatus === 1 ? "Degraded" : "Threat"
-                color: protectionStatus === 0 ? "#3fb950" : protectionStatus === 1 ? "#d29922" : "#f85149"
+                color: protectionStatus === 0 ? Theme.accentSuccess : protectionStatus === 1 ? Theme.accentWarning : Theme.accentDanger
                 font.pixelSize: 11
                 font.bold: true
                 rightPadding: 8
@@ -114,7 +114,7 @@ ApplicationWindow {
             Label {
                 id: batteryLabel
                 text: "⚡ AC"
-                color: "#3fb950"
+                color: Theme.accentSuccess
                 font.pixelSize: 11
                 rightPadding: 8
                 visible: false
@@ -132,55 +132,55 @@ ApplicationWindow {
             spacing: 8
 
             Rectangle {
-                color: "#161b22"
+                color: Theme.bgSurface
                 radius: 6
                 Layout.fillWidth: true
                 Layout.preferredHeight: 80
-                border.color: "#30363d"
+                border.color: Theme.borderDefault
                 border.width: 1
                 ColumnLayout {
                     anchors.centerIn: parent
-                    Label { text: "Packets/sec"; color: "#8b949e"; font.pixelSize: 10 }
-                    Label { id: ppsLabel; text: "0"; color: "#58a6ff"; font.pixelSize: 20; font.bold: true }
+                    Label { text: "Packets/sec"; color: Theme.textSecondary; font.pixelSize: 10 }
+                    Label { id: ppsLabel; text: "0"; color: Theme.accentInfo; font.pixelSize: 20; font.bold: true }
                 }
             }
             Rectangle {
-                color: "#161b22"
+                color: Theme.bgSurface
                 radius: 6
                 Layout.fillWidth: true
                 Layout.preferredHeight: 80
-                border.color: "#30363d"
+                border.color: Theme.borderDefault
                 border.width: 1
                 ColumnLayout {
                     anchors.centerIn: parent
-                    Label { text: "Alerts"; color: "#8b949e"; font.pixelSize: 10 }
-                    Label { id: alertCountLabel; text: "0"; color: "#f85149"; font.pixelSize: 20; font.bold: true }
+                    Label { text: "Alerts"; color: Theme.textSecondary; font.pixelSize: 10 }
+                    Label { id: alertCountLabel; text: "0"; color: Theme.accentDanger; font.pixelSize: 20; font.bold: true }
                 }
             }
             Rectangle {
-                color: "#161b22"
+                color: Theme.bgSurface
                 radius: 6
                 Layout.fillWidth: true
                 Layout.preferredHeight: 80
-                border.color: "#30363d"
+                border.color: Theme.borderDefault
                 border.width: 1
                 ColumnLayout {
                     anchors.centerIn: parent
-                    Label { text: "Active Filters"; color: "#8b949e"; font.pixelSize: 10 }
-                    Label { id: filterCountLabel; text: "0"; color: "#d2a8ff"; font.pixelSize: 20; font.bold: true }
+                    Label { text: "Active Filters"; color: Theme.textSecondary; font.pixelSize: 10 }
+                    Label { id: filterCountLabel; text: "0"; color: Theme.accentPurple; font.pixelSize: 20; font.bold: true }
                 }
             }
             Rectangle {
-                color: "#161b22"
+                color: Theme.bgSurface
                 radius: 6
                 Layout.fillWidth: true
                 Layout.preferredHeight: 80
-                border.color: "#30363d"
+                border.color: Theme.borderDefault
                 border.width: 1
                 ColumnLayout {
                     anchors.centerIn: parent
-                    Label { text: "Process Execs"; color: "#8b949e"; font.pixelSize: 10 }
-                    Label { id: procCountLabel; text: "0"; color: "#3fb950"; font.pixelSize: 20; font.bold: true }
+                    Label { text: "Process Execs"; color: Theme.textSecondary; font.pixelSize: 10 }
+                    Label { id: procCountLabel; text: "0"; color: Theme.accentSuccess; font.pixelSize: 20; font.bold: true }
                 }
             }
         }
@@ -188,13 +188,13 @@ ApplicationWindow {
         TabBar {
             id: mainTabBar
             Layout.fillWidth: true
-            background: Rectangle { color: "#161b22" }
-            TabButton { text: "Network"; background: Rectangle { color: mainTabBar.currentIndex === 0 ? "#21262d" : "#161b22" } }
-            TabButton { text: "Processes"; background: Rectangle { color: mainTabBar.currentIndex === 1 ? "#21262d" : "#161b22" } }
-            TabButton { text: "DNS & Security"; background: Rectangle { color: mainTabBar.currentIndex === 2 ? "#21262d" : "#161b22" } }
-            TabButton { text: "Alerts"; background: Rectangle { color: mainTabBar.currentIndex === 3 ? "#21262d" : "#161b22" } }
-            TabButton { text: "System"; background: Rectangle { color: mainTabBar.currentIndex === 4 ? "#21262d" : "#161b22" } }
-            TabButton { text: "Settings"; background: Rectangle { color: mainTabBar.currentIndex === 5 ? "#21262d" : "#161b22" } }
+            background: Rectangle { color: Theme.bgSurface }
+            TabButton { text: "Network"; background: Rectangle { color: mainTabBar.currentIndex === 0 ? Theme.bgSurfaceAlt : Theme.bgSurface } }
+            TabButton { text: "Processes"; background: Rectangle { color: mainTabBar.currentIndex === 1 ? Theme.bgSurfaceAlt : Theme.bgSurface } }
+            TabButton { text: "DNS & Security"; background: Rectangle { color: mainTabBar.currentIndex === 2 ? Theme.bgSurfaceAlt : Theme.bgSurface } }
+            TabButton { text: "Alerts"; background: Rectangle { color: mainTabBar.currentIndex === 3 ? Theme.bgSurfaceAlt : Theme.bgSurface } }
+            TabButton { text: "System"; background: Rectangle { color: mainTabBar.currentIndex === 4 ? Theme.bgSurfaceAlt : Theme.bgSurface } }
+            TabButton { text: "Settings"; background: Rectangle { color: mainTabBar.currentIndex === 5 ? Theme.bgSurfaceAlt : Theme.bgSurface } }
         }
 
         StackLayout {
@@ -207,9 +207,9 @@ ApplicationWindow {
             ColumnLayout {
                 spacing: 4
                 Rectangle {
-                    color: "#161b22"; radius: 6
+                    color: Theme.bgSurface; radius: 6
                     Layout.fillWidth: true; Layout.preferredHeight: 160
-                    border.color: "#30363d"; border.width: 1
+                    border.color: Theme.borderDefault; border.width: 1
                     LiveTrafficChart {
                         id: liveChart
                         anchors.fill: parent
@@ -217,12 +217,12 @@ ApplicationWindow {
                     }
                 }
                 Rectangle {
-                    color: "#161b22"; radius: 6
+                    color: Theme.bgSurface; radius: 6
                     Layout.fillWidth: true; Layout.fillHeight: true
-                    border.color: "#30363d"; border.width: 1; clip: true
+                    border.color: Theme.borderDefault; border.width: 1; clip: true
                     ColumnLayout { anchors.fill: parent; anchors.margins: 4
                         RowLayout { spacing: 4
-                            TextField { id: filterInput; placeholderText: "Filter events (PID, IP, binary, rule...)"; color: "#c9d1d9"; placeholderTextColor: "#484f58"; background: Rectangle { color: "#0d1117"; radius: 4; border.color: "#30363d"; border.width: 1 } Layout.fillWidth: true; Layout.preferredHeight: 28 }
+                            TextField { id: filterInput; placeholderText: "Filter events (PID, IP, binary, rule...)"; color: Theme.textPrimary; placeholderTextColor: Theme.textMuted; background: Rectangle { color: Theme.bgBase; radius: 4; border.color: Theme.borderDefault; border.width: 1 } Layout.fillWidth: true; Layout.preferredHeight: 28 }
                             Button { text: "Clear"; flat: true; onClicked: filterInput.text = "" }
                         }
                         EventFeed { id: eventList; Layout.fillWidth: true; Layout.fillHeight: true; filterText: filterInput.text }
@@ -233,7 +233,7 @@ ApplicationWindow {
             // Tab 1: Processes
             ColumnLayout { spacing: 4
                 ProcessTree { id: processTreeComponent; Layout.fillWidth: true; Layout.fillHeight: true }
-                Rectangle { color: "#161b22"; radius: 6; Layout.fillWidth: true; Layout.preferredHeight: 160; border.color: "#30363d"; border.width: 1
+                Rectangle { color: Theme.bgSurface; radius: 6; Layout.fillWidth: true; Layout.preferredHeight: 160; border.color: Theme.borderDefault; border.width: 1
                     SocketTable { id: socketTable; anchors.fill: parent; anchors.margins: 4 }
                 }
             }
@@ -262,13 +262,13 @@ ApplicationWindow {
         y: Math.round((parent.height - height) / 3)
         width: 440
         height: 220
-        background: Rectangle { color: "#161b22"; radius: 8; border.color: "#f85149"; border.width: 2 }
+        background: Rectangle { color: Theme.bgSurface; radius: 8; border.color: Theme.accentDanger; border.width: 2 }
         ColumnLayout {
             anchors.fill: parent
             anchors.margins: 16
             spacing: 12
-            Label { text: "🚨 THREAT DETECTED"; color: "#f85149"; font.pixelSize: 16; font.bold: true }
-            Label { id: alertMsg; text: ""; color: "#c9d1d9"; font.pixelSize: 12; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+            Label { text: "🚨 THREAT DETECTED"; color: Theme.accentDanger; font.pixelSize: 16; font.bold: true }
+            Label { id: alertMsg; text: ""; color: Theme.textPrimary; font.pixelSize: 12; Layout.fillWidth: true; wrapMode: Text.WordWrap }
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 8
@@ -435,7 +435,7 @@ ApplicationWindow {
             }
             // Power + blocklist state → labels, DNS inspector and System tab.
             batteryLabel.text = evt.onBattery ? "⚡ Battery" : "⚡ AC"
-            batteryLabel.color = evt.onBattery ? "#d29922" : "#3fb950"
+            batteryLabel.color = evt.onBattery ? Theme.accentWarning : Theme.accentSuccess
             batteryLabel.visible = true
             if (typeof evt.fimThrottled === "boolean")
                 batteryLabel.text += evt.fimThrottled ? " · FIM throttled" : ""

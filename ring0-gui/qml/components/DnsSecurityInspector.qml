@@ -7,9 +7,9 @@ import QtQuick.Layouts 1.15
 // surfaced by the daemon's kernel fast path.
 Rectangle {
     id: dnsRoot
-    color: "#161b22"
+    color: Theme.bgSurface
     radius: 6
-    border.color: "#30363d"
+    border.color: Theme.borderDefault
     border.width: 1
 
     property int blockedDomains: 0
@@ -26,44 +26,44 @@ Rectangle {
             Layout.fillWidth: true
             spacing: 8
             Rectangle {
-                color: "#0d1117"
+                color: Theme.bgBase
                 radius: 4
                 Layout.fillWidth: true
                 Layout.preferredHeight: 56
-                border.color: "#30363d"
+                border.color: Theme.borderDefault
                 ColumnLayout {
                     anchors.centerIn: parent
-                    Label { text: "Blocked Domains"; color: "#8b949e"; font.pixelSize: 10 }
-                    Label { text: dnsRoot.blockedDomains; color: "#d2a8ff"; font.pixelSize: 18; font.bold: true }
+                    Label { text: "Blocked Domains"; color: Theme.textSecondary; font.pixelSize: 10 }
+                    Label { text: dnsRoot.blockedDomains; color: Theme.accentPurple; font.pixelSize: 18; font.bold: true }
                 }
             }
             Rectangle {
-                color: "#0d1117"
+                color: Theme.bgBase
                 radius: 4
                 Layout.fillWidth: true
                 Layout.preferredHeight: 56
-                border.color: "#30363d"
+                border.color: Theme.borderDefault
                 ColumnLayout {
                     anchors.centerIn: parent
-                    Label { text: "Blocked CIDRs"; color: "#8b949e"; font.pixelSize: 10 }
-                    Label { text: dnsRoot.blockedCidrs; color: "#58a6ff"; font.pixelSize: 18; font.bold: true }
+                    Label { text: "Blocked CIDRs"; color: Theme.textSecondary; font.pixelSize: 10 }
+                    Label { text: dnsRoot.blockedCidrs; color: Theme.accentInfo; font.pixelSize: 18; font.bold: true }
                 }
             }
             Rectangle {
-                color: "#0d1117"
+                color: Theme.bgBase
                 radius: 4
                 Layout.fillWidth: true
                 Layout.preferredHeight: 56
-                border.color: "#30363d"
+                border.color: Theme.borderDefault
                 ColumnLayout {
                     anchors.centerIn: parent
-                    Label { text: "Blocked Ports"; color: "#8b949e"; font.pixelSize: 10 }
-                    Label { text: dnsRoot.blockedPorts; color: "#f0883e"; font.pixelSize: 18; font.bold: true }
+                    Label { text: "Blocked Ports"; color: Theme.textSecondary; font.pixelSize: 10 }
+                    Label { text: dnsRoot.blockedPorts; color: Theme.accentWarning; font.pixelSize: 18; font.bold: true }
                 }
             }
         }
 
-        Label { text: "Fast-path DPI matches (kernel)"; color: "#58a6ff"; font.pixelSize: 12; font.bold: true }
+        Label { text: "Fast-path DPI matches (kernel)"; color: Theme.accentInfo; font.pixelSize: 12; font.bold: true }
 
         ListView {
             id: dpiList
@@ -74,14 +74,14 @@ Rectangle {
             delegate: Rectangle {
                 width: parent.width
                 height: 22
-                color: index % 2 === 0 ? "#161b22" : "#0d1117"
+                color: index % 2 === 0 ? Theme.bgSurface : Theme.bgBase
                 RowLayout {
                     anchors.fill: parent
                     anchors.margins: 2
                     spacing: 6
-                    Label { text: ts; color: "#8b949e"; font.pixelSize: 10; Layout.preferredWidth: 110 }
-                    Label { text: rule; color: "#f85149"; font.pixelSize: 10; Layout.preferredWidth: 50 }
-                    Label { text: msg; color: "#c9d1d9"; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
+                    Label { text: ts; color: Theme.textSecondary; font.pixelSize: 10; Layout.preferredWidth: 110 }
+                    Label { text: rule; color: Theme.accentDanger; font.pixelSize: 10; Layout.preferredWidth: 50 }
+                    Label { text: msg; color: Theme.textPrimary; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
                 }
             }
         }

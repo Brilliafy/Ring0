@@ -3,9 +3,9 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 
 Rectangle {
-    color: "#161b22"
+    color: Theme.bgSurface
     radius: 6
-    border.color: "#30363d"
+    border.color: Theme.borderDefault
     border.width: 1
 
     property var packetModel: ListModel {}
@@ -19,21 +19,21 @@ Rectangle {
         delegate: Rectangle {
             width: parent.width
             height: 22
-            color: index % 2 === 0 ? "#161b22" : "#0d1117"
+            color: Theme.rowColor(index, false)
             RowLayout {
                 anchors.fill: parent
                 anchors.margins: 2
                 spacing: 6
-                Label { text: timestamp; color: "#8b949e"; font.pixelSize: 10; Layout.preferredWidth: 120 }
-                Label { text: src; color: "#58a6ff"; font.pixelSize: 10; Layout.preferredWidth: 100 }
-                Label { text: dst; color: "#58a6ff"; font.pixelSize: 10; Layout.preferredWidth: 100 }
-                Label { text: proto; color: "#d2a8ff"; font.pixelSize: 10; Layout.preferredWidth: 35 }
-                Label { text: pid; color: "#c9d1d9"; font.pixelSize: 10; Layout.preferredWidth: 40 }
-                Label { text: action; color: action === "DROP" ? "#f85149" : "#3fb950"; font.pixelSize: 10; Layout.fillWidth: true }
+                Label { text: timestamp; color: Theme.textSecondary; font.pixelSize: 10; Layout.preferredWidth: 120 }
+                Label { text: src; color: Theme.accentInfo; font.pixelSize: 10; Layout.preferredWidth: 100 }
+                Label { text: dst; color: Theme.accentInfo; font.pixelSize: 10; Layout.preferredWidth: 100 }
+                Label { text: proto; color: Theme.accentPurple; font.pixelSize: 10; Layout.preferredWidth: 35 }
+                Label { text: pid; color: Theme.textPrimary; font.pixelSize: 10; Layout.preferredWidth: 40 }
+                Label { text: action; color: action === "DROP" ? Theme.accentDanger : Theme.accentSuccess; font.pixelSize: 10; Layout.fillWidth: true }
             }
         }
         footer: Rectangle {
-            width: parent.width; height: 2; color: "#30363d"
+            width: parent.width; height: 2; color: Theme.borderDefault
         }
     }
 

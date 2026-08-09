@@ -7,9 +7,9 @@ import QtQuick.Layouts 1.15
 // normal activity from security-relevant signals at a glance.
 Rectangle {
     id: root
-    color: "#161b22"
+    color: Theme.bgSurface
     radius: 6
-    border.color: "#30363d"
+    border.color: Theme.borderDefault
     border.width: 1
 
     property var feedModel: ListModel {}
@@ -17,15 +17,15 @@ Rectangle {
 
     function kindColor(kind) {
         switch (kind) {
-        case "alert": return "#f85149"
-        case "packet": return "#d29922"
-        case "dpi": return "#f0883e"
-        case "selfDefense": return "#f85149"
-        case "fileAccess": return "#f0883e"
-        case "connect": return "#58a6ff"
-        case "processExec": return "#3fb950"
-        case "dns": return "#d2a8ff"
-        default: return "#8b949e"
+        case "alert": return Theme.accentDanger
+        case "packet": return Theme.accentWarning
+        case "dpi": return Theme.accentWarning
+        case "selfDefense": return Theme.accentDanger
+        case "fileAccess": return Theme.accentWarning
+        case "connect": return Theme.accentInfo
+        case "processExec": return Theme.accentSuccess
+        case "dns": return Theme.accentPurple
+        default: return Theme.textSecondary
         }
     }
 
@@ -47,7 +47,7 @@ Rectangle {
             // cap) - width would throw "Cannot read property 'width' of null".
             width: parent ? parent.width : 0
             height: 22
-            color: index % 2 === 0 ? "#161b22" : "#0d1117"
+            color: index % 2 === 0 ? Theme.bgSurface : Theme.bgBase
             visible: root.filterText.length === 0 || summary.indexOf(root.filterText) >= 0
             RowLayout {
                 anchors.fill: parent
@@ -60,21 +60,21 @@ Rectangle {
                     Label {
                         anchors.centerIn: parent
                         text: kind.toUpperCase()
-                        color: "#0d1117"
+                        color: Theme.bgBase
                         font.pixelSize: 8
                         font.bold: true
                     }
                 }
-                Label { text: ts; color: "#8b949e"; font.pixelSize: 10; Layout.preferredWidth: 90 }
+                Label { text: ts; color: Theme.textSecondary; font.pixelSize: 10; Layout.preferredWidth: 90 }
                 Label {
                     text: summary
-                    color: "#c9d1d9"
+                    color: Theme.textPrimary
                     font.pixelSize: 10
                     Layout.fillWidth: true
                     elide: Text.ElideRight
                 }
             }
         }
-        footer: Rectangle { width: parent.width; height: 2; color: "#30363d" }
+        footer: Rectangle { width: parent.width; height: 2; color: Theme.borderDefault }
     }
 }

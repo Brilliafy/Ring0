@@ -8,9 +8,9 @@ import QtQuick.Layouts 1.15
 // new processes are visible immediately.
 Rectangle {
     id: root
-    color: "#161b22"
+    color: Theme.bgSurface
     radius: 6
-    border.color: "#30363d"
+    border.color: Theme.borderDefault
     border.width: 1
 
     property var treeModel: ListModel {}
@@ -24,9 +24,9 @@ Rectangle {
         RowLayout {
             Layout.fillWidth: true
             spacing: 6
-            Label { text: "Live Processes (" + treeModel.count + ")"; color: "#58a6ff"; font.pixelSize: 12; font.bold: true }
+            Label { text: "Live Processes (" + treeModel.count + ")"; color: Theme.accentInfo; font.pixelSize: 12; font.bold: true }
             Item { Layout.fillWidth: true }
-            Label { text: "state pid ppid user"; color: "#484f58"; font.pixelSize: 9 }
+            Label { text: "state pid ppid user"; color: Theme.textMuted; font.pixelSize: 9 }
         }
 
         ListView {
@@ -39,7 +39,7 @@ Rectangle {
             delegate: Rectangle {
                 width: parent.width
                 height: 20
-                color: index % 2 === 0 ? "#161b22" : "#0d1117"
+                color: index % 2 === 0 ? Theme.bgSurface : Theme.bgBase
                 RowLayout {
                     anchors.fill: parent
                     anchors.margins: 2
@@ -47,16 +47,16 @@ Rectangle {
                     spacing: 6
                     Rectangle {
                         width: 34; height: 12; radius: 3
-                        color: state === "R" ? "#3fb950" : state === "S" ? "#58a6ff" : state === "Z" ? "#f85149" : "#8b949e"
+                        color: state === "R" ? Theme.accentSuccess : state === "S" ? Theme.accentInfo : state === "Z" ? Theme.accentDanger : Theme.textSecondary
                         Layout.alignment: Qt.AlignVCenter
-                        Label { anchors.centerIn: parent; text: state; color: "#0d1117"; font.pixelSize: 8; font.bold: true }
+                        Label { anchors.centerIn: parent; text: state; color: Theme.textOnAccent; font.pixelSize: 8; font.bold: true }
                     }
-                    Label { text: pid; color: "#f85149"; font.pixelSize: 10; Layout.preferredWidth: 46 }
-                    Label { text: ppid; color: "#484f58"; font.pixelSize: 9; Layout.preferredWidth: 40 }
-                    Label { text: uid; color: "#8b949e"; font.pixelSize: 9; Layout.preferredWidth: 34 }
+                    Label { text: pid; color: Theme.accentDanger; font.pixelSize: 10; Layout.preferredWidth: 46 }
+                    Label { text: ppid; color: Theme.textMuted; font.pixelSize: 9; Layout.preferredWidth: 40 }
+                    Label { text: uid; color: Theme.textSecondary; font.pixelSize: 9; Layout.preferredWidth: 34 }
                     Label {
                         text: binary + (cmdline.length > 0 ? "  " + cmdline : "")
-                        color: depth === 0 ? "#c9d1d9" : "#8b949e"
+                        color: depth === 0 ? Theme.textPrimary : Theme.textSecondary
                         font.pixelSize: 10
                         Layout.fillWidth: true
                         elide: Text.ElideRight
@@ -76,11 +76,11 @@ Rectangle {
             }
         }
 
-        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#30363d" }
+        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.borderDefault }
 
         RowLayout {
             Layout.fillWidth: true
-            Label { text: "Recently Executed"; color: "#58a6ff"; font.pixelSize: 12; font.bold: true }
+            Label { text: "Recently Executed"; color: Theme.accentInfo; font.pixelSize: 12; font.bold: true }
             Item { Layout.fillWidth: true }
             Button {
                 text: "Refresh Tree"
@@ -99,14 +99,14 @@ Rectangle {
             delegate: Rectangle {
                 width: parent.width
                 height: 20
-                color: index % 2 === 0 ? "#161b22" : "#0d1117"
+                color: index % 2 === 0 ? Theme.bgSurface : Theme.bgBase
                 RowLayout {
                     anchors.fill: parent
                     anchors.margins: 2
                     spacing: 6
-                    Label { text: ts; color: "#8b949e"; font.pixelSize: 10; Layout.preferredWidth: 80 }
-                    Label { text: pid; color: "#f85149"; font.pixelSize: 10; Layout.preferredWidth: 46 }
-                    Label { text: binary; color: "#3fb950"; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
+                    Label { text: ts; color: Theme.textSecondary; font.pixelSize: 10; Layout.preferredWidth: 80 }
+                    Label { text: pid; color: Theme.accentDanger; font.pixelSize: 10; Layout.preferredWidth: 46 }
+                    Label { text: binary; color: Theme.accentSuccess; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
                 }
             }
         }

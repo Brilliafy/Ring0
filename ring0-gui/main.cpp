@@ -11,6 +11,14 @@ int main(int argc, char *argv[])
 
     qmlRegisterType<ring0::Ring0Bridge>("ring0", 1, 0, "Ring0Bridge");
 
+    // Expose the design-system Theme (components/Theme.qml) as a context
+    // property so every view resolves Theme.* tokens (dark/light/system).
+    QQmlComponent themeComp(&engine, QUrl(QStringLiteral("qrc:/qml/components/Theme.qml")));
+    QObject *themeObj = themeComp.create();
+    if (themeObj) {
+        engine.rootContext()->setContextProperty("Theme", themeObj);
+    }
+
     ring0::Ring0Bridge *bridge = new ring0::Ring0Bridge(&app);
     engine.rootContext()->setContextProperty("bridge", bridge);
 

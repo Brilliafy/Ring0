@@ -6,19 +6,19 @@ import QtQuick.Layouts 1.15
 // alert/correlation events. Severity-colored with a Block-IP action.
 Rectangle {
     id: root
-    color: "#161b22"
+    color: Theme.bgSurface
     radius: 6
-    border.color: "#30363d"
+    border.color: Theme.borderDefault
     border.width: 1
 
     property var alertModel: ListModel {}
 
     function sevColor(sev) {
         switch (sev) {
-        case "CRITICAL": return "#f85149"
-        case "HIGH": return "#f0883e"
-        case "MED": case "MEDIUM": return "#d29922"
-        default: return "#8b949e"
+        case "CRITICAL": return Theme.accentDanger
+        case "HIGH": return Theme.accentWarning
+        case "MED": case "MEDIUM": return Theme.accentWarning
+        default: return Theme.textSecondary
         }
     }
 
@@ -55,7 +55,7 @@ Rectangle {
 
         RowLayout {
             Layout.fillWidth: true
-            Label { text: "Alerts (" + alertModel.count + ")"; color: "#f85149"; font.pixelSize: 12; font.bold: true }
+            Label { text: "Alerts (" + alertModel.count + ")"; color: Theme.accentDanger; font.pixelSize: 12; font.bold: true }
             Item { Layout.fillWidth: true }
             Button {
                 text: "Load History"
@@ -74,7 +74,7 @@ Rectangle {
             delegate: Rectangle {
                 width: parent.width
                 height: 24
-                color: index % 2 === 0 ? "#161b22" : "#0d1117"
+                color: index % 2 === 0 ? Theme.bgSurface : Theme.bgBase
                 RowLayout {
                     anchors.fill: parent
                     anchors.margins: 2
@@ -83,11 +83,11 @@ Rectangle {
                         width: 52; height: 12; radius: 3
                         color: color
                         Layout.alignment: Qt.AlignVCenter
-                        Label { anchors.centerIn: parent; text: sev; color: "#0d1117"; font.pixelSize: 8; font.bold: true }
+                        Label { anchors.centerIn: parent; text: sev; color: Theme.textOnAccent; font.pixelSize: 8; font.bold: true }
                     }
-                    Label { text: ts; color: "#8b949e"; font.pixelSize: 10; Layout.preferredWidth: 80 }
-                    Label { text: rule; color: "#58a6ff"; font.pixelSize: 10; Layout.preferredWidth: 90 }
-                    Label { text: sig; color: "#c9d1d9"; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
+                    Label { text: ts; color: Theme.textSecondary; font.pixelSize: 10; Layout.preferredWidth: 80 }
+                    Label { text: rule; color: Theme.accentInfo; font.pixelSize: 10; Layout.preferredWidth: 90 }
+                    Label { text: sig; color: Theme.textPrimary; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
                     Button {
                         text: "Block"
                         flat: true
