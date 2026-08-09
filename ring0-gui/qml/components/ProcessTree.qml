@@ -117,7 +117,7 @@ Rectangle {
         try {
             var data = JSON.parse(json)
             var procs = data.processes || []
-            console.log("ProcessTree: got " + procs.length + " processes (raw " + json.length + " bytes)")
+
             // pid -> index for O(1) parent lookup.
             var byPid = {}
             for (var i = 0; i < procs.length; i++) byPid[procs[i].pid] = procs[i]
