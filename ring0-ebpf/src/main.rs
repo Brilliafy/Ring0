@@ -64,6 +64,12 @@ pub static SAMPLING_ENABLED: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
 /// traffic. Rate limit to one event per 20ms (~50/s).
 #[map]
 pub static PACKET_LAST_EMIT: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
+
+/// Per-pid rate limit for LSM socket_connect events: audit mode emits one
+/// event per pid per window so the approve/disapprove pipeline sees the
+/// connection without letting a chatty process flood the ring.
+#[map]
+pub static LAST_CONNECT_EMIT: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
 /// Default per-connection TLS plaintext budget in bytes. The interesting
 /// part of any flow is its START (protocol headers, the request, the first
 /// bytes of the response); the rest is bulk transfer with little detection
@@ -1033,12 +1039,10 @@ pub fn ring0_lsm_bprm_check(ctx: LsmContext) -> i32 {
 
 #[lsm(hook = "socket_connect")]
 pub fn ring0_lsm_socket_connect(ctx: LsmContext) -> i32 {
-    if !is_lsm_enforced() {
-        return 0;
-    }
     let pid = ctx.pid();
-    // ctx args are u64 slots; read them aligned via ctx.arg (unaligned byte
-    // reads of the context are rejected by the verifier).
+    // LSM arg layout (kernel BTF): arg0 = sock (struct socket *), arg1 =
+    // address (struct sockaddr *), arg2 = addrlen. The verifier rejects any
+    // arithmetic on the BTF-typed args, so they must stay opaque pointers.
     let sock = ctx.arg::<*const u8>(0);
     if sock.is_null() {
         return 0;
@@ -1047,39 +1051,57 @@ pub fn ring0_lsm_socket_connect(ctx: LsmContext) -> i32 {
     if addr_ptr.is_null() {
         return 0;
     }
-    // sockaddr fields live in user memory  -  read them with probe helpers.
+    // The sockaddr here is the KERNEL copy (the syscall's move_addr_to_kernel
+    // runs before the LSM hook), so probe_read_USER fails and returns 0 for
+    // every field. Read it with the kernel probe.
     let family =
-        unsafe { aya_ebpf::helpers::bpf_probe_read_user::<u16>(addr_ptr.cast()) }.unwrap_or(0);
+        unsafe { aya_ebpf::helpers::bpf_probe_read_kernel::<u16>(addr_ptr.cast()) }.unwrap_or(0);
+    // Only IPv4 destinations are meaningful to the blocklist/prompt pipeline;
+    // AF_UNIX/AF_INET6 connects would otherwise produce 0.0.0.0 prompts.
     if family != 2 {
         return 0;
     }
-    let port = unsafe { aya_ebpf::helpers::bpf_probe_read_user::<u16>(addr_ptr.add(2).cast()) }
+    let port = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel::<u16>(addr_ptr.add(2).cast()) }
         .map(u16::from_be)
         .unwrap_or(0);
-    let ip = unsafe { aya_ebpf::helpers::bpf_probe_read_user::<u32>(addr_ptr.add(4).cast()) }
+    let ip = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel::<u32>(addr_ptr.add(4).cast()) }
         .map(u32::from_be)
         .unwrap_or(0);
-    if unsafe {
+    let now = ktime_get_ns();
+    // Rate-limit emission per pid (1/500ms) so the audit/approve pipeline
+    // sees each process's connections without flooding the ring buffer.
+    if let Some(last) = unsafe { LAST_CONNECT_EMIT.get_ptr(&pid) } {
+        if now.saturating_sub(unsafe { *last }) < 500_000_000 {
+            return 0;
+        }
+    }
+    unsafe {
+        let _ = LAST_CONNECT_EMIT.insert(&pid, &now, 0);
+    }
+    // Emit in BOTH modes: audit mode drives the approve/disapprove prompt;
+    // enforce mode additionally blocks listed destinations.
+    let uid = unsafe { aya_ebpf::helpers::bpf_get_current_uid_gid() } as u32;
+    let blocked = unsafe {
         USER_BLOCKED_IPS
             .get(&Key::new(32, u32::from_be(ip)))
             .is_some()
-    } || unsafe { BLOCKED_PORTS.get_ptr(&port).is_some() }
-    {
-        let evt = LsmEvent {
-            kind: KIND_LSM,
-            timestamp: ktime_get_ns(),
-            pid,
-            uid: 0,
-            event_type: 2,
-            denied: 1,
-            path: [0u8; 96],
-            dst_ip: ip,
-            dst_port: port,
-        };
-        if let Some(mut buf) = unsafe { LSM_EVENTS.reserve::<LsmEvent>(0) } {
-            buf.write(evt);
-            buf.submit(0);
-        }
+    } || unsafe { BLOCKED_PORTS.get_ptr(&port).is_some() };
+    let evt = LsmEvent {
+        kind: KIND_LSM,
+        timestamp: now,
+        pid,
+        uid,
+        event_type: 2,
+        denied: if blocked { 1 } else { 0 },
+        path: [0u8; 96],
+        dst_ip: ip,
+        dst_port: port,
+    };
+    if let Some(mut buf) = unsafe { LSM_EVENTS.reserve::<LsmEvent>(0) } {
+        buf.write(evt);
+        buf.submit(0);
+    }
+    if is_lsm_enforced() && blocked {
         return -1;
     }
     0

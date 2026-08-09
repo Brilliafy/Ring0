@@ -9,7 +9,7 @@ use ring0_common::proto as capnp_schema;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::broadcast;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::storage::RocksManager;
 
@@ -174,6 +174,7 @@ impl IpcServer {
                                         resp = resp_rx.recv() => {
                                             match resp {
                                                 Some(data) => {
+                                                    info!("IPC: writing response frame {} bytes", data.len());
                                                     let len = (data.len() as u32).to_le_bytes();
                                                     if writer.write_all(&len).await.is_err() {
                                                         break;
@@ -220,9 +221,11 @@ impl IpcServer {
                                         // hop) so the GUI can refresh its process
                                         // tree / socket list without an approval.
                                         Ok(DaemonCmd::ListProcesses) => {
+                                            info!("IPC: ListProcesses from pid {}", peer_cred.pid);
                                             let procs = crate::proc_snapshot::list_processes();
                                             let response = build_process_list_response(&procs);
                                             if resp_tx.send(response).is_err() {
+                                                warn!("IPC: ListProcesses resp_tx send FAILED");
                                                 break;
                                             }
                                         }
@@ -511,14 +514,13 @@ pub(crate) fn parse_command_frame(data: &[u8], caller_pid: u32) -> Result<Daemon
 fn build_query_response(results: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     let mut message = capnp::message::Builder::new_default();
     {
-        let mut resp = message.init_root::<capnp_schema::query_response::Builder>();
+        let mut root = message.init_root::<capnp_schema::response::Builder>();
+        let mut resp = root.initQuery();
         let count = results.len().min(500) as u32;
         resp.setCount(count);
         let mut alerts = resp.initAlerts(count);
         for (i, (_, v)) in results.iter().enumerate().take(count as usize) {
             let mut alert = alerts.reborrow().get(i as u32);
-            // Decode through the canonical alert format instead of hand-rolling
-            // offsets (see crate::alert::AlertRecord).
             match crate::alert::AlertRecord::decode(v) {
                 Some(rec) => {
                     alert.setTimestamp(rec.timestamp_ns);
@@ -533,8 +535,6 @@ fn build_query_response(results: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
                     alert.setSignatureName(&rec.message);
                 }
                 None => {
-                    // Undecodable record (e.g. written by an older build):
-                    // surface it as a placeholder rather than silently shifting.
                     alert.setTimestamp(0);
                     alert.setSeverity(capnp_schema::Severity::Low);
                     alert.setRuleId(0);
@@ -747,14 +747,14 @@ pub fn build_connect_event(
     buf
 }
 
-
 // ---------- Snapshot responses (ListProcesses / ListSockets) ----------
 
-/// Serialize a process snapshot as a `ProcessListResponse` capnp frame.
+/// Serialize a process snapshot as a `Response.processes` capnp frame.
 pub fn build_process_list_response(procs: &[crate::proc_snapshot::ProcessInfo]) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
-    let mut root = msg.init_root::<capnp_schema::process_list_response::Builder>();
-    let mut list = root.reborrow().initProcesses(procs.len() as u32);
+    let mut root = msg.init_root::<capnp_schema::response::Builder>();
+    let mut inner = root.initProcesses();
+    let mut list = inner.reborrow().initProcesses(procs.len() as u32);
     for (i, p) in procs.iter().enumerate() {
         let mut e = list.reborrow().get(i as u32);
         e.setPid(p.pid);
@@ -764,17 +764,18 @@ pub fn build_process_list_response(procs: &[crate::proc_snapshot::ProcessInfo]) 
         e.setCmdline(&p.cmdline);
         e.setState(&p.state);
     }
-    root.setCount(procs.len() as u32);
+    inner.setCount(procs.len() as u32);
     let mut buf = Vec::new();
     let _ = capnp::serialize::write_message(&mut buf, &msg);
     buf
 }
 
-/// Serialize a socket snapshot as a `SocketListResponse` capnp frame.
+/// Serialize a socket snapshot as a `Response.sockets` capnp frame.
 pub fn build_socket_list_response(socks: &[crate::proc_snapshot::SocketInfo]) -> Vec<u8> {
     let mut msg = capnp::message::Builder::new_default();
-    let mut root = msg.init_root::<capnp_schema::socket_list_response::Builder>();
-    let mut list = root.reborrow().initSockets(socks.len() as u32);
+    let mut root = msg.init_root::<capnp_schema::response::Builder>();
+    let mut inner = root.initSockets();
+    let mut list = inner.reborrow().initSockets(socks.len() as u32);
     for (i, s) in socks.iter().enumerate() {
         let mut e = list.reborrow().get(i as u32);
         e.setLocalIp(&s.local_ip);
@@ -786,7 +787,7 @@ pub fn build_socket_list_response(socks: &[crate::proc_snapshot::SocketInfo]) ->
         e.setPid(s.pid);
         e.setBinary(&s.binary);
     }
-    root.setCount(socks.len() as u32);
+    inner.setCount(socks.len() as u32);
     let mut buf = Vec::new();
     let _ = capnp::serialize::write_message(&mut buf, &msg);
     buf

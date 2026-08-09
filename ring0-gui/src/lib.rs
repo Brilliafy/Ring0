@@ -126,8 +126,7 @@ use std::thread;
 use std::time::Duration;
 
 use ring0_common::proto as capnp_schema;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+// tokio is used ONLY for the D-Bus notifier; socket IO is std blocking.
 
 use crate::notify::{DbusNotifier, Notification};
 
@@ -209,47 +208,46 @@ impl Ring0BridgeRust {
         let socket_path: String = socket_path.into();
         let this = self.get_mut();
         this.disconnect_internal();
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(_) => return false,
-        };
-        let stream = match rt.block_on(UnixStream::connect(&socket_path)) {
+
+        // The socket is a plain blocking Unix stream: tokio sockets are bound
+        // to the reactor of the runtime that created them, and moving a split
+        // half to another runtime fails every read with "Tokio 1.x context was
+        // found, but it is being shutdown". The bridge is a simple client, so
+        // the writer/reader threads use std blocking I/O with timeouts.
+        let mut stream = match std::os::unix::net::UnixStream::connect(&socket_path) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Ring0Bridge: connect failed: {e}");
                 return false;
             }
         };
-        // Split the stream: the reader thread owns the read half; a dedicated
-        // writer thread owns the write half and drains a channel, so GUI-thread
-        // calls never block on socket I/O.
-        let (read_half, write_half) = stream.into_split();
-        drop(rt);
 
         let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = std::sync::mpsc::channel();
         let running = Arc::new(AtomicBool::new(true));
         let connected = Arc::new(AtomicBool::new(true));
 
         // Writer thread: serializes frames from the channel onto the socket.
+        // A stalled daemon backpressures only this thread, never the GUI.
+        let mut writer_stream = match stream.try_clone() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Ring0Bridge: try_clone failed: {e}");
+                return false;
+            }
+        };
         let writer = thread::Builder::new()
             .name("ring0-bridge-writer".into())
             .spawn(move || {
-                let rt = match tokio::runtime::Runtime::new() {
-                    Ok(rt) => rt,
-                    Err(_) => return,
-                };
-                rt.block_on(async move {
-                    let mut writer = write_half;
-                    for frame in rx.iter() {
-                        let len = (frame.len() as u32).to_le_bytes();
-                        if writer.write_all(&len).await.is_err() {
-                            break;
-                        }
-                        if writer.write_all(&frame).await.is_err() {
-                            break;
-                        }
+                for frame in rx.iter() {
+                    let len = (frame.len() as u32).to_le_bytes();
+                    use std::io::Write;
+                    if writer_stream.write_all(&len).is_err() {
+                        break;
                     }
-                });
+                    if writer_stream.write_all(&frame).is_err() {
+                        break;
+                    }
+                }
             });
         let writer = match writer {
             Ok(h) => h,
@@ -268,61 +266,99 @@ impl Ring0BridgeRust {
         let reader = thread::Builder::new()
             .name("ring0-bridge-reader".into())
             .spawn(move || {
-                let rt = match tokio::runtime::Runtime::new() {
-                    Ok(rt) => rt,
-                    Err(_) => return,
+                let mut stream = stream;
+                // Blocking, byte-safe framed reader. Timeout on the length
+                // read doubles as the keep-alive poll; partial reads are
+                // accumulated in `buf` so a timeout can never desync frames.
+                use std::io::Read;
+                let mut buf: Vec<u8> = Vec::with_capacity(8192);
+                let mut chunk = [0u8; 4096];
+                let mut read_more = |stream: &mut std::os::unix::net::UnixStream,
+                                     buf: &mut Vec<u8>|
+                 -> std::io::Result<bool> {
+                    // false = would block (no data), true = got data
+                    match stream.read(&mut chunk) {
+                        Ok(0) => Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "daemon closed connection",
+                        )),
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            Ok(true)
+                        }
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            Ok(false)
+                        }
+                        Err(e) => Err(e),
+                    }
                 };
-                rt.block_on(async move {
-                    let mut reader = read_half;
-                    let mut len_buf = [0u8; 4];
-                    loop {
-                        if !running_reader.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        // Poll with a timeout so a disconnect (running=false) is
-                        // observed promptly even while blocked on the socket.
-                        let read = tokio::time::timeout(
-                            Duration::from_millis(READER_POLL_MS),
-                            reader.read_exact(&mut len_buf),
-                        )
-                        .await;
-                        match read {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(_)) => break,
-                            Err(_) => continue,
-                        }
-                        let msg_len = u32::from_le_bytes(len_buf) as usize;
-                        if msg_len == 0 || msg_len > 1 << 20 {
-                            break;
-                        }
-                        let mut msg_buf = vec![0u8; msg_len];
-                        if reader.read_exact(&mut msg_buf).await.is_err() {
-                            break;
-                        }
-                        if let Some(event_json) = deserialize_to_json(&msg_buf) {
-                            if let Ok(mut q) = event_queue.lock() {
-                                if q.len() >= MAX_QUEUED_EVENTS {
-                                    q.pop_front();
-                                }
-                                q.push_back(event_json);
-                            }
-                        } else if let Some(resp_json) = deserialize_query_response(&msg_buf) {
-                            // A QueryLogs reply  -  stash it for queryLogs().
-                            if let Ok(mut slot) = pending_query_response.lock() {
-                                *slot = Some(resp_json);
-                            }
-                        } else if let Some(procs_json) = deserialize_process_response(&msg_buf) {
-                            if let Ok(mut slot) = pending_processes.lock() {
-                                *slot = Some(procs_json);
-                            }
-                        } else if let Some(socks_json) = deserialize_socket_response(&msg_buf) {
-                            if let Ok(mut slot) = pending_sockets.lock() {
-                                *slot = Some(socks_json);
+                loop {
+                    if !running_reader.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // Length prefix: 4 bytes. The 250ms timeout doubles as the
+                    // keep-alive poll (checks the running flag above).
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                    while buf.len() < 4 {
+                        match read_more(&mut stream, &mut buf) {
+                            Ok(false) => break, // no data; loop re-checks running
+                            Ok(true) => {}
+                            Err(e) => {
+                                break;
                             }
                         }
                     }
-                    connected_reader.store(false, Ordering::Relaxed);
-                });
+                    if buf.len() < 4 {
+                        continue;
+                    }
+                    let msg_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                    if msg_len == 0 || msg_len > 1 << 20 {
+                        break;
+                    }
+                    // Body: may span multiple timeouts; a long timeout turns a
+                    // mid-frame daemon stall into a disconnect instead of a hang.
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                    while buf.len() < 4 + msg_len {
+                        match read_more(&mut stream, &mut buf) {
+                            Ok(false) => continue, // keep waiting for the body
+                            Ok(true) => {}
+                            Err(e) => {
+                                break;
+                            }
+                        }
+                    }
+                    if buf.len() < 4 + msg_len {
+                        break; // body never completed
+                    }
+                    let msg_buf: Vec<u8> = buf[4..4 + msg_len].to_vec();
+                    buf.drain(..4 + msg_len);
+                    if let Some(event_json) = deserialize_to_json(&msg_buf) {
+                        if let Ok(mut q) = event_queue.lock() {
+                            if q.len() >= MAX_QUEUED_EVENTS {
+                                q.pop_front();
+                            }
+                            q.push_back(event_json);
+                        }
+                    } else if let Some(resp_json) = deserialize_response(&msg_buf) {
+                        // A synchronous reply. The envelope carries no kind tag
+                        // in the JSON, so stash it into every pending slot; the
+                        // awaiting method (queryLogs/listProcesses/listSockets)
+                        // consumes its own and the others time out harmlessly.
+                        if let Ok(mut slot) = pending_query_response.lock() {
+                            *slot = Some(resp_json.clone());
+                        }
+                        if let Ok(mut slot) = pending_processes.lock() {
+                            *slot = Some(resp_json.clone());
+                        }
+                        if let Ok(mut slot) = pending_sockets.lock() {
+                            *slot = Some(resp_json);
+                        }
+                    }
+                }
+                connected_reader.store(false, Ordering::Relaxed);
             });
         let reader = match reader {
             Ok(h) => h,
@@ -696,93 +732,69 @@ fn deserialize_to_json(data: &[u8]) -> Option<String> {
     Some(json.to_string())
 }
 
-/// Parse a `QueryLogs` reply frame (a `QueryResponse`, not a `Ring0Event`)
-/// into JSON `{"count":N,"alerts":[{timestamp,severity,rule_id,signature}]}`.
-fn deserialize_query_response(data: &[u8]) -> Option<String> {
+/// Parse a synchronous `Response` envelope frame (QueryLogs / ListProcesses /
+/// ListSockets reply) into the matching JSON. The envelope union is
+/// discriminated, so a process list can never be misclassified as an alert
+/// query result (capnp does not type-check the root struct).
+fn deserialize_response(data: &[u8]) -> Option<String> {
     let mut d = data;
     let reader = capnp::serialize::read_message_from_flat_slice(
         &mut d,
         capnp::message::ReaderOptions::new(),
     )
     .ok()?;
-    let qr = reader
-        .get_root::<capnp_schema::query_response::Reader>()
-        .ok()?;
-    let mut alerts = Vec::new();
-    if let Ok(list) = qr.getAlerts() {
-        for a in list.iter() {
-            alerts.push(serde_json::json!({
-                "timestamp": a.getTimestamp(),
-                "severity": format_severity(a.getSeverity().unwrap_or(capnp_schema::Severity::Low)),
-                "rule_id": a.getRuleId(),
-                "signature": text_or(a.getSignatureName().ok()),
-            }));
+    let resp = reader.get_root::<capnp_schema::response::Reader>().ok()?;
+    use capnp_schema::response::Which;
+    match resp.which().ok()? {
+        Which::Query(q) => {
+            let q = q.ok()?;
+            let list = q.getAlerts().ok()?;
+            let mut alerts = Vec::new();
+            for a in list.iter() {
+                alerts.push(serde_json::json!({
+                    "timestamp": a.getTimestamp(),
+                    "severity": format_severity(a.getSeverity().unwrap_or(capnp_schema::Severity::Low)),
+                    "rule_id": a.getRuleId(),
+                    "signature": text_or(a.getSignatureName().ok()),
+                }));
+            }
+            Some(serde_json::json!({"count": q.getCount(), "alerts": alerts}).to_string())
+        }
+        Which::Processes(p) => {
+            let p = p.ok()?;
+            let list = p.getProcesses().ok()?;
+            let mut procs = Vec::new();
+            for e in list.iter() {
+                procs.push(serde_json::json!({
+                    "pid": e.getPid(),
+                    "ppid": e.getPpid(),
+                    "uid": e.getUid(),
+                    "binary": text_or(e.getBinary().ok()),
+                    "cmdline": text_or(e.getCmdline().ok()),
+                    "state": text_or(e.getState().ok()),
+                }));
+            }
+            Some(serde_json::json!({"count": p.getCount(), "processes": procs}).to_string())
+        }
+        Which::Sockets(s) => {
+            let s = s.ok()?;
+            let list = s.getSockets().ok()?;
+            let mut socks = Vec::new();
+            for e in list.iter() {
+                socks.push(serde_json::json!({
+                    "localIp": text_or(e.getLocalIp().ok()),
+                    "localPort": e.getLocalPort(),
+                    "remoteIp": text_or(e.getRemoteIp().ok()),
+                    "remotePort": e.getRemotePort(),
+                    "proto": text_or(e.getProto().ok()),
+                    "state": text_or(e.getState().ok()),
+                    "pid": e.getPid(),
+                    "binary": text_or(e.getBinary().ok()),
+                }));
+            }
+            Some(serde_json::json!({"count": s.getCount(), "sockets": socks}).to_string())
         }
     }
-    Some(serde_json::json!({"count": qr.getCount(), "alerts": alerts}).to_string())
-}
-
-/// Parse a `ProcessListResponse` frame into
-/// `{"count":N,"processes":[{pid,ppid,uid,binary,cmdline,state}]}`.
-fn deserialize_process_response(data: &[u8]) -> Option<String> {
-    let mut d = data;
-    let reader = capnp::serialize::read_message_from_flat_slice(
-        &mut d,
-        capnp::message::ReaderOptions::new(),
-    )
-    .ok()?;
-    let resp = reader
-        .get_root::<capnp_schema::process_list_response::Reader>()
-        .ok()?;
-    let list = resp.getProcesses().ok()?;
-    let mut procs = Vec::new();
-    for p in list.iter() {
-        let p = p;
-        procs.push(serde_json::json!({
-            "pid": p.getPid(),
-            "ppid": p.getPpid(),
-            "uid": p.getUid(),
-            "binary": text_or(p.getBinary().ok()),
-            "cmdline": text_or(p.getCmdline().ok()),
-            "state": text_or(p.getState().ok()),
-        }));
-    }
-    Some(
-        serde_json::json!({"count": resp.getCount(), "processes": procs})
-            .to_string(),
-    )
-}
-
-/// Parse a `SocketListResponse` frame into
-/// `{"count":N,"sockets":[{localIp,localPort,remoteIp,remotePort,proto,state,pid,binary}]}`.
-fn deserialize_socket_response(data: &[u8]) -> Option<String> {
-    let mut d = data;
-    let reader = capnp::serialize::read_message_from_flat_slice(
-        &mut d,
-        capnp::message::ReaderOptions::new(),
-    )
-    .ok()?;
-    let resp = reader
-        .get_root::<capnp_schema::socket_list_response::Reader>()
-        .ok()?;
-    let list = resp.getSockets().ok()?;
-    let mut socks = Vec::new();
-    for s in list.iter() {
-        let s = s;
-        socks.push(serde_json::json!({
-            "localIp": text_or(s.getLocalIp().ok()),
-            "localPort": s.getLocalPort(),
-            "remoteIp": text_or(s.getRemoteIp().ok()),
-            "remotePort": s.getRemotePort(),
-            "proto": text_or(s.getProto().ok()),
-            "state": text_or(s.getState().ok()),
-            "pid": s.getPid(),
-            "binary": text_or(s.getBinary().ok()),
-        }));
-    }
-    Some(
-        serde_json::json!({"count": resp.getCount(), "sockets": socks}).to_string(),
-    )
 }
 
 fn text_or(t: Option<capnp::text::Reader<'_>>) -> String {

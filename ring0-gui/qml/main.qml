@@ -325,6 +325,37 @@ ApplicationWindow {
         }
     }
 
+    // Desktop notifications are throttled + severity-gated: a burst of
+    // routine alerts (process anomalies, file access) must never spam the
+    // notification daemon. Only CRITICAL/HIGH trigger a notification, at
+    // most one per second; low-severity alerts stay in the feed/popup.
+    // Desktop notifications are aggressively throttled: a noisy rule (e.g.
+    // "process anomaly" firing on every script exec) must never spam the
+    // notification daemon. CRITICAL alerts notify immediately (once per 5s);
+    // HIGH alerts coalesce into at most one per minute; MED/LOW never notify
+    // (they stay in the feed + alert history + in-app popup).
+    property int lastCritNotifSec: 0
+    property int lastHighNotifSec: 0
+    property int highCoalesced: 0
+    function notifyAlert(sev, msg) {
+        var now = Math.floor(Date.now() / 1000)
+        if (sev === "CRITICAL") {
+            if (now - lastCritNotifSec < 5) {
+                highCoalesced++ // fold into the next HIGH summary
+                return
+            }
+            lastCritNotifSec = now
+            bridge.sendDesktopNotification(2, "RingZero Alert", msg)
+        } else if (sev === "HIGH") {
+            highCoalesced++
+            if (now - lastHighNotifSec < 60) return
+            lastHighNotifSec = now
+            var n = highCoalesced
+            highCoalesced = 0
+            bridge.sendDesktopNotification(1, "RingZero (" + n + " alerts)", msg)
+        }
+    }
+
     function processEvent(evt) {
         var ts = new Date(evt.timestamp ? evt.timestamp / 1000000 : Date.now()).toLocaleTimeString()
         if (evt.type === "packet") {
@@ -345,7 +376,7 @@ ApplicationWindow {
             if (evt.signature && evt.signature.indexOf("DPI match") === 0) {
                 dnsInspector.addDpiMatch("Rule " + evt.rule_id, evt.signature)
             }
-            bridge.sendDesktopNotification(evt.severity === "CRITICAL" ? 3 : 2, "RingZero Alert", pendingAlertMsg)
+            notifyAlert(evt.severity, pendingAlertMsg)
             if (evt.severity === "CRITICAL") { appWindow.setStatusThreat() }
         } else if (evt.type === "connectionPrompt") {
             showPrompt(evt)
