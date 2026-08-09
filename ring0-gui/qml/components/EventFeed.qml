@@ -33,7 +33,9 @@ Rectangle {
         if (feedModel.count > 800) {
             feedModel.remove(800, feedModel.count - 800)
         }
-        feedModel.insert(0, { kind: kind, ts: ts, summary: summary, color: kindColor(kind) })
+        // role named 'color' is shadowed by Rectangle.color in delegates -
+        // use pillColor to avoid the self-referencing binding.
+        feedModel.insert(0, { kind: kind, ts: ts, summary: summary, pillColor: kindColor(kind) })
     }
 
     ListView {
@@ -55,7 +57,7 @@ Rectangle {
                 spacing: 6
                 Rectangle {
                     width: 46; height: 12; radius: 3
-                    color: color
+                    color: pillColor
                     Layout.alignment: Qt.AlignVCenter
                     Label {
                         anchors.centerIn: parent

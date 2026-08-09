@@ -19,17 +19,14 @@ int main(int argc, char *argv[])
     // Expose the design-system Theme (components/Theme.qml) as a context
     // property so every view resolves Theme.* tokens (dark/light/system).
     QQmlComponent themeComp(&engine, QUrl(QStringLiteral("qrc:/qml/components/Theme.qml")));
-    QObject *themeObj = nullptr;
     if (themeComp.isError()) {
-        qWarning() << "Theme.qml load error:" << themeComp.errorString();
-    } else {
-        themeObj = themeComp.create();
-        if (!themeObj) {
-            qWarning() << "Theme.qml create failed:" << themeComp.errorString();
-        } else {
-            engine.rootContext()->setContextProperty("Theme", themeObj);
-        }
+        qFatal("Theme.qml load error: %s", qPrintable(themeComp.errorString()));
     }
+    QObject *themeObj = themeComp.create();
+    if (!themeObj) {
+        qFatal("Theme.qml create failed: %s", qPrintable(themeComp.errorString()));
+    }
+    engine.rootContext()->setContextProperty("Theme", themeObj);
 
     ring0::Ring0Bridge *bridge = new ring0::Ring0Bridge(&app);
     engine.rootContext()->setContextProperty("bridge", bridge);
