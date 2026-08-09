@@ -9,7 +9,7 @@ Window {
     modality: Qt.ApplicationModal
     width: 520
     height: 380
-    color: "#161b22"
+    color: Theme.bgSurface
     title: "Ring0 — Connection Prompt"
 
     property int promptId: 0
@@ -54,7 +54,7 @@ Window {
             spacing: 8
             Rectangle {
                 width: 40; height: 40; radius: 8
-                color: "#21262d"
+                color: Theme.bgSurfaceAlt
                 Label {
                     anchors.centerIn: parent
                     text: "🛡"
@@ -65,13 +65,13 @@ Window {
                 spacing: 2
                 Label {
                     text: "Outbound Connection Attempt"
-                    color: "#f85149"
+                    color: Theme.accentDanger
                     font.pixelSize: 14
                     font.bold: true
                 }
                 Label {
                     text: "%1 second(s) to respond".arg(remainingSecs)
-                    color: "#8b949e"
+                    color: Theme.textSecondary
                     font.pixelSize: 10
                 }
             }
@@ -84,17 +84,20 @@ Window {
             Layout.preferredHeight: 4
             from: 0; to: 1
             value: 1
-            background: Rectangle { color: "#30363d"; radius: 2 }
+            background: Rectangle { color: Theme.borderDefault; radius: 2 }
             contentItem: Rectangle {
                 radius: 2
-                color: remainingSecs > 5 ? "#58a6ff" : remainingSecs > 3 ? "#d29922" : "#f85149"
+                // Fill MUST track visualPosition - the old code left the
+                // width unbounded, so the "loading bar" never moved.
+                width: parent.width * timeoutBar.visualPosition
+                color: remainingSecs > 5 ? Theme.accentInfo : remainingSecs > 3 ? Theme.accentWarning : Theme.accentDanger
             }
         }
 
         Rectangle {
             Layout.fillWidth: true
             Layout.preferredHeight: 1
-            color: "#30363d"
+            color: Theme.borderDefault
         }
 
         GridLayout {
@@ -103,32 +106,32 @@ Window {
             rowSpacing: 6
             Layout.fillWidth: true
 
-            Label { text: "Binary:"; color: "#8b949e"; font.pixelSize: 11 }
-            Label { text: binaryPath; color: "#c9d1d9"; font.pixelSize: 11; font.bold: true; elide: Text.ElideRight; Layout.fillWidth: true }
+            Label { text: "Binary:"; color: Theme.textSecondary; font.pixelSize: 11 }
+            Label { text: binaryPath; color: Theme.textPrimary; font.pixelSize: 11; font.bold: true; elide: Text.ElideRight; Layout.fillWidth: true }
 
-            Label { text: "PID / PPID:"; color: "#8b949e"; font.pixelSize: 11 }
-            Label { text: "%1 / %2".arg(pid).arg(ppid); color: "#c9d1d9"; font.pixelSize: 11 }
+            Label { text: "PID / PPID:"; color: Theme.textSecondary; font.pixelSize: 11 }
+            Label { text: "%1 / %2".arg(pid).arg(ppid); color: Theme.textPrimary; font.pixelSize: 11 }
 
-            Label { text: "Parent:"; color: "#8b949e"; font.pixelSize: 11 }
-            Label { text: parentBinary; color: "#c9d1d9"; font.pixelSize: 11; elide: Text.ElideRight; Layout.fillWidth: true }
+            Label { text: "Parent:"; color: Theme.textSecondary; font.pixelSize: 11 }
+            Label { text: parentBinary; color: Theme.textPrimary; font.pixelSize: 11; elide: Text.ElideRight; Layout.fillWidth: true }
 
-            Label { text: "Destination:"; color: "#8b949e"; font.pixelSize: 11 }
-            Label { text: "%1:%2 (%3)".arg(dstIp).arg(dstPort).arg(protocol); color: "#58a6ff"; font.pixelSize: 11; font.bold: true }
+            Label { text: "Destination:"; color: Theme.textSecondary; font.pixelSize: 11 }
+            Label { text: "%1:%2 (%3)".arg(dstIp).arg(dstPort).arg(protocol); color: Theme.accentInfo; font.pixelSize: 11; font.bold: true }
 
-            Label { text: "GeoIP:"; color: "#8b949e"; font.pixelSize: 11 }
-            Label { text: "%1 — %2".arg(countryCode).arg(countryName); color: "#d2a8ff"; font.pixelSize: 11 }
+            Label { text: "GeoIP:"; color: Theme.textSecondary; font.pixelSize: 11 }
+            Label { text: "%1 — %2".arg(countryCode).arg(countryName); color: Theme.accentPurple; font.pixelSize: 11 }
 
-            Label { text: "Hostname:"; color: "#8b949e"; font.pixelSize: 11 }
-            Label { text: rdnsName; color: "#c9d1d9"; font.pixelSize: 11; elide: Text.ElideRight; Layout.fillWidth: true }
+            Label { text: "Hostname:"; color: Theme.textSecondary; font.pixelSize: 11 }
+            Label { text: rdnsName; color: Theme.textPrimary; font.pixelSize: 11; elide: Text.ElideRight; Layout.fillWidth: true }
         }
 
         Rectangle {
             Layout.fillWidth: true
             Layout.preferredHeight: 1
-            color: "#30363d"
+            color: Theme.borderDefault
         }
 
-        Label { text: "Rule Scope:"; color: "#8b949e"; font.pixelSize: 11 }
+        Label { text: "Rule Scope:"; color: Theme.textSecondary; font.pixelSize: 11 }
         RowLayout {
             Layout.fillWidth: true
             spacing: 6

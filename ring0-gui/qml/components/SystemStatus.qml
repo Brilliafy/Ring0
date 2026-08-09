@@ -6,9 +6,9 @@ import QtQuick.Layouts 1.15
 // dropped-event counter, and operator actions (scan, sync, reload, shutdown).
 Rectangle {
     id: root
-    color: "#161b22"
+    color: Theme.bgSurface
     radius: 6
-    border.color: "#30363d"
+    border.color: Theme.borderDefault
     border.width: 1
 
     property int cpuPct: 0
@@ -36,7 +36,7 @@ Rectangle {
         anchors.margins: 12
         spacing: 10
 
-        Label { text: "Daemon Health"; color: "#58a6ff"; font.pixelSize: 15; font.bold: true }
+        Label { text: "Daemon Health"; color: Theme.accentInfo; font.pixelSize: 15; font.bold: true }
 
         GridLayout {
             columns: 4
@@ -44,40 +44,40 @@ Rectangle {
             rowSpacing: 8
             Layout.fillWidth: true
 
-            Rectangle { color: "#0d1117"; radius: 4; Layout.fillWidth: true; Layout.preferredHeight: 52; border.color: "#30363d"
+            Rectangle { color: Theme.bgBase; radius: 4; Layout.fillWidth: true; Layout.preferredHeight: 52; border.color: Theme.borderDefault
                 ColumnLayout { anchors.centerIn: parent; spacing: 0
-                    Label { text: "CPU"; color: "#8b949e"; font.pixelSize: 9 }
-                    Label { text: root.cpuPct + "%"; color: root.cpuPct > 60 ? "#f85149" : "#58a6ff"; font.pixelSize: 16; font.bold: true }
+                    Label { text: "CPU"; color: Theme.textSecondary; font.pixelSize: 9 }
+                    Label { text: root.cpuPct + "%"; color: root.cpuPct > 60 ? Theme.accentDanger : Theme.accentInfo; font.pixelSize: 16; font.bold: true }
                 } }
-            Rectangle { color: "#0d1117"; radius: 4; Layout.fillWidth: true; Layout.preferredHeight: 52; border.color: "#30363d"
+            Rectangle { color: Theme.bgBase; radius: 4; Layout.fillWidth: true; Layout.preferredHeight: 52; border.color: Theme.borderDefault
                 ColumnLayout { anchors.centerIn: parent; spacing: 0
-                    Label { text: "RAM"; color: "#8b949e"; font.pixelSize: 9 }
-                    Label { text: root.ramMb + " MB"; color: "#3fb950"; font.pixelSize: 16; font.bold: true }
+                    Label { text: "RAM"; color: Theme.textSecondary; font.pixelSize: 9 }
+                    Label { text: root.ramMb + " MB"; color: Theme.accentSuccess; font.pixelSize: 16; font.bold: true }
                 } }
-            Rectangle { color: "#0d1117"; radius: 4; Layout.fillWidth: true; Layout.preferredHeight: 52; border.color: "#30363d"
+            Rectangle { color: Theme.bgBase; radius: 4; Layout.fillWidth: true; Layout.preferredHeight: 52; border.color: Theme.borderDefault
                 ColumnLayout { anchors.centerIn: parent; spacing: 0
-                    Label { text: "Events/s"; color: "#8b949e"; font.pixelSize: 9 }
-                    Label { text: root.eps.toFixed(0); color: "#d2a8ff"; font.pixelSize: 16; font.bold: true }
+                    Label { text: "Events/s"; color: Theme.textSecondary; font.pixelSize: 9 }
+                    Label { text: root.eps.toFixed(0); color: Theme.accentPurple; font.pixelSize: 16; font.bold: true }
                 } }
-            Rectangle { color: "#0d1117"; radius: 4; Layout.fillWidth: true; Layout.preferredHeight: 52; border.color: "#30363d"
+            Rectangle { color: Theme.bgBase; radius: 4; Layout.fillWidth: true; Layout.preferredHeight: 52; border.color: Theme.borderDefault
                 ColumnLayout { anchors.centerIn: parent; spacing: 0
-                    Label { text: "Dropped events"; color: "#8b949e"; font.pixelSize: 9 }
-                    Label { text: root.droppedEvents; color: root.droppedEvents > 0 ? "#d29922" : "#8b949e"; font.pixelSize: 16; font.bold: true }
+                    Label { text: "Dropped events"; color: Theme.textSecondary; font.pixelSize: 9 }
+                    Label { text: root.droppedEvents; color: root.droppedEvents > 0 ? Theme.accentWarning : Theme.textSecondary; font.pixelSize: 16; font.bold: true }
                 } }
         }
 
         RowLayout {
             Layout.fillWidth: true
             spacing: 12
-            Label { text: "Active filters: " + root.activeFilters; color: "#d2a8ff"; font.pixelSize: 11 }
-            Label { text: "Domains: " + root.blockedDomains; color: "#d2a8ff"; font.pixelSize: 11 }
-            Label { text: "CIDRs: " + root.blockedCidrs; color: "#58a6ff"; font.pixelSize: 11 }
-            Label { text: "Ports: " + root.blockedPorts; color: "#f0883e"; font.pixelSize: 11 }
+            Label { text: "Active filters: " + root.activeFilters; color: Theme.accentPurple; font.pixelSize: 11 }
+            Label { text: "Domains: " + root.blockedDomains; color: Theme.accentPurple; font.pixelSize: 11 }
+            Label { text: "CIDRs: " + root.blockedCidrs; color: Theme.accentInfo; font.pixelSize: 11 }
+            Label { text: "Ports: " + root.blockedPorts; color: Theme.accentWarning; font.pixelSize: 11 }
         }
 
-        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#30363d" }
+        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.borderDefault }
 
-        Label { text: "Maintenance"; color: "#d2a8ff"; font.pixelSize: 13; font.bold: true }
+        Label { text: "Maintenance"; color: Theme.accentPurple; font.pixelSize: 13; font.bold: true }
 
         GridLayout {
             columns: 3
@@ -94,16 +94,16 @@ Rectangle {
             Button { text: "Shutdown Daemon"; flat: true; onClicked: { bridge.shutdownDaemon(); systemMsg.text = "Shutdown sent" } }
         }
 
-        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#30363d" }
+        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.borderDefault }
 
         Label {
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
-            color: "#8b949e"
+            color: Theme.textSecondary
             font.pixelSize: 10
             text: "Detection modes: LSM and fast-path DPI default to AUDIT (report-only). Set RING0_DPI_ENFORCE=1 / RING0_LSM_ENFORCE=1 at daemon start to drop matching traffic."
         }
 
-        Label { id: systemMsg; text: ""; color: "#3fb950"; font.pixelSize: 11 }
+        Label { id: systemMsg; text: ""; color: Theme.accentSuccess; font.pixelSize: 11 }
     }
 }

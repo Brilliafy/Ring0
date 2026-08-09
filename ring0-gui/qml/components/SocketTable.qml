@@ -6,9 +6,9 @@ import QtQuick.Layouts 1.15
 // (bridge.listSockets): local/remote endpoints, protocol, state, owning pid.
 Rectangle {
     id: root
-    color: "#161b22"
+    color: Theme.bgSurface
     radius: 6
-    border.color: "#30363d"
+    border.color: Theme.borderDefault
     border.width: 1
 
     property var socketModel: ListModel {}
@@ -20,7 +20,7 @@ Rectangle {
 
         RowLayout {
             Layout.fillWidth: true
-            Label { text: "Active Sockets (" + socketModel.count + ")"; color: "#58a6ff"; font.pixelSize: 12; font.bold: true }
+            Label { text: "Active Sockets (" + socketModel.count + ")"; color: Theme.accentInfo; font.pixelSize: 12; font.bold: true }
             Item { Layout.fillWidth: true }
             Button {
                 text: "Refresh"
@@ -39,18 +39,18 @@ Rectangle {
             delegate: Rectangle {
                 width: parent.width
                 height: 20
-                color: index % 2 === 0 ? "#161b22" : "#0d1117"
+                color: index % 2 === 0 ? Theme.bgSurface : Theme.bgBase
                 RowLayout {
                     anchors.fill: parent
                     anchors.margins: 2
                     spacing: 6
-                    Label { text: proto; color: "#d2a8ff"; font.pixelSize: 9; Layout.preferredWidth: 38 }
-                    Label { text: localIp + ":" + localPort; color: "#58a6ff"; font.pixelSize: 10; Layout.preferredWidth: 170; elide: Text.ElideRight }
-                    Label { text: "→"; color: "#484f58"; font.pixelSize: 10; Layout.preferredWidth: 14 }
-                    Label { text: remoteIp + ":" + remotePort; color: remotePort === 0 ? "#8b949e" : "#c9d1d9"; font.pixelSize: 10; Layout.preferredWidth: 170; elide: Text.ElideRight }
-                    Label { text: state; color: state === "LISTEN" ? "#d29922" : state === "ESTABLISHED" ? "#3fb950" : "#8b949e"; font.pixelSize: 9; Layout.preferredWidth: 76 }
-                    Label { text: pid; color: "#f85149"; font.pixelSize: 10; Layout.preferredWidth: 46 }
-                    Label { text: binary; color: "#8b949e"; font.pixelSize: 9; Layout.fillWidth: true; elide: Text.ElideRight }
+                    Label { text: proto; color: Theme.accentPurple; font.pixelSize: 9; Layout.preferredWidth: 38 }
+                    Label { text: localIp + ":" + localPort; color: Theme.accentInfo; font.pixelSize: 10; Layout.preferredWidth: 170; elide: Text.ElideRight }
+                    Label { text: "→"; color: Theme.textMuted; font.pixelSize: 10; Layout.preferredWidth: 14 }
+                    Label { text: remoteIp + ":" + remotePort; color: remotePort === 0 ? Theme.textSecondary : Theme.textPrimary; font.pixelSize: 10; Layout.preferredWidth: 170; elide: Text.ElideRight }
+                    Label { text: state; color: state === "LISTEN" ? Theme.accentWarning : state === "ESTABLISHED" ? Theme.accentSuccess : Theme.textSecondary; font.pixelSize: 9; Layout.preferredWidth: 76 }
+                    Label { text: pid; color: Theme.accentDanger; font.pixelSize: 10; Layout.preferredWidth: 46 }
+                    Label { text: binary; color: Theme.textSecondary; font.pixelSize: 9; Layout.fillWidth: true; elide: Text.ElideRight }
                 }
             }
         }

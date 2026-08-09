@@ -19,7 +19,7 @@ Item {
         onPaint: {
             var ctx = getContext("2d");
             ctx.reset();
-            ctx.strokeStyle = "#58a6ff";
+            ctx.strokeStyle = Theme.accentInfo;
             ctx.lineWidth = 2;
             ctx.beginPath();
             var n = root.history.length;
@@ -40,7 +40,7 @@ Item {
         anchors.left: parent.left
         anchors.margins: 4
         text: "Events/s: " + root.currentValue.toFixed(1)
-        color: "#58a6ff"
+        color: Theme.accentInfo
         font.pixelSize: 11
     }
 
