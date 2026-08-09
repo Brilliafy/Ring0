@@ -12,17 +12,61 @@
 //! the action rather than allowing it.
 
 use std::collections::HashMap;
+use std::sync::{Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 
+use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
 /// Polkit action id  -  must match `etc/ring0/polkit/com.ring0.policy`.
 pub const RING0_CONTROL_ACTION: &str = "com.ring0.security.control";
 
+/// Serializes polkit checks: at most ONE authentication dialog can be open at
+/// a time (several privileged commands issued in a burst used to pop stacked
+/// dialogs). Subsequent requests wait, then hit the success cache.
+static CHECK_LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
+/// (pid, uid) -> time of the last successful authorization. auth_admin_keep
+/// already caches at the polkitd level; this avoids even the round-trip and
+/// guarantees no re-prompt for a peer that just approved.
+static SUCCESS_CACHE: OnceLock<StdMutex<HashMap<(u32, u32), Instant>>> = OnceLock::new();
+
+const CACHE_TTL: Duration = Duration::from_secs(30);
+
 /// Ask polkitd whether the given Unix process may perform privileged daemon
 /// operations. With `AllowUserInteraction` set, polkit blocks while the user
 /// answers the desktop authentication prompt.
 pub async fn check_authorization(pid: u32, uid: u32) -> bool {
+    {
+        let cache = SUCCESS_CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
+        let c = cache.lock().unwrap();
+        if let Some(at) = c.get(&(pid, uid)) {
+            if at.elapsed() < CACHE_TTL {
+                return true;
+            }
+        }
+    }
+    // At most one dialog at a time.
+    let _guard = CHECK_LOCK.get_or_init(|| TokioMutex::new(())).lock().await;
+    {
+        // Another burst request may have authorized while we waited.
+        let cache = SUCCESS_CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
+        let c = cache.lock().unwrap();
+        if let Some(at) = c.get(&(pid, uid)) {
+            if at.elapsed() < CACHE_TTL {
+                return true;
+            }
+        }
+    }
+    let ok = do_check(pid, uid).await;
+    if ok {
+        let cache = SUCCESS_CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
+        cache.lock().unwrap().insert((pid, uid), Instant::now());
+    }
+    ok
+}
+
+async fn do_check(pid: u32, uid: u32) -> bool {
     let conn = match zbus::Connection::system().await {
         Ok(c) => c,
         Err(e) => {

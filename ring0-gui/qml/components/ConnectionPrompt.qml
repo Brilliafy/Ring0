@@ -41,7 +41,9 @@ Window {
             timeoutBar.value = remainingSecs / timeoutSecs
             if (remainingSecs <= 0) {
                 countdownTimer.stop()
-                decisionMade(promptId, "block", "exact_ip")
+                // Timeout = automatic dismissal: the connection already
+                // happened; allow it once rather than auto-blocking.
+                decisionMade(promptId, "allow_once", "exact_ip")
                 promptWindow.close()
             }
         }

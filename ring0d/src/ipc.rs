@@ -436,7 +436,6 @@ fn is_privileged_command(cmd: &DaemonCmd) -> bool {
             | Quarantine(_)
             | RunRootkitScan
             | SyncIntelFeeds
-            | SubmitPromptDecision(_, _, _, _)
             | Shutdown
     )
 }

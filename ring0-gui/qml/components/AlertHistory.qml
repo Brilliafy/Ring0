@@ -86,6 +86,7 @@ Rectangle {
                     spacing: 6
                     Rectangle {
                         width: 52; height: 12; radius: 3
+                        Layout.preferredWidth: 52
                         color: color
                         Layout.alignment: Qt.AlignVCenter
                         Label { anchors.centerIn: parent; text: sev; color: Theme.textOnAccent; font.pixelSize: 8; font.bold: true }
