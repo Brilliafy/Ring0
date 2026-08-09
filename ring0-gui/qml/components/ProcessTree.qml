@@ -2,51 +2,71 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 
+// Live process tree: built from the daemon's /proc snapshot (bridge.listProcesses)
+// with parent-child indentation, plus a kill button per row. The snapshot is
+// refreshed by a timer in main.qml; recent EXEC events are appended on top so
+// new processes are visible immediately.
 Rectangle {
+    id: root
     color: "#161b22"
     radius: 6
     border.color: "#30363d"
     border.width: 1
 
-    property var processModel: ListModel {}
-    property var socketModel: ListModel {}
+    property var treeModel: ListModel {}
+    property var execModel: ListModel {}
 
     ColumnLayout {
         anchors.fill: parent
-        anchors.margins: 4
+        anchors.margins: 6
         spacing: 4
 
-        Label {
-            text: "Process Tree"
-            color: "#58a6ff"
-            font.pixelSize: 12
-            font.bold: true
-            leftPadding: 4
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 6
+            Label { text: "Live Processes (" + treeModel.count + ")"; color: "#58a6ff"; font.pixelSize: 12; font.bold: true }
+            Item { Layout.fillWidth: true }
+            Label { text: "state pid ppid user"; color: "#484f58"; font.pixelSize: 9 }
         }
 
         ListView {
-            id: processListView
+            id: treeList
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
-            model: processModel
+            model: root.treeModel
+            section.property: "depth"
             delegate: Rectangle {
                 width: parent.width
-                height: 22
+                height: 20
                 color: index % 2 === 0 ? "#161b22" : "#0d1117"
                 RowLayout {
                     anchors.fill: parent
                     anchors.margins: 2
+                    anchors.leftMargin: 8 + depth * 16
                     spacing: 6
-                    Label { text: pid; color: "#f85149"; font.pixelSize: 10; Layout.preferredWidth: 45 }
-                    Label { text: ppid; color: "#8b949e"; font.pixelSize: 10; Layout.preferredWidth: 45 }
-                    Label { text: binary; color: "#c9d1d9"; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
-                    Label { text: cmdline; color: "#484f58"; font.pixelSize: 9; Layout.preferredWidth: 160; elide: Text.ElideRight }
+                    Rectangle {
+                        width: 34; height: 12; radius: 3
+                        color: state === "R" ? "#3fb950" : state === "S" ? "#58a6ff" : state === "Z" ? "#f85149" : "#8b949e"
+                        Layout.alignment: Qt.AlignVCenter
+                        Label { anchors.centerIn: parent; text: state; color: "#0d1117"; font.pixelSize: 8; font.bold: true }
+                    }
+                    Label { text: pid; color: "#f85149"; font.pixelSize: 10; Layout.preferredWidth: 46 }
+                    Label { text: ppid; color: "#484f58"; font.pixelSize: 9; Layout.preferredWidth: 40 }
+                    Label { text: uid; color: "#8b949e"; font.pixelSize: 9; Layout.preferredWidth: 34 }
+                    Label {
+                        text: binary + (cmdline.length > 0 ? "  " + cmdline : "")
+                        color: depth === 0 ? "#c9d1d9" : "#8b949e"
+                        font.pixelSize: 10
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                    }
                     Button {
                         text: "Kill"
                         flat: true
                         font.pixelSize: 9
                         implicitHeight: 18
+                        visible: parseInt(pid) > 1
                         onClicked: {
                             var p = parseInt(pid)
                             if (p > 1) bridge.killProcess(p)
@@ -56,26 +76,26 @@ Rectangle {
             }
         }
 
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.preferredHeight: 1
-            color: "#30363d"
-        }
+        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#30363d" }
 
-        Label {
-            text: "Recent Connections"
-            color: "#58a6ff"
-            font.pixelSize: 12
-            font.bold: true
-            leftPadding: 4
+        RowLayout {
+            Layout.fillWidth: true
+            Label { text: "Recently Executed"; color: "#58a6ff"; font.pixelSize: 12; font.bold: true }
+            Item { Layout.fillWidth: true }
+            Button {
+                text: "Refresh Tree"
+                flat: true
+                font.pixelSize: 10
+                onClicked: root.refresh()
+            }
         }
 
         ListView {
-            id: socketListView
+            id: execList
             Layout.fillWidth: true
-            Layout.preferredHeight: 80
+            Layout.preferredHeight: 100
             clip: true
-            model: socketModel
+            model: root.execModel
             delegate: Rectangle {
                 width: parent.width
                 height: 20
@@ -84,11 +104,51 @@ Rectangle {
                     anchors.fill: parent
                     anchors.margins: 2
                     spacing: 6
-                    Label { text: ip; color: "#58a6ff"; font.pixelSize: 10; Layout.preferredWidth: 110 }
-                    Label { text: port; color: "#d2a8ff"; font.pixelSize: 10; Layout.preferredWidth: 50 }
-                    Label { text: proto; color: "#8b949e"; font.pixelSize: 10; Layout.fillWidth: true }
+                    Label { text: ts; color: "#8b949e"; font.pixelSize: 10; Layout.preferredWidth: 80 }
+                    Label { text: pid; color: "#f85149"; font.pixelSize: 10; Layout.preferredWidth: 46 }
+                    Label { text: binary; color: "#3fb950"; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
                 }
             }
+        }
+    }
+
+    // Rebuild the tree from a ProcessListResponse JSON string.
+    function setSnapshot(json) {
+        try {
+            var data = JSON.parse(json)
+            var procs = data.processes || []
+            console.log("ProcessTree: got " + procs.length + " processes (raw " + json.length + " bytes)")
+            // pid -> index for O(1) parent lookup.
+            var byPid = {}
+            for (var i = 0; i < procs.length; i++) byPid[procs[i].pid] = procs[i]
+            treeModel.clear()
+            // Assign depths: walk up parent chains; roots (ppid not found) are depth 0.
+            function depthOf(p) {
+                var d = 0
+                var seen = 0
+                var cur = p
+                while (cur.ppid && byPid[cur.ppid] && byPid[cur.ppid] !== cur && seen < 20) {
+                    d++
+                    cur = byPid[cur.ppid]
+                    seen++
+                }
+                return d
+            }
+            for (var j = 0; j < procs.length; j++) {
+                var p = procs[j]
+                treeModel.append({
+                    pid: p.pid, ppid: p.ppid, uid: p.uid,
+                    binary: p.binary || "?", cmdline: p.cmdline || "",
+                    state: p.state || "?",
+                    depth: Math.min(depthOf(p), 6)
+                })
+            }
+        } catch (e) {}
+    }
+
+    function refresh() {
+        if (bridge && bridge.isConnected()) {
+            setSnapshot(bridge.listProcesses())
         }
     }
 }

@@ -73,6 +73,12 @@ pub mod qobject {
         ) -> QString;
         #[auto_wrap]
         #[qinvokable]
+        fn listProcesses(self: Pin<&mut Ring0Bridge>) -> QString;
+        #[auto_wrap]
+        #[qinvokable]
+        fn listSockets(self: Pin<&mut Ring0Bridge>) -> QString;
+        #[auto_wrap]
+        #[qinvokable]
         fn reloadRules(self: Pin<&mut Ring0Bridge>);
         #[auto_wrap]
         #[qinvokable]
@@ -146,6 +152,9 @@ pub struct Ring0BridgeRust {
     /// Holds the JSON of the most recent QueryLogs response frame read by the
     /// reader thread (the daemon answers queries on the event channel).
     pending_query_response: Arc<Mutex<Option<String>>>,
+    /// Holds the most recent ProcessListResponse / SocketListResponse JSON.
+    pending_processes: Arc<Mutex<Option<String>>>,
+    pending_sockets: Arc<Mutex<Option<String>>>,
     reader_handle: Option<thread::JoinHandle<()>>,
     writer_handle: Option<thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
@@ -159,6 +168,8 @@ impl Default for Ring0BridgeRust {
             stream: None,
             event_queue: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_QUEUED_EVENTS))),
             pending_query_response: Arc::new(Mutex::new(None)),
+            pending_processes: Arc::new(Mutex::new(None)),
+            pending_sockets: Arc::new(Mutex::new(None)),
             reader_handle: None,
             writer_handle: None,
             running: Arc::new(AtomicBool::new(false)),
@@ -250,6 +261,8 @@ impl Ring0BridgeRust {
 
         let event_queue = this.event_queue.clone();
         let pending_query_response = this.pending_query_response.clone();
+        let pending_processes = this.pending_processes.clone();
+        let pending_sockets = this.pending_sockets.clone();
         let running_reader = running.clone();
         let connected_reader = connected.clone();
         let reader = thread::Builder::new()
@@ -297,6 +310,14 @@ impl Ring0BridgeRust {
                             // A QueryLogs reply  -  stash it for queryLogs().
                             if let Ok(mut slot) = pending_query_response.lock() {
                                 *slot = Some(resp_json);
+                            }
+                        } else if let Some(procs_json) = deserialize_process_response(&msg_buf) {
+                            if let Ok(mut slot) = pending_processes.lock() {
+                                *slot = Some(procs_json);
+                            }
+                        } else if let Some(socks_json) = deserialize_socket_response(&msg_buf) {
+                            if let Ok(mut slot) = pending_sockets.lock() {
+                                *slot = Some(socks_json);
                             }
                         }
                     }
@@ -452,6 +473,67 @@ impl Ring0BridgeRust {
         while std::time::Instant::now() < deadline {
             if let Some(resp) = this
                 .pending_query_response
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                return cxx_qt_lib::QString::from(resp);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cxx_qt_lib::QString::from("")
+    }
+
+    /// Request a live /proc process snapshot from the daemon (read-only,
+    /// answered inline by the IPC handler). Returns JSON or "" on timeout.
+    pub fn listProcesses(self: Pin<&mut Self>) -> cxx_qt_lib::QString {
+        let this = self.get_mut();
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut cmd = message.init_root::<capnp_schema::daemon_command::Builder>();
+            cmd.setListProcesses(());
+        }
+        let mut buf = Vec::new();
+        let _ = capnp::serialize::write_message(&mut buf, &message);
+        *this
+            .pending_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        this.send_frame(&buf);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(resp) = this
+                .pending_processes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                return cxx_qt_lib::QString::from(resp);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cxx_qt_lib::QString::from("")
+    }
+
+    /// Request a live TCP/UDP socket snapshot (with owning processes).
+    pub fn listSockets(self: Pin<&mut Self>) -> cxx_qt_lib::QString {
+        let this = self.get_mut();
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut cmd = message.init_root::<capnp_schema::daemon_command::Builder>();
+            cmd.setListSockets(());
+        }
+        let mut buf = Vec::new();
+        let _ = capnp::serialize::write_message(&mut buf, &message);
+        *this
+            .pending_sockets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        this.send_frame(&buf);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(resp) = this
+                .pending_sockets
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
@@ -638,6 +720,69 @@ fn deserialize_query_response(data: &[u8]) -> Option<String> {
         }
     }
     Some(serde_json::json!({"count": qr.getCount(), "alerts": alerts}).to_string())
+}
+
+/// Parse a `ProcessListResponse` frame into
+/// `{"count":N,"processes":[{pid,ppid,uid,binary,cmdline,state}]}`.
+fn deserialize_process_response(data: &[u8]) -> Option<String> {
+    let mut d = data;
+    let reader = capnp::serialize::read_message_from_flat_slice(
+        &mut d,
+        capnp::message::ReaderOptions::new(),
+    )
+    .ok()?;
+    let resp = reader
+        .get_root::<capnp_schema::process_list_response::Reader>()
+        .ok()?;
+    let list = resp.getProcesses().ok()?;
+    let mut procs = Vec::new();
+    for p in list.iter() {
+        let p = p;
+        procs.push(serde_json::json!({
+            "pid": p.getPid(),
+            "ppid": p.getPpid(),
+            "uid": p.getUid(),
+            "binary": text_or(p.getBinary().ok()),
+            "cmdline": text_or(p.getCmdline().ok()),
+            "state": text_or(p.getState().ok()),
+        }));
+    }
+    Some(
+        serde_json::json!({"count": resp.getCount(), "processes": procs})
+            .to_string(),
+    )
+}
+
+/// Parse a `SocketListResponse` frame into
+/// `{"count":N,"sockets":[{localIp,localPort,remoteIp,remotePort,proto,state,pid,binary}]}`.
+fn deserialize_socket_response(data: &[u8]) -> Option<String> {
+    let mut d = data;
+    let reader = capnp::serialize::read_message_from_flat_slice(
+        &mut d,
+        capnp::message::ReaderOptions::new(),
+    )
+    .ok()?;
+    let resp = reader
+        .get_root::<capnp_schema::socket_list_response::Reader>()
+        .ok()?;
+    let list = resp.getSockets().ok()?;
+    let mut socks = Vec::new();
+    for s in list.iter() {
+        let s = s;
+        socks.push(serde_json::json!({
+            "localIp": text_or(s.getLocalIp().ok()),
+            "localPort": s.getLocalPort(),
+            "remoteIp": text_or(s.getRemoteIp().ok()),
+            "remotePort": s.getRemotePort(),
+            "proto": text_or(s.getProto().ok()),
+            "state": text_or(s.getState().ok()),
+            "pid": s.getPid(),
+            "binary": text_or(s.getBinary().ok()),
+        }));
+    }
+    Some(
+        serde_json::json!({"count": resp.getCount(), "sockets": socks}).to_string(),
+    )
 }
 
 fn text_or(t: Option<capnp::text::Reader<'_>>) -> String {

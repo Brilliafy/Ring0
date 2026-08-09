@@ -31,6 +31,7 @@ pub mod ipc;
 #[cfg(test)]
 mod fuzz;
 pub mod polkit;
+pub mod proc_snapshot;
 pub mod power;
 pub mod privesc;
 pub mod process;
@@ -1406,6 +1407,11 @@ impl Daemon {
                 }
                 self.threat_blocklist.unblock_port(port);
             }
+            ListProcesses => {
+                // Answered inline by the IPC handler; the main loop never
+                // receives this (kept for exhaustiveness).
+            }
+            ListSockets => {}
             KillProcess(pid) => {
                 // F1: pid_t is signed 32-bit  -  a u32 pid >= 0x8000_0000 casts
                 // to a negative pid_t, and kill(-1, SIGKILL) signals EVERY

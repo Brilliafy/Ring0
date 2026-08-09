@@ -124,6 +124,22 @@ struct AlertRecord {
 struct QueryResponse {
     alerts @0 : List(AlertRecord); count @1 : UInt32;
 }
+struct ProcessEntry {
+    pid @0 : UInt32; ppid @1 : UInt32; uid @2 : UInt32;
+    binary @3 : Text; cmdline @4 : Text; state @5 : Text;
+}
+struct ProcessListResponse {
+    processes @0 : List(ProcessEntry); count @1 : UInt32;
+}
+struct SocketEntry {
+    localIp @0 : Text; localPort @1 : UInt16;
+    remoteIp @2 : Text; remotePort @3 : UInt16;
+    proto @4 : Text; state @5 : Text;
+    pid @6 : UInt32; binary @7 : Text;
+}
+struct SocketListResponse {
+    sockets @0 : List(SocketEntry); count @1 : UInt32;
+}
 struct PromptDecisionCommand {
     promptId @0 : UInt64;
     action @1 : Text;
@@ -149,5 +165,7 @@ struct DaemonCommand {
     status @15 : Void;
     blockPort @16 : UInt32;
     unblockPort @17 : UInt32;
+    listProcesses @18 : Void;
+    listSockets @19 : Void;
     }
 }
