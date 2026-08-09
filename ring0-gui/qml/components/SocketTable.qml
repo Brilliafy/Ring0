@@ -49,8 +49,7 @@ Rectangle {
                     Label { text: "→"; color: Theme.textMuted; font.pixelSize: 10; Layout.preferredWidth: 14 }
                     Label { text: remoteIp + ":" + remotePort; color: remotePort === 0 ? Theme.textSecondary : Theme.textPrimary; font.pixelSize: 10; Layout.preferredWidth: 170; elide: Text.ElideRight }
                     Label { text: state; color: state === "LISTEN" ? Theme.accentWarning : state === "ESTABLISHED" ? Theme.accentSuccess : Theme.textSecondary; font.pixelSize: 9; Layout.preferredWidth: 76 }
-                    Label { text: pid; color: Theme.accentDanger; font.pixelSize: 10; Layout.preferredWidth: 46 }
-                    Label { text: binary; color: Theme.textSecondary; font.pixelSize: 9; Layout.fillWidth: true; elide: Text.ElideRight }
+                    Label { text: pid + "  " + binary; color: pid === 0 ? Theme.textSecondary : Theme.accentDanger; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
                 }
             }
         }

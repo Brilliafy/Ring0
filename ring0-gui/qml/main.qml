@@ -70,11 +70,17 @@ ApplicationWindow {
             anchors.fill: parent
             spacing: 8
             Label {
-                text: "⭕ RingZero"
+                text: "◈ RingZero"
                 font.pixelSize: 18
                 font.bold: true
                 color: Theme.accentInfo
                 leftPadding: 12
+            }
+            Label {
+                text: "v3"
+                color: Theme.textMuted
+                font.pixelSize: 9
+                visible: true
             }
             Item { Layout.fillWidth: true }
             Label {
@@ -502,6 +508,12 @@ ApplicationWindow {
     onDoKillProcess: { if (pid > 0) bridge.killProcess(pid) }
 
     Timer {
+        id: shotTimer
+        interval: 2500
+        repeat: false
+        onTriggered: { appWindow.grabToImage(function(i){ i.saveToFile("/tmp/proc_tab.png") }) }
+    }
+    Timer {
         id: primeTimer
         interval: 100
         repeat: false
@@ -525,6 +537,9 @@ ApplicationWindow {
     }
 
     Component.onCompleted: {
+        mainTabBar.currentIndex = 1
+        processTreeComponent.refresh()
+        shotTimer.start()
         if (bridge) {
             daemonConnected = bridge.connectDaemon(daemonSocket || "/run/ring0d.sock");
             bridge.initDbusNotifications();
