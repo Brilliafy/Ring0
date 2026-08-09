@@ -398,7 +398,7 @@ fn is_privileged_command(cmd: &DaemonCmd) -> bool {
     )
 }
 
-fn parse_command_frame(data: &[u8], caller_pid: u32) -> Result<DaemonCmd> {
+pub(crate) fn parse_command_frame(data: &[u8], caller_pid: u32) -> Result<DaemonCmd> {
     let mut data_mut = data;
     let reader = capnp::serialize::read_message_from_flat_slice(
         &mut data_mut,

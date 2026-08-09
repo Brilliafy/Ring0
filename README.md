@@ -282,6 +282,86 @@ enforcement is opt-in, and every hot path is bounded.
 
 ---
 
+## 7.5 Security model & hardening
+
+### Threat model
+
+Ring0 defends a single-user desktop against **malware and remote scanners**:
+
+- **Inbound** scanners/exploits (feed CIDRs, port blocks) - blocked at the NIC
+  by the XDP/TC fast path (TCP inbound only; UDP/ICMP are never feed-dropped
+  so VPN tunnels survive - see §2.1).
+- **Malicious local processes** (a downloaded binary phoning home): observed
+  via exec/connect/TLS capture, scored by the risk engine (§4), and - only
+  when `RING0_RESPONSE` is set - contained (freeze/kill).
+
+**Out of scope by design**: network crypto, disk encryption, or any
+anti-forensics guarantees. The eBPF programs are best-effort telemetry, not a
+hardened firewall or a mandatory-access-control system.
+
+### Privilege boundaries
+
+| Component | Privilege | Why |
+|---|---|---|
+| `ring0-gui`, `ring0ctl` | unprivileged (Ring 3) | management/telemetry only |
+| `ring0d` | root (CAP_BPF, CAP_NET_ADMIN, CAP_KILL) | loads eBPF, owns the socket |
+| eBPF programs | kernel, verifier-vetted | minimal, bounded, no loops |
+
+The GUI/CLI never gain privileges themselves: destructive commands
+(`kill`, `block`) are **polkit-gated** (`com.ring0.security.control`,
+`auth_admin_keep`) and the daemon re-checks the caller's credentials per
+command. A compromised GUI therefore cannot silently freeze processes without
+a desktop auth prompt.
+
+### IPC protocol & trust
+
+- Unix datagram stream socket (`/run/ring0d.sock`), 4-byte length-prefixed
+  Cap'n Proto frames.
+- **Frame bounds**: length `0 < len ≤ 65536` enforced before any parse;
+  capnp `ReaderOptions` limits traversal; `QueryLogs.limit` is clamped to
+  1000 so an unprivileged peer cannot force an unbounded RocksDB scan.
+- **Caller identity** is read per-connection from `SO_PEERCRED` (pid/uid/gid)
+  - not parsed from the message - and privileged commands are authorized
+  against it (root or `ring0` group bypass; everyone else goes through
+  polkitd).
+- **Kill hardening**: pid must fit positive `pid_t` (a raw u32 `>= 0x8000_0000`
+  would cast to `kill(-1, …)`, signalling every process); pid 0/1/self are
+  refused (confused-deputy protection).
+- **Socket swap protection**: the daemon binds, then fstat-compares the path
+  to the bound inode before chown/chmod - a symlink swap refuses the chmod.
+
+### Binary hardening
+
+Verified on release builds (`readelf`):
+
+- **Full RELRO** (`BIND_NOW`, `FLAGS_1: NOW`) - GOT is read-only after load.
+- **PIE** (`Type: DYN`) - ASLR applies to the executable itself.
+- **NX** - non-executable stack/heap (kernel default).
+- **Rust memory safety** - bounds-checked slices; `unsafe` is limited to
+  `libc` FFI with documented contracts + `aya::Pod` impls for plain-old-data.
+
+Deliberate trade-offs: Rust's stable toolchain has **no stack protector** (the
+nightly `-Z stack-protector`/`-Z sanitizer=cfi` flags exist but force nightly
+builds for the whole daemon). Given bounds-checked code and no
+manually-managed buffers, the marginal value is low; revisit if a C ABI
+surface is ever added.
+
+### Fuzzing
+
+`ring0d/src/fuzz.rs` runs a seeded PRNG harness under plain `cargo test`
+(no nightly, CI-safe) against the three untrusted decode paths:
+`parse_command_frame` (IPC), `AlertRecord::decode` (persistence), and the
+kernel ABI guard. ~2.6M iterations across seeds in ~25s, zero panics.
+For deeper coverage, the same entry points can be wrapped in libFuzzer
+targets:
+
+```bash
+# (nightly toolchain) add a fuzz/ workspace; feed random frames to
+# parse_command_frame + random bytes to the decoders.
+```
+
+---
+
 ## 8. Crates
 
 | Crate | Role |
