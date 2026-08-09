@@ -24,6 +24,10 @@ pub struct RocksManager {
     write_tx: Option<SyncSender<(u8, Vec<u8>)>>,
     writer: Option<std::thread::JoinHandle<()>>,
     dropped: Arc<AtomicU64>,
+    /// When the last memtable flush started (monotonic nanos), so a small but
+    /// continuous write trickle (alerts at ~2 KB/s) cannot accumulate for
+    /// hours before the write-buffer auto-flush fires.
+    last_flush: std::sync::atomic::AtomicU64,
 }
 
 impl RocksManager {
@@ -52,14 +56,24 @@ impl RocksManager {
 
         opts.increase_parallelism(num_cpus::get() as i32);
 
-        let cfs = vec![
-            ColumnFamilyDescriptor::new("events", Options::default()),
-            ColumnFamilyDescriptor::new("alerts", Options::default()),
-            ColumnFamilyDescriptor::new("metrics", Options::default()),
-            ColumnFamilyDescriptor::new("baseline", Options::default()),
-            ColumnFamilyDescriptor::new("fim_baseline", Options::default()),
-            ColumnFamilyDescriptor::new("intel", Options::default()),
+        // Every CF must inherit the tuned options (16 MB write buffer, WAL
+        // caps): ColumnFamilyDescriptor::new with Options::default() silently
+        // resets each CF to RocksDB defaults (64 MB write buffer x 6 CFs =
+        // up to 384 MB in-process under an alert storm). db.flush() then
+        // only ever flushed the default CF, leaving the alerts/events
+        // memtables to grow toward their 64 MB cap.
+        let cf_names = [
+            "events",
+            "alerts",
+            "metrics",
+            "baseline",
+            "fim_baseline",
+            "intel",
         ];
+        let cfs = cf_names
+            .iter()
+            .map(|name| ColumnFamilyDescriptor::new(*name, opts.clone()))
+            .collect::<Vec<_>>();
 
         let db = DB::open_cf_descriptors(&opts, path, cfs)
             .with_context(|| format!("failed to open RocksDB at {path}"))?;
@@ -80,11 +94,16 @@ impl RocksManager {
             .map_err(|e| anyhow::anyhow!("failed to spawn storage writer: {e}"))?;
 
         info!("RocksDB opened at {path}");
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
         Ok(Self {
             db,
             write_tx: Some(write_tx),
             writer: Some(writer),
             dropped,
+            last_flush: std::sync::atomic::AtomicU64::new(now_ns),
         })
     }
 
@@ -298,25 +317,63 @@ impl RocksManager {
     }
 
     /// Flush the memtable once it has grown past a threshold, so RSS stays
-    /// flat (a tight sawtooth) instead of creeping to RocksDB's default
-    /// 64 MB write-buffer limit and flushing hours later. The flush itself
-    /// runs on a detached worker thread because `db.flush()` can block for
-    /// seconds on a slow spinning disk; the writer queue keeps draining
-    /// meanwhile. The shutdown path still uses only [`Self::flush_bounded`].
+    /// flat (a tight sawtooth) instead of creeping to RocksDB's 16 MB
+    /// write-buffer limit and flushing hours later. The flush itself runs on
+    /// a detached worker thread because `db.flush()` can block for seconds on
+    /// a slow spinning disk; the writer queue keeps draining meanwhile. The
+    /// shutdown path still uses only [`Self::flush_bounded`].
     pub fn maybe_flush(&self) {
-        const MEMTABLE_FLUSH_MB: u64 = 16;
-        let cur = self
-            .db
-            .property_value("rocksdb.cur-size-all-mem-tables")
-            .ok()
-            .flatten()
-            .and_then(|s| s.trim().parse::<u64>().ok())
+        // 4 MB accumulation flushes immediately; below that, a 5-minute
+        // dirty window bounds the trickle case (~2 KB/s of alerts = <1 MB
+        // per window, visually flat RSS).
+        const MEMTABLE_FLUSH_BYTES: u64 = 4 * 1024 * 1024;
+        const DIRTY_FLUSH_NANOS: u64 = 300_000_000_000;
+        const CF_NAMES: [&str; 6] = [
+            "events",
+            "alerts",
+            "metrics",
+            "baseline",
+            "fim_baseline",
+            "intel",
+        ];
+        // The DB-wide property `rocksdb.cur-size-all-mem-tables` reports
+        // only the default CF through the C API; sum per-CF properties
+        // instead so the alerts/events memtables drive the flush.
+        let mut cur = 0u64;
+        for name in CF_NAMES {
+            if let Some(cf) = self.db.cf_handle(name) {
+                if let Ok(Some(s)) = self
+                    .db
+                    .property_value_cf(cf, "rocksdb.cur-size-all-mem-tables")
+                {
+                    if let Ok(v) = s.trim().parse::<u64>() {
+                        cur = cur.saturating_add(v);
+                    }
+                }
+            }
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        if cur >= MEMTABLE_FLUSH_MB * 1024 * 1024 {
+        let last = self.last_flush.load(std::sync::atomic::Ordering::Relaxed);
+        let dirty = cur > 0;
+        let overdue = dirty && last != 0 && now.saturating_sub(last) >= DIRTY_FLUSH_NANOS;
+        if cur >= MEMTABLE_FLUSH_BYTES || overdue {
+            self.last_flush
+                .store(now, std::sync::atomic::Ordering::Relaxed);
+            // db.flush() through the C API flushes ONLY the default CF
+            // (rocksdb_flush vs rocksdb_flush_cf) - the named CFs never
+            // wrote SSTs. Flush each CF explicitly on a worker thread so a
+            // slow disk cannot stall the Tokio tick loop.
             let db = self.db.clone();
             std::thread::spawn(move || {
-                if let Err(e) = db.flush() {
-                    error!("RocksDB periodic memtable flush failed: {e}");
+                for name in CF_NAMES {
+                    if let Some(cf) = db.cf_handle(name) {
+                        if let Err(e) = db.flush_cf(cf) {
+                            error!("RocksDB periodic flush failed on CF {name}: {e}");
+                        }
+                    }
                 }
             });
         }
