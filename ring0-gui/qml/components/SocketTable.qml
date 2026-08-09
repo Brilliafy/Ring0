@@ -37,7 +37,7 @@ Rectangle {
             clip: true
             model: root.socketModel
             delegate: Rectangle {
-                width: parent.width
+                width: parent ? parent.width : 0
                 height: 20
                 color: index % 2 === 0 ? Theme.bgSurface : Theme.bgBase
                 RowLayout {
