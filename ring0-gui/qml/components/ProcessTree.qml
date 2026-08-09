@@ -26,7 +26,7 @@ Rectangle {
             spacing: 6
             Label { text: "Live Processes (" + treeModel.count + ")"; color: Theme.accentInfo; font.pixelSize: 12; font.bold: true }
             Item { Layout.fillWidth: true }
-            Label { text: "state pid ppid user"; color: Theme.textMuted; font.pixelSize: 9 }
+            Label { text: "state  PID / command"; color: Theme.textMuted; font.pixelSize: 9 }
         }
 
         ListView {
@@ -61,8 +61,6 @@ Rectangle {
                         Layout.fillWidth: true
                         Layout.minimumWidth: 60
                         elide: Text.ElideRight
-                        // highlight the pid prefix
-                        font.italic: false
                     }
                     Button {
                         text: "Kill"
