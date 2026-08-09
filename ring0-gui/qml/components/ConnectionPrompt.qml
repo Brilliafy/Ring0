@@ -40,7 +40,7 @@ Window {
             remainingSecs -= 1
             timeoutBar.value = remainingSecs / timeoutSecs
             if (remainingSecs <= 0) {
-                timer.stop()
+                countdownTimer.stop()
                 decisionMade(promptId, "block", "exact_ip")
                 promptWindow.close()
             }

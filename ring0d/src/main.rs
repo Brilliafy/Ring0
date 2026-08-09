@@ -625,7 +625,14 @@ impl Daemon {
                 if !self.alert_due(200 + rid) {
                     continue;
                 }
-                let a = build_alert_bytes_rule(rid, 3, "process anomaly");
+                // Actionable message: rule name + the offending binary + its
+                // parent, so the operator knows WHAT was anomalous and WHO
+                // spawned it (the old "process anomaly" said neither).
+                let rule_name = self.rules.process_rule_name(rid);
+                let msg = format!(
+                    "{rule_name}: {binary} spawned by {pb}"
+                );
+                let a = build_alert_bytes_rule(rid, 3, &msg);
                 self.storage.write_alert(&a);
                 self.broadcast_alert_record(&a).await;
             }
