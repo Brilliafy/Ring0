@@ -72,7 +72,7 @@ Rectangle {
             clip: true
             model: dnsRoot.dpiModel
             delegate: Rectangle {
-                width: parent.width
+                width: parent ? parent.width : 0
                 height: 22
                 color: index % 2 === 0 ? Theme.bgSurface : Theme.bgBase
                 RowLayout {

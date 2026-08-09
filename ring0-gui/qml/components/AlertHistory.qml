@@ -85,11 +85,12 @@ Rectangle {
                     anchors.margins: 2
                     spacing: 6
                     Rectangle {
-                        width: 52; height: 12; radius: 3
-                        Layout.preferredWidth: 52
+                        width: 64; height: 12; radius: 3
+                        Layout.preferredWidth: 64
                         color: color
+                        clip: true
                         Layout.alignment: Qt.AlignVCenter
-                        Label { anchors.centerIn: parent; text: sev; color: Theme.textOnAccent; font.pixelSize: 8; font.bold: true }
+                        Label { anchors.left: parent.left; anchors.leftMargin: 3; anchors.verticalCenter: parent.verticalCenter; text: sev; color: Theme.textOnAccent; font.pixelSize: 8; font.bold: true; elide: Text.ElideRight }
                     }
                     Label { text: ts; color: Theme.textSecondary; font.pixelSize: 10; Layout.preferredWidth: 80 }
                     Label { text: rule; color: Theme.accentInfo; font.pixelSize: 10; Layout.preferredWidth: 90 }

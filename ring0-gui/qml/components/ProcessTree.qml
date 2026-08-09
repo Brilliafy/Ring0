@@ -56,10 +56,11 @@ Rectangle {
                     Label { text: ppid; color: Theme.textMuted; font.pixelSize: 9; Layout.preferredWidth: 40 }
                     Label { text: uid; color: Theme.textSecondary; font.pixelSize: 9; Layout.preferredWidth: 34 }
                     Label {
-                        text: binary + (cmdline.length > 0 ? "  " + cmdline : "")
+                        text: (binary + (cmdline.length > 0 ? "  " + cmdline : "")).slice(0, 220)
                         color: depth === 0 ? Theme.textPrimary : Theme.textSecondary
                         font.pixelSize: 10
                         Layout.fillWidth: true
+                        Layout.minimumWidth: 60
                         elide: Text.ElideRight
                     }
                     Button {

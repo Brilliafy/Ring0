@@ -56,16 +56,20 @@ Rectangle {
                 anchors.margins: 2
                 spacing: 6
                 Rectangle {
-                    width: 46; height: 12; radius: 3
-                    Layout.preferredWidth: 46
+                    width: 68; height: 14; radius: 3
+                    Layout.preferredWidth: 68
                     color: pillColor
+                    clip: true
                     Layout.alignment: Qt.AlignVCenter
                     Label {
-                        anchors.centerIn: parent
+                        anchors.left: parent.left
+                        anchors.leftMargin: 3
+                        anchors.verticalCenter: parent.verticalCenter
                         text: kind.toUpperCase()
                         color: Theme.bgBase
                         font.pixelSize: 8
                         font.bold: true
+                        elide: Text.ElideRight
                     }
                 }
                 Label { text: ts; color: Theme.textSecondary; font.pixelSize: 10; Layout.preferredWidth: 90 }
