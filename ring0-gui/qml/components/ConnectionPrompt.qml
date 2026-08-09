@@ -70,7 +70,7 @@ Window {
                     font.bold: true
                 }
                 Label {
-                    text: "%d second(s) to respond".arg(remainingSecs)
+                    text: "%1 second(s) to respond".arg(remainingSecs)
                     color: "#8b949e"
                     font.pixelSize: 10
                 }

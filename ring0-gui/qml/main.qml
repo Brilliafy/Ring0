@@ -356,6 +356,21 @@ ApplicationWindow {
         }
     }
 
+    // In-app alert popup: like desktop notifications, it must not open for
+    // every low-severity alert (a rule-200 anomaly on each script exec
+    // spammed the UI). Only HIGH/CRITICAL pop up, throttled to one per 2s.
+    property int lastPopupSec: 0
+    function showAlertPopup(sev, msg, ip) {
+        if (sev !== "CRITICAL" && sev !== "HIGH") return
+        var now = Math.floor(Date.now() / 1000)
+        if (now - lastPopupSec < 2) return
+        lastPopupSec = now
+        pendingAlertMsg = msg
+        pendingAlertIp = ip || ""
+        alertMsg.text = pendingAlertMsg
+        alertPopup.open()
+    }
+
     function processEvent(evt) {
         var ts = new Date(evt.timestamp ? evt.timestamp / 1000000 : Date.now()).toLocaleTimeString()
         if (evt.type === "packet") {
@@ -368,10 +383,7 @@ ApplicationWindow {
             alertCountLabel.text = alertCount.toString()
             eventList.appendEvent("alert", ts, (evt.signature || "alert") + " [Rule " + evt.rule_id + "]")
             alertHistory.addAlert(evt.severity, "Rule " + evt.rule_id, evt.signature, intToIp(evt.src_ip))
-            pendingAlertMsg = evt.signature + " [Rule " + evt.rule_id + "]"
-            pendingAlertIp = evt.src_ip || ""
-            alertMsg.text = pendingAlertMsg
-            alertPopup.open()
+            showAlertPopup(evt.severity, evt.signature + " [Rule " + evt.rule_id + "]", evt.src_ip || "")
             // Fast-path DPI matches also surface in the DNS & Security tab.
             if (evt.signature && evt.signature.indexOf("DPI match") === 0) {
                 dnsInspector.addDpiMatch("Rule " + evt.rule_id, evt.signature)
@@ -397,20 +409,14 @@ ApplicationWindow {
             var corrMsg = "[" + (evt.pattern_name || "correlation") + "] " + (evt.description || "")
             eventList.appendEvent("alert", ts, corrMsg)
             alertHistory.addAlert(evt.severity, "Corr " + (evt.pattern_id || ""), corrMsg, "")
-            pendingAlertMsg = corrMsg
-            pendingAlertIp = ""
-            alertMsg.text = pendingAlertMsg
-            alertPopup.open()
+            showAlertPopup(evt.severity, corrMsg, "")
         } else if (evt.type === "selfDefense") {
             alertCount++
             alertCountLabel.text = alertCount.toString()
             var sdMsg = "Self-defense: PID " + evt.attacker_pid + " " + (evt.syscall || "")
             eventList.appendEvent("selfDefense", ts, sdMsg)
             alertHistory.addAlert("HIGH", "SelfDefense", sdMsg, "")
-            pendingAlertMsg = sdMsg
-            pendingAlertIp = ""
-            alertMsg.text = pendingAlertMsg
-            alertPopup.open()
+            showAlertPopup("HIGH", sdMsg, "")
         } else if (evt.type === "dns") {
             eventList.appendEvent("dns", ts, "pid " + evt.pid + " query " + (evt.domain || ""))
             dnsInspector.addDpiMatch("DNS", evt.domain || "")
@@ -418,10 +424,6 @@ ApplicationWindow {
             var faMsg = "File access: " + (evt.file || "") + " by " + (evt.binary || "")
             eventList.appendEvent("fileAccess", ts, faMsg)
             alertHistory.addAlert("MED", "FileAccess", faMsg, "")
-            pendingAlertMsg = faMsg
-            pendingAlertIp = ""
-            alertMsg.text = pendingAlertMsg
-            alertPopup.open()
         } else if (evt.type === "status") {
             var filters = evt.activeFilters || []
             filterCountLabel.text = filters.length.toString()
