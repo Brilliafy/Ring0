@@ -413,6 +413,23 @@ impl Daemon {
                 }
                 _ = fastpath_tick.tick() => {
                     self.fastpath.purge_idle_flows();
+                    // Reap stale per-pid throttle entries: pids churn and the
+                    // maps would otherwise grow without bound (one entry per
+                    // exited process, forever).
+                    {
+                        let cutoff_s = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                            .saturating_sub(120);
+                        let mut thr = self.connect_throttle.lock();
+                        thr.retain(|_, last| *last >= cutoff_s);
+                    }
+                    {
+                        let mut at = self.alert_throttle.lock();
+                        let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(120);
+                        at.retain(|_, last| *last >= cutoff);
+                    }
                     self.storage.flush_bounded();
                     // Keep the memtable bounded so RSS stays flat (see
                     // RocksManager::maybe_flush); runs the flush on a worker
@@ -698,10 +715,19 @@ impl Daemon {
         self.correlation.push_connect(pid, dip, dp);
         self.lineage.record_connect(pid, dip, dp);
         self.baseline.record_connection(dip, dp);
+        // Surface every connect in the live GUI feed FIRST - the throttle
+        // below must not hide telemetry from the operator.
+        let binary = binary_hint
+            .filter(|b| !b.is_empty())
+            .or_else(|| crate::process::ProcessResolver::binary_path(pid))
+            .unwrap_or_else(|| "unknown".into());
+        let evt = ipc::build_connect_event(pid, uid, &binary, dip, dp, proto);
+        self.ipc.broadcast_raw(&evt).await;
         // Per-pid throttle: the LSM emits up to 2 connects/s per pid and the
         // full pipeline runs an rpm subprocess + file hashing. Running it on
         // every event starved the main loop (status/commands queued behind a
-        // cascade of connect handling). Cheap trackers above still update.
+        // cascade of connect handling). Cheap trackers + the broadcast above
+        // still run; only the expensive trust/prompt path is throttled.
         let now_s = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -721,10 +747,6 @@ impl Daemon {
             let evt = ipc::build_alert_event(8002, 2, &anomaly);
             self.ipc.broadcast_raw(&evt).await;
         }
-        let binary = binary_hint
-            .filter(|b| !b.is_empty())
-            .or_else(|| crate::process::ProcessResolver::binary_path(pid))
-            .unwrap_or_else(|| "unknown".into());
         let cmdline =
             crate::process::ProcessResolver::cmdline(pid).unwrap_or_else(|| "unknown".into());
         self.desktop_sandbox.resolve_pid(pid, &binary, &cmdline);
@@ -735,9 +757,7 @@ impl Daemon {
             self.ipc.broadcast_raw(&evt).await;
             info!("[SANDBOX] {}", anomaly.description);
         }
-        let evt = ipc::build_connect_event(pid, uid, &binary, dip, dp, proto);
         self.storage.write_raw(&evt);
-        self.ipc.broadcast_raw(&evt).await;
 
         // Trust verification runs on a blocking thread (whole-file hash + rpm
         // subprocess) so a slow disk/rpm cannot stall the event pipeline.
