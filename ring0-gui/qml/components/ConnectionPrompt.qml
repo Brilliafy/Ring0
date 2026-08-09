@@ -6,7 +6,10 @@ import QtQuick.Window 2.15
 Window {
     id: promptWindow
     flags: Qt.Dialog | Qt.WindowStaysOnTopHint
-    modality: Qt.ApplicationModal
+    // WindowModal (not ApplicationModal): ApplicationModal blocked input to
+    // EVERY window, which felt like the app froze. WindowModal only blocks the
+    // main window, and the countdown keeps the decision visible.
+    modality: Qt.WindowModal
     width: 520
     height: 380
     color: Theme.bgSurface
@@ -76,6 +79,19 @@ Window {
                 }
             }
             Item { Layout.fillWidth: true }
+            Button {
+                text: "✕"
+                flat: true
+                font.pixelSize: 12
+                implicitWidth: 24
+                implicitHeight: 24
+                ToolTip.text: "Dismiss (allow this connection once)"
+                ToolTip.visible: hovered
+                onClicked: {
+                    decisionMade(promptId, "allow_once", "exact_ip")
+                    promptWindow.close()
+                }
+            }
         }
 
         ProgressBar {

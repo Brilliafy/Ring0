@@ -267,7 +267,19 @@ ApplicationWindow {
             anchors.fill: parent
             anchors.margins: 16
             spacing: 12
-            Label { text: "🚨 THREAT DETECTED"; color: Theme.accentDanger; font.pixelSize: 16; font.bold: true }
+            RowLayout {
+                Layout.fillWidth: true
+                Label { text: "◈ THREAT DETECTED"; color: Theme.accentDanger; font.pixelSize: 16; font.bold: true }
+                Item { Layout.fillWidth: true }
+                Button {
+                    text: "✕"
+                    flat: true
+                    font.pixelSize: 12
+                    implicitWidth: 24
+                    implicitHeight: 24
+                    onClicked: alertPopup.close()
+                }
+            }
             Label { id: alertMsg; text: ""; color: Theme.textPrimary; font.pixelSize: 12; Layout.fillWidth: true; wrapMode: Text.WordWrap }
             RowLayout {
                 Layout.fillWidth: true
