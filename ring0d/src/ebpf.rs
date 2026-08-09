@@ -111,6 +111,9 @@ pub struct EbpfManager {
     /// Interfaces XDP/TC have been attached to (for periodic re-scan when new
     /// interfaces appear or the default route moves).
     attached_interfaces: parking_lot::Mutex<Vec<String>>,
+    /// Programs are loaded into the kernel ONCE; attach is per-interface.
+    xdp_loaded: std::sync::atomic::AtomicBool,
+    tc_loaded: std::sync::atomic::AtomicBool,
     // software fallback for when the kernel maps are unavailable
     fallback_blocked_ips: parking_lot::Mutex<Vec<String>>,
     fallback_blocked_ports: parking_lot::Mutex<Vec<u16>>,
@@ -160,6 +163,8 @@ impl EbpfManager {
                     loaded: Arc::new(AtomicBool::new(false)),
                     lsm_attached: Arc::new(AtomicBool::new(false)),
                     attached_interfaces: parking_lot::Mutex::new(Vec::new()),
+                    xdp_loaded: std::sync::atomic::AtomicBool::new(false),
+                    tc_loaded: std::sync::atomic::AtomicBool::new(false),
                     fallback_blocked_ips: parking_lot::Mutex::new(Vec::new()),
                     fallback_blocked_ports: parking_lot::Mutex::new(Vec::new()),
                     fallback_dns_domains: parking_lot::Mutex::new(Vec::new()),
@@ -189,10 +194,11 @@ impl EbpfManager {
             .context("failed to load BPF program")?;
 
         let attached_interfaces = parking_lot::Mutex::new(Vec::new());
+        let xdp_loaded = std::sync::atomic::AtomicBool::new(false);
 
         // ── Attach XDP + TC to the default interface ──
         if let Some(iface) = default_interface() {
-            match attach_xdp(&mut ebpf, &iface) {
+            match attach_xdp(&mut ebpf, &iface, &xdp_loaded) {
                 Ok(()) => info!("XDP attached on {iface}"),
                 Err(e) => warn!("XDP attach failed on {iface}: {e}"),
             }
@@ -293,6 +299,8 @@ impl EbpfManager {
             rootkit_tx: rootkit_tx.clone(),
             privesc_tx: privesc_tx.clone(),
             ebpf: Some(ebpf),
+            xdp_loaded,
+            tc_loaded: std::sync::atomic::AtomicBool::new(false),
             loaded: Arc::new(AtomicBool::new(true)),
             lsm_attached: Arc::new(AtomicBool::new(lsm_ok)),
             attached_interfaces,
@@ -801,12 +809,24 @@ impl EbpfManager {
             return;
         }
         let mut attached = self.attached_interfaces.lock();
-        for iface in list_up_interfaces() {
+        for (iface, physical) in list_up_interfaces() {
             if attached.contains(&iface) {
                 continue;
             }
             if let Some(ebpf) = self.ebpf.as_mut() {
-                match attach_xdp(ebpf, &iface) {
+                // Virtual/tunnel interfaces run capture-only: mark them in the
+                // kernel map so the XDP never drops there, then attach.
+                if !physical {
+                    if let Some(map) = ebpf.map_mut("CAPTURE_ONLY") {
+                        if let Ok(mut m) = aya::maps::HashMap::<_, u32, u8>::try_from(map) {
+                            if let Ok(ifindex) = ifindex_of(&iface) {
+                                let _ = m.insert(ifindex, 1, 0);
+                                info!("interface {iface} marked CAPTURE-ONLY (no drops)");
+                            }
+                        }
+                    }
+                }
+                match attach_xdp(ebpf, &iface, &self.xdp_loaded) {
                     Ok(()) => {
                         let _ = attach_tc(ebpf, &iface);
                         info!("XDP/TC attached on newly seen interface {iface}");
@@ -824,8 +844,14 @@ impl EbpfManager {
     }
 }
 
-/// Enumerate up, non-loopback interfaces from /sys/class/net.
-fn list_up_interfaces() -> Vec<String> {
+/// An up, non-loopback interface + whether it is a PHYSICAL NIC.
+/// Physical = a `/sys/class/net/<name>/device` symlink (PCI/USB). Virtual
+/// interfaces (wg*, tun/tap, veth, docker0, br*, corporate tunnels such as
+/// edr-*) have none - on those the fast path runs CAPTURE-ONLY (telemetry
+/// flows, nothing is ever dropped), so attaching to the user's VPN tunnel can
+/// never break connectivity while still yielding DNS/packet/DPI visibility
+/// where the traffic actually travels.
+fn list_up_interfaces() -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let Ok(dir) = std::fs::read_dir("/sys/class/net") else {
         return out;
@@ -835,37 +861,39 @@ fn list_up_interfaces() -> Vec<String> {
         if name == "lo" {
             continue;
         }
-        // PHYSICAL interfaces only: a `/sys/class/net/<name>/device` symlink
-        // exists for real NICs (PCI/USB) but not for virtual/tunnel devices
-        // (wireguard wg*, tun/tap, veth, docker0, br*, tailscale…). Attaching
-        // XDP/TC to a VPN tunnel filters the DECRYPTED inner traffic against
-        // the blocklist  -  dropping the user's own VPN packets and breaking
-        // connectivity  -  and to virtual bridges double-filters traffic. The
-        // physical edge (wlo1/eth0) already sees the ENCRYPTED outer packets,
-        // which is where egress/ingress filtering belongs.
-        if !Path::new(&format!("/sys/class/net/{name}/device")).exists() {
-            continue;
-        }
+        let physical = Path::new(&format!("/sys/class/net/{name}/device")).exists();
         let operstate =
             std::fs::read_to_string(format!("/sys/class/net/{name}/operstate")).unwrap_or_default();
-        if operstate.trim() == "up" {
-            out.push(name);
+        // 'unknown' is normal for point-to-point/virtual links (wg, tunnels) -
+        // treat it as up; only 'down'/'lowerlayerdown' are excluded.
+        let st = operstate.trim();
+        if st == "up" || st == "unknown" {
+            out.push((name, physical));
         }
     }
     out
 }
 
+/// Resolve an interface's kernel ifindex.
+fn ifindex_of(name: &str) -> std::io::Result<u32> {
+    let s = std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))?;
+    Ok(s.trim().parse().unwrap_or(0))
+}
+
 type LpmTrieKey = aya::maps::lpm_trie::Key<u32>;
 
-fn attach_xdp(ebpf: &mut Ebpf, iface: &str) -> Result<()> {
-    // aya 0.14 names programs by their ELF symbol (the Rust fn name), NOT the
-    // section name  -  `program_mut("xdp")` never matched and no program ever
-    // attached, silently disabling all kernel enforcement.
+fn attach_xdp(
+    ebpf: &mut Ebpf,
+    iface: &str,
+    loaded: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
     let program: &mut Xdp = ebpf
         .program_mut("ring0_xdp")
         .context("xdp program not found")?
         .try_into()?;
-    program.load()?; // aya >= 0.13 requires an explicit load before attach
+    if !loaded.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        program.load()?; // aya >= 0.13 requires an explicit load before attach
+    }
     program.attach(iface, XdpMode::default())?;
     Ok(())
 }

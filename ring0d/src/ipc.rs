@@ -735,6 +735,27 @@ pub fn build_file_access_event(pid: u32, uid: u32, binary: &str, path: &str) -> 
     buf
 }
 
+/// Serialize a DNS query observation as a capnp `ring0_event::Dns` frame.
+pub fn build_dns_event(
+    timestamp: u64,
+    pid: u32,
+    domain: &str,
+    query_type: u16,
+    dga_score: f32,
+) -> Vec<u8> {
+    let mut msg = capnp::message::Builder::new_default();
+    let evt = msg.init_root::<capnp_schema::ring0_event::Builder>();
+    let mut d = evt.initDns();
+    d.setTimestamp(timestamp);
+    d.setPid(pid);
+    d.setDomain(domain);
+    d.setQueryType(query_type);
+    d.setDgaScore(dga_score);
+    let mut buf = Vec::new();
+    let _ = capnp::serialize::write_message(&mut buf, &msg);
+    buf
+}
+
 pub fn build_connect_event(
     pid: u32,
     uid: u32,

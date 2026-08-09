@@ -477,6 +477,7 @@ impl Daemon {
             4 => self.on_kill_event(raw).await,
             5 => self.on_unlink_event(raw).await,
             6 => self.on_tls_event(raw).await,
+            7 => self.on_dns_event(raw).await,
             30 => self.on_dpi_event(raw).await,
             _ => {}
         }
@@ -919,6 +920,43 @@ impl Daemon {
             self.storage.write_alert(&alert);
             self.broadcast_alert_record(&alert).await;
         }
+    }
+
+    async fn on_dns_event(&mut self, raw: &[u8]) {
+        self.event_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if raw.len() < ring0_abi::SIZE_DNS {
+            return;
+        }
+        let ts = u64::from_le_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
+        let query_type = u16::from_le_bytes(raw[24..26].try_into().unwrap_or([0; 2]));
+        // The XDP copies the raw label bytes (length-prefixed); decode them
+        // here: <len><bytes> repeated, dots between, stop at 0 / pointer / end.
+        let name = &raw[28..28 + ring0_abi::SIZE_DNS - 28];
+        let mut domain = String::with_capacity(96);
+        let mut i = 0usize;
+        while i < name.len() {
+            let l = name[i] as usize;
+            if l == 0 {
+                break; // root terminator
+            }
+            if l & 0xC0 == 0xC0 || i + 1 + l > name.len() {
+                break; // compression pointer or truncated
+            }
+            if !domain.is_empty() {
+                domain.push('.');
+            }
+            // skip the length byte + copy the label
+            domain.push_str(&String::from_utf8_lossy(&name[i + 1..i + 1 + l]));
+            i += 1 + l;
+        }
+        if domain.is_empty() {
+            return;
+        }
+        // Blocked-domain hits surface in the DNS & Security view.
+        let evt = ipc::build_dns_event(ts, 0, &domain, query_type, 0.0);
+        self.storage.write_raw(&evt);
+        self.ipc.broadcast_raw(&evt).await;
     }
 
     async fn on_tls_event(&mut self, raw: &[u8]) {
