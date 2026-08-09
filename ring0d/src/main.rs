@@ -28,6 +28,8 @@ pub mod intel;
 // wired into the event pipeline (see IntelApiClient).
 pub mod intel_api;
 pub mod ipc;
+#[cfg(test)]
+mod fuzz;
 pub mod polkit;
 pub mod power;
 pub mod privesc;
@@ -46,14 +48,39 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .json()
-        .init();
+    // A panic anywhere (worker thread, storage writer, ring reader) is a bug
+    // worth surfacing to the operator, not something the runtime should
+    // swallow: capture the backtrace into the structured log. RUST_BACKTRACE
+    // is not required; force_capture() always records it.
+    std::panic::set_hook(Box::new(|info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        error!("PANIC at {info}\nbacktrace:\n{bt}");
+    }));
+
+    let env_filter = EnvFilter::from_default_env();
+    let registry = tracing_subscriber::registry();
+    // Prefer the systemd journal for structured, persisted logs; always keep
+    // the stderr JSON stream too (manual runs, shell redirects). journald is
+    // absent on non-systemd hosts - fall back to stderr only. (The fmt layer
+    // is rebuilt per arm because its Subscriber type parameter is fixed by
+    // the composition it joins.)
+    match tracing_journald::layer() {
+        Ok(journald_layer) => registry
+            .with(env_filter)
+            .with(journald_layer)
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).json())
+            .init(),
+        Err(_) => registry
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).json())
+            .init(),
+    }
 
     let shutdown = Arc::new(Notify::new());
     let sig_shutdown = shutdown.clone();
@@ -1577,7 +1604,7 @@ impl Daemon {
 /// Validate a ring-buffer entry against the canonical per-kind size table
 /// (ring0-abi). Unknown kinds pass (handlers may still reject them); known
 /// kinds must be at least the canonical size.
-fn event_len_ok(kind: u8, len: usize) -> bool {
+pub(crate) fn event_len_ok(kind: u8, len: usize) -> bool {
     match ring0_abi::EVENT_SIZE.get(kind as usize).copied().flatten() {
         Some(expected) => len >= expected,
         None => true,
