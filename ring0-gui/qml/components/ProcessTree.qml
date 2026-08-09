@@ -48,6 +48,7 @@ Rectangle {
                     Rectangle {
                         width: 34; height: 12; radius: 3
                         color: state === "R" ? Theme.accentSuccess : state === "S" ? Theme.accentInfo : state === "Z" ? Theme.accentDanger : Theme.textSecondary
+                        Layout.preferredWidth: 34
                         Layout.alignment: Qt.AlignVCenter
                         Label { anchors.centerIn: parent; text: state; color: Theme.textOnAccent; font.pixelSize: 8; font.bold: true }
                     }

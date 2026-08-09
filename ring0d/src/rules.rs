@@ -76,6 +76,18 @@ pub struct RuleEngine {
 }
 
 impl RuleEngine {
+    /// Look up a process-rule's display name by id (for alert messages).
+    pub fn process_rule_name(&self, id: u32) -> String {
+        let config = self.config.read();
+        config
+            .rules
+            .process
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| format!("rule {id}"))
+    }
+
     pub fn empty() -> Self {
         Self {
             config: Arc::new(RwLock::new(RuleConfig {
