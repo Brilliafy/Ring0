@@ -351,19 +351,25 @@ impl Ring0BridgeRust {
                             }
                             q.push_back(event_json);
                         }
-                    } else if let Some(resp_json) = deserialize_response(&msg_buf) {
-                        // A synchronous reply. The envelope carries no kind tag
-                        // in the JSON, so stash it into every pending slot; the
-                        // awaiting method (queryLogs/listProcesses/listSockets)
-                        // consumes its own and the others time out harmlessly.
-                        if let Ok(mut slot) = pending_query_response.lock() {
-                            *slot = Some(resp_json.clone());
-                        }
-                        if let Ok(mut slot) = pending_processes.lock() {
-                            *slot = Some(resp_json.clone());
-                        }
-                        if let Ok(mut slot) = pending_sockets.lock() {
-                            *slot = Some(resp_json);
+                    } else if let Some((kind, resp_json)) = deserialize_response(&msg_buf) {
+                        // Route to the matching pending slot only.
+                        match kind {
+                            "query" => {
+                                if let Ok(mut slot) = pending_query_response.lock() {
+                                    *slot = Some(resp_json);
+                                }
+                            }
+                            "processes" => {
+                                if let Ok(mut slot) = pending_processes.lock() {
+                                    *slot = Some(resp_json);
+                                }
+                            }
+                            "sockets" => {
+                                if let Ok(mut slot) = pending_sockets.lock() {
+                                    *slot = Some(resp_json);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -644,10 +650,11 @@ impl Ring0BridgeRust {
                     summary: title,
                     body: message,
                     urgency,
-                    actions: vec![
-                        ("block_ip".into(), "Block IP".into()),
-                        ("quarantine".into(), "Quarantine PID".into()),
-                    ],
+                    // NO actions: the desktop notification daemon has no
+                    // ActionInvoked listener here, so "Block IP"/"Quarantine"
+                    // buttons rendered but did nothing - a user clicking them
+                    // would believe the IP was blocked when it wasn't.
+                    actions: Vec::new(),
                 };
                 let mut guard = notifier.lock().await;
                 if let Some(n) = guard.as_mut() {
@@ -745,7 +752,11 @@ fn deserialize_to_json(data: &[u8]) -> Option<String> {
 /// ListSockets reply) into the matching JSON. The envelope union is
 /// discriminated, so a process list can never be misclassified as an alert
 /// query result (capnp does not type-check the root struct).
-fn deserialize_response(data: &[u8]) -> Option<String> {
+/// Parse a synchronous `Response` envelope; returns (kind, json) so the
+/// reader can route the reply to exactly the pending slot it belongs to
+/// (stashing every reply into every slot let a processes response briefly
+/// overwrite the socket table's view).
+fn deserialize_response(data: &[u8]) -> Option<(&'static str, String)> {
     let mut d = data;
     let reader = capnp::serialize::read_message_from_flat_slice(
         &mut d,
@@ -767,7 +778,7 @@ fn deserialize_response(data: &[u8]) -> Option<String> {
                     "signature": text_or(a.getSignatureName().ok()),
                 }));
             }
-            Some(serde_json::json!({"count": q.getCount(), "alerts": alerts}).to_string())
+            Some(("query", serde_json::json!({"count": q.getCount(), "alerts": alerts}).to_string()))
         }
         Which::Processes(p) => {
             let p = p.ok()?;
@@ -783,7 +794,7 @@ fn deserialize_response(data: &[u8]) -> Option<String> {
                     "state": text_or(e.getState().ok()),
                 }));
             }
-            Some(serde_json::json!({"count": p.getCount(), "processes": procs}).to_string())
+            Some(("processes", serde_json::json!({"count": p.getCount(), "processes": procs}).to_string()))
         }
         Which::Sockets(s) => {
             let s = s.ok()?;
@@ -801,7 +812,7 @@ fn deserialize_response(data: &[u8]) -> Option<String> {
                     "binary": text_or(e.getBinary().ok()),
                 }));
             }
-            Some(serde_json::json!({"count": s.getCount(), "sockets": socks}).to_string())
+            Some(("sockets", serde_json::json!({"count": s.getCount(), "sockets": socks}).to_string()))
         }
     }
 }
