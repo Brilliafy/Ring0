@@ -43,7 +43,9 @@ Rectangle {
         clip: true
         model: feedModel
         delegate: Rectangle {
-            width: parent.width
+            // parent is null while a row is being destroyed (model clear /
+            // cap) - width would throw "Cannot read property 'width' of null".
+            width: parent ? parent.width : 0
             height: 22
             color: index % 2 === 0 ? "#161b22" : "#0d1117"
             visible: root.filterText.length === 0 || summary.indexOf(root.filterText) >= 0
