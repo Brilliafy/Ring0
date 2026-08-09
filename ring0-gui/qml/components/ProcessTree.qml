@@ -52,16 +52,17 @@ Rectangle {
                         Layout.alignment: Qt.AlignVCenter
                         Label { anchors.centerIn: parent; text: state; color: Theme.textOnAccent; font.pixelSize: 8; font.bold: true }
                     }
-                    Label { text: pid; color: Theme.accentDanger; font.pixelSize: 10; Layout.preferredWidth: 46 }
-                    Label { text: ppid; color: Theme.textMuted; font.pixelSize: 9; Layout.preferredWidth: 40 }
-                    Label { text: uid; color: Theme.textSecondary; font.pixelSize: 9; Layout.preferredWidth: 34 }
+                    // PID is part of the main label (no separate column):
+                    // "12345 /usr/bin/grep grep -Fxq ..." reads as one unit.
                     Label {
-                        text: (binary + (cmdline.length > 0 ? "  " + cmdline : "")).slice(0, 220)
+                        text: (pid + "  " + binary + (cmdline.length > 0 ? "  " + cmdline : "")).slice(0, 220)
                         color: depth === 0 ? Theme.textPrimary : Theme.textSecondary
                         font.pixelSize: 10
                         Layout.fillWidth: true
                         Layout.minimumWidth: 60
                         elide: Text.ElideRight
+                        // highlight the pid prefix
+                        font.italic: false
                     }
                     Button {
                         text: "Kill"
@@ -107,8 +108,7 @@ Rectangle {
                     anchors.margins: 2
                     spacing: 6
                     Label { text: ts; color: Theme.textSecondary; font.pixelSize: 10; Layout.preferredWidth: 80 }
-                    Label { text: pid; color: Theme.accentDanger; font.pixelSize: 10; Layout.preferredWidth: 46 }
-                    Label { text: binary; color: Theme.accentSuccess; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
+                    Label { text: pid + "  " + binary; color: Theme.accentSuccess; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
                 }
             }
         }
