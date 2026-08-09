@@ -192,8 +192,9 @@ ApplicationWindow {
             TabButton { text: "Network"; background: Rectangle { color: mainTabBar.currentIndex === 0 ? "#21262d" : "#161b22" } }
             TabButton { text: "Processes"; background: Rectangle { color: mainTabBar.currentIndex === 1 ? "#21262d" : "#161b22" } }
             TabButton { text: "DNS & Security"; background: Rectangle { color: mainTabBar.currentIndex === 2 ? "#21262d" : "#161b22" } }
-            TabButton { text: "MITRE"; background: Rectangle { color: mainTabBar.currentIndex === 3 ? "#21262d" : "#161b22" } }
-            TabButton { text: "Settings"; background: Rectangle { color: mainTabBar.currentIndex === 4 ? "#21262d" : "#161b22" } }
+            TabButton { text: "Alerts"; background: Rectangle { color: mainTabBar.currentIndex === 3 ? "#21262d" : "#161b22" } }
+            TabButton { text: "System"; background: Rectangle { color: mainTabBar.currentIndex === 4 ? "#21262d" : "#161b22" } }
+            TabButton { text: "Settings"; background: Rectangle { color: mainTabBar.currentIndex === 5 ? "#21262d" : "#161b22" } }
         }
 
         StackLayout {
@@ -221,26 +222,34 @@ ApplicationWindow {
                     border.color: "#30363d"; border.width: 1; clip: true
                     ColumnLayout { anchors.fill: parent; anchors.margins: 4
                         RowLayout { spacing: 4
-                            TextField { id: filterInput; placeholderText: "Filter by PID, IP, or Rule..."; color: "#c9d1d9"; placeholderTextColor: "#484f58"; background: Rectangle { color: "#0d1117"; radius: 4; border.color: "#30363d"; border.width: 1 } Layout.fillWidth: true; Layout.preferredHeight: 28 }
+                            TextField { id: filterInput; placeholderText: "Filter events (PID, IP, binary, rule...)"; color: "#c9d1d9"; placeholderTextColor: "#484f58"; background: Rectangle { color: "#0d1117"; radius: 4; border.color: "#30363d"; border.width: 1 } Layout.fillWidth: true; Layout.preferredHeight: 28 }
                             Button { text: "Clear"; flat: true; onClicked: filterInput.text = "" }
                         }
-                        EventLogTable { id: eventList; Layout.fillWidth: true; Layout.fillHeight: true }
+                        EventFeed { id: eventList; Layout.fillWidth: true; Layout.fillHeight: true; filterText: filterInput.text }
                     }
                 }
             }
 
             // Tab 1: Processes
-            ProcessTree { id: processTreeComponent }
+            ColumnLayout { spacing: 4
+                ProcessTree { id: processTreeComponent; Layout.fillWidth: true; Layout.fillHeight: true }
+                Rectangle { color: "#161b22"; radius: 6; Layout.fillWidth: true; Layout.preferredHeight: 160; border.color: "#30363d"; border.width: 1
+                    SocketTable { id: socketTable; anchors.fill: parent; anchors.margins: 4 }
+                }
+            }
 
             // Tab 2: DNS & Security
             ColumnLayout { spacing: 6
                 DnsSecurityInspector { id: dnsInspector; Layout.fillWidth: true; Layout.fillHeight: true }
             }
 
-            // Tab 3: MITRE
-            MitreMatrix { id: mitreMatrix }
+            // Tab 3: Alerts
+            AlertHistory { id: alertHistory }
 
-            // Tab 4: Settings
+            // Tab 4: System
+            SystemStatus { id: systemStatus }
+
+            // Tab 5: Settings
             Settings { id: settingsComponent }
         }
     }
@@ -317,19 +326,17 @@ ApplicationWindow {
     }
 
     function processEvent(evt) {
+        var ts = new Date(evt.timestamp ? evt.timestamp / 1000000 : Date.now()).toLocaleTimeString()
         if (evt.type === "packet") {
-            eventList.appendPacket(
-                new Date(evt.timestamp / 1000000).toLocaleTimeString(),
-                intToIp(evt.src_ip),
-                intToIp(evt.dst_ip),
-                evt.protocol,
-                evt.pid.toString(),
-                evt.action
-            )
+            var dropAct = evt.action === "DROP" ? " [DROPPED]" : ""
+            eventList.appendEvent("packet", ts,
+                intToIp(evt.src_ip) + ":" + (evt.src_port || "") + " -> " + intToIp(evt.dst_ip) + ":" + (evt.dst_port || "") + " " + (evt.protocol || "") + " pid=" + (evt.pid || "") + dropAct)
             ppsLabel.text = (parseInt(ppsLabel.text) + 1).toString()
         } else if (evt.type === "alert") {
             alertCount++
             alertCountLabel.text = alertCount.toString()
+            eventList.appendEvent("alert", ts, (evt.signature || "alert") + " [Rule " + evt.rule_id + "]")
+            alertHistory.addAlert(evt.severity, "Rule " + evt.rule_id, evt.signature, intToIp(evt.src_ip))
             pendingAlertMsg = evt.signature + " [Rule " + evt.rule_id + "]"
             pendingAlertIp = evt.src_ip || ""
             alertMsg.text = pendingAlertMsg
@@ -343,43 +350,44 @@ ApplicationWindow {
         } else if (evt.type === "connectionPrompt") {
             showPrompt(evt)
         } else if (evt.type === "processExec") {
-            processTreeComponent.processModel.insert(0, {
+            eventList.appendEvent("processExec", ts, "pid " + evt.pid + " " + (evt.binary || "") + " " + (evt.cmdline || ""))
+            processTreeComponent.execModel.insert(0, {
+                ts: ts,
                 pid: evt.pid.toString(),
-                ppid: evt.ppid.toString(),
-                binary: evt.binary || "",
-                cmdline: evt.cmdline || ""
+                binary: (evt.binary || "") + " " + (evt.cmdline || "")
             })
-            if (processTreeComponent.processModel.count > 500) processTreeComponent.processModel.remove(500, processTreeComponent.processModel.count - 500)
+            if (processTreeComponent.execModel.count > 200) processTreeComponent.execModel.remove(200, processTreeComponent.execModel.count - 200)
             procCountLabel.text = (parseInt(procCountLabel.text) + 1).toString()
         } else if (evt.type === "connect") {
-            processTreeComponent.socketModel.insert(0, {
-                ip: intToIp(evt.dst_ip),
-                port: evt.dst_port.toString(),
-                proto: evt.protocol || "TCP"
-            })
-            if (processTreeComponent.socketModel.count > 200) processTreeComponent.socketModel.remove(200, processTreeComponent.socketModel.count - 200)
+            eventList.appendEvent("connect", ts, "pid " + evt.pid + " -> " + intToIp(evt.dst_ip) + ":" + evt.dst_port + " " + (evt.protocol || "TCP") + " " + (evt.binary || ""))
         } else if (evt.type === "correlation") {
-            // Correlation alerts feed the MITRE matrix and the alert counter.
-            mitreMatrix.addTechnique(evt.mitre_technique)
             alertCount++
             alertCountLabel.text = alertCount.toString()
-            pendingAlertMsg = "[" + (evt.pattern_name || "correlation") + "] " + (evt.description || "")
+            var corrMsg = "[" + (evt.pattern_name || "correlation") + "] " + (evt.description || "")
+            eventList.appendEvent("alert", ts, corrMsg)
+            alertHistory.addAlert(evt.severity, "Corr " + (evt.pattern_id || ""), corrMsg, "")
+            pendingAlertMsg = corrMsg
             pendingAlertIp = ""
             alertMsg.text = pendingAlertMsg
             alertPopup.open()
         } else if (evt.type === "selfDefense") {
             alertCount++
             alertCountLabel.text = alertCount.toString()
-            pendingAlertMsg = "Self-defense: PID " + evt.attacker_pid + " " + (evt.syscall || "")
+            var sdMsg = "Self-defense: PID " + evt.attacker_pid + " " + (evt.syscall || "")
+            eventList.appendEvent("selfDefense", ts, sdMsg)
+            alertHistory.addAlert("HIGH", "SelfDefense", sdMsg, "")
+            pendingAlertMsg = sdMsg
             pendingAlertIp = ""
             alertMsg.text = pendingAlertMsg
             alertPopup.open()
         } else if (evt.type === "dns") {
+            eventList.appendEvent("dns", ts, "pid " + evt.pid + " query " + (evt.domain || ""))
             dnsInspector.addDpiMatch("DNS", evt.domain || "")
         } else if (evt.type === "fileAccess") {
-            alertCount++
-            alertCountLabel.text = alertCount.toString()
-            pendingAlertMsg = "File access: " + (evt.file || "") + " by " + (evt.binary || "")
+            var faMsg = "File access: " + (evt.file || "") + " by " + (evt.binary || "")
+            eventList.appendEvent("fileAccess", ts, faMsg)
+            alertHistory.addAlert("MED", "FileAccess", faMsg, "")
+            pendingAlertMsg = faMsg
             pendingAlertIp = ""
             alertMsg.text = pendingAlertMsg
             alertPopup.open()
@@ -392,7 +400,7 @@ ApplicationWindow {
                 epsLabel.text = evt.eventsPerSec >= 100 ? evt.eventsPerSec.toFixed(0) + " eps" : evt.eventsPerSec.toFixed(1) + " eps"
                 liveChart.addValue(evt.eventsPerSec)
             }
-            // Power + blocklist state → labels and DNS inspector.
+            // Power + blocklist state → labels, DNS inspector and System tab.
             batteryLabel.text = evt.onBattery ? "⚡ Battery" : "⚡ AC"
             batteryLabel.color = evt.onBattery ? "#d29922" : "#3fb950"
             batteryLabel.visible = true
@@ -401,6 +409,7 @@ ApplicationWindow {
             dnsInspector.blockedDomains = evt.blockedDomains || 0
             dnsInspector.blockedCidrs = evt.blockedCidrs || 0
             dnsInspector.blockedPorts = evt.blockedPorts || 0
+            systemStatus.updateFromStatus(evt)
         }
     }
 
@@ -443,10 +452,28 @@ ApplicationWindow {
     onDoBlockIp: { if (ip && ip.length > 0) bridge.blockIp(ip) }
     onDoKillProcess: { if (pid > 0) bridge.killProcess(pid) }
 
+    Timer {
+        id: snapshotTimer
+        interval: 3000
+        running: daemonConnected
+        repeat: true
+        onTriggered: {
+            // Live process tree + socket table refresh (snapshot IPC).
+            processTreeComponent.refresh()
+            socketTable.refresh()
+        }
+    }
+
     Component.onCompleted: {
         if (bridge) {
             daemonConnected = bridge.connectDaemon(daemonSocket || "/run/ring0d.sock");
             bridge.initDbusNotifications();
+            if (daemonConnected) {
+                // Prime the process tree immediately + load persisted alerts.
+                processTreeComponent.refresh()
+                socketTable.refresh()
+                alertHistory.loadHistory()
+            }
         }
     }
 }

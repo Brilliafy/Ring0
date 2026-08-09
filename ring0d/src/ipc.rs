@@ -40,6 +40,9 @@ pub enum DaemonCmd {
     Status,
     BlockPort(u16),
     UnblockPort(u16),
+    /// Read-only /proc snapshots answered inline by the IPC handler.
+    ListProcesses,
+    ListSockets,
 }
 
 pub struct IpcServer {
@@ -208,6 +211,24 @@ impl IpcServer {
                                         Ok(DaemonCmd::QueryLogs(_start, _end, sev, limit)) => {
                                             let results = storage.query_alerts(sev, limit as usize);
                                             let response = build_query_response(&results);
+                                            if resp_tx.send(response).is_err() {
+                                                break;
+                                            }
+                                        }
+                                        // Read-only /proc snapshots are answered
+                                        // inline (no privilege gate, no main-loop
+                                        // hop) so the GUI can refresh its process
+                                        // tree / socket list without an approval.
+                                        Ok(DaemonCmd::ListProcesses) => {
+                                            let procs = crate::proc_snapshot::list_processes();
+                                            let response = build_process_list_response(&procs);
+                                            if resp_tx.send(response).is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Ok(DaemonCmd::ListSockets) => {
+                                            let socks = crate::proc_snapshot::list_sockets();
+                                            let response = build_socket_list_response(&socks);
                                             if resp_tx.send(response).is_err() {
                                                 break;
                                             }
@@ -437,6 +458,8 @@ pub(crate) fn parse_command_frame(data: &[u8], caller_pid: u32) -> Result<Daemon
         Which::ReloadFilters(()) => Ok(DaemonCmd::ReloadFilters),
         Which::ReloadRules(()) => Ok(DaemonCmd::ReloadRules),
         Which::Shutdown(()) => Ok(DaemonCmd::Shutdown),
+        Which::ListProcesses(()) => Ok(DaemonCmd::ListProcesses),
+        Which::ListSockets(()) => Ok(DaemonCmd::ListSockets),
         Which::QueryLogs(query) => {
             let q = query.map_err(|e| anyhow::anyhow!("capnp query error: {e}"))?;
             // F3: the limit drives an unbounded RocksDB iteration + collection
@@ -719,6 +742,51 @@ pub fn build_connect_event(
     } else {
         capnp_schema::Protocol::Tcp
     });
+    let mut buf = Vec::new();
+    let _ = capnp::serialize::write_message(&mut buf, &msg);
+    buf
+}
+
+
+// ---------- Snapshot responses (ListProcesses / ListSockets) ----------
+
+/// Serialize a process snapshot as a `ProcessListResponse` capnp frame.
+pub fn build_process_list_response(procs: &[crate::proc_snapshot::ProcessInfo]) -> Vec<u8> {
+    let mut msg = capnp::message::Builder::new_default();
+    let mut root = msg.init_root::<capnp_schema::process_list_response::Builder>();
+    let mut list = root.reborrow().initProcesses(procs.len() as u32);
+    for (i, p) in procs.iter().enumerate() {
+        let mut e = list.reborrow().get(i as u32);
+        e.setPid(p.pid);
+        e.setPpid(p.ppid);
+        e.setUid(p.uid);
+        e.setBinary(&p.binary);
+        e.setCmdline(&p.cmdline);
+        e.setState(&p.state);
+    }
+    root.setCount(procs.len() as u32);
+    let mut buf = Vec::new();
+    let _ = capnp::serialize::write_message(&mut buf, &msg);
+    buf
+}
+
+/// Serialize a socket snapshot as a `SocketListResponse` capnp frame.
+pub fn build_socket_list_response(socks: &[crate::proc_snapshot::SocketInfo]) -> Vec<u8> {
+    let mut msg = capnp::message::Builder::new_default();
+    let mut root = msg.init_root::<capnp_schema::socket_list_response::Builder>();
+    let mut list = root.reborrow().initSockets(socks.len() as u32);
+    for (i, s) in socks.iter().enumerate() {
+        let mut e = list.reborrow().get(i as u32);
+        e.setLocalIp(&s.local_ip);
+        e.setLocalPort(s.local_port);
+        e.setRemoteIp(&s.remote_ip);
+        e.setRemotePort(s.remote_port);
+        e.setProto(&s.proto);
+        e.setState(&s.state);
+        e.setPid(s.pid);
+        e.setBinary(&s.binary);
+    }
+    root.setCount(socks.len() as u32);
     let mut buf = Vec::new();
     let _ = capnp::serialize::write_message(&mut buf, &msg);
     buf

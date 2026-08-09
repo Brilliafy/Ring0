@@ -1,13 +1,15 @@
 <RCC>
     <qresource prefix="/">
         <file>qml/main.qml</file>
+        <file>qml/components/AlertHistory.qml</file>
         <file>qml/components/ConnectionPrompt.qml</file>
-        <file>qml/components/EventLogTable.qml</file>
+        <file>qml/components/DnsSecurityInspector.qml</file>
+        <file>qml/components/EventFeed.qml</file>
         <file>qml/components/LiveTrafficChart.qml</file>
-        <file>qml/components/MitreMatrix.qml</file>
         <file>qml/components/ProcessTree.qml</file>
         <file>qml/components/Settings.qml</file>
-        <file>qml/components/DnsSecurityInspector.qml</file>
+        <file>qml/components/SocketTable.qml</file>
+        <file>qml/components/SystemStatus.qml</file>
         <file>icons/shield_green.png</file>
         <file>icons/shield_yellow.png</file>
         <file>icons/shield_red.png</file>

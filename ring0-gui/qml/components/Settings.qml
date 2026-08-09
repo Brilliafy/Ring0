@@ -1,12 +1,11 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
-import QtQuick.Controls.Material 2.15
 
-// Settings panel. Every control here is either wired to the daemon through the
-// bridge, or clearly informational. (The previous Slack/Discord/Syslog
-// "SIEM exporters" fields were cosmetic — the daemon had no such feature, so
-// they were removed rather than pretending to configure them.)
+// Settings: every control here performs a real daemon action (polkit-gated
+// where privileged). No cosmetic placeholders - the previous Slack/Syslog
+// "exporters" and threshold sliders were removed because the daemon has no
+// such features.
 Rectangle {
     id: settingsRoot
     color: "#161b22"
@@ -17,40 +16,16 @@ Rectangle {
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: 12
-        spacing: 16
+        spacing: 14
 
-        Label {
-            text: "Settings & Configuration"
-            color: "#58a6ff"
-            font.pixelSize: 16
-            font.bold: true
-        }
-
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.preferredHeight: 1
-            color: "#30363d"
-        }
-
-        // ── Enforcement mode (informational — set at daemon start) ──
-        Label { text: "Detection Modes"; color: "#d2a8ff"; font.pixelSize: 13; font.bold: true }
+        Label { text: "Blocking"; color: "#58a6ff"; font.pixelSize: 15; font.bold: true }
         Label {
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
             color: "#8b949e"
             font.pixelSize: 11
-            text: "LSM (ptrace/capable) and fast-path DPI default to AUDIT — they report matches and never break the flow. "
-                  + "To drop matching traffic / deny capability usage, restart the daemon with RING0_DPI_ENFORCE=1 and/or RING0_LSM_ENFORCE=1."
+            text: "Block/unblock an IP address or port. These are privileged actions: the daemon asks polkitd, which pops your desktop authentication dialog once per session."
         }
-
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.preferredHeight: 1
-            color: "#30363d"
-        }
-
-        // ── Response: block / kill ──
-        Label { text: "Threat Response"; color: "#d2a8ff"; font.pixelSize: 13; font.bold: true }
 
         RowLayout {
             Layout.fillWidth: true
@@ -70,7 +45,7 @@ Rectangle {
                 onClicked: {
                     if (blockIpField.text.trim().length > 0) {
                         bridge.blockIp(blockIpField.text.trim())
-                        settingsStatus.text = "Block sent (requires root/ring0)"
+                        settingsStatus.text = "Block sent"
                     }
                 }
             }
@@ -80,35 +55,12 @@ Rectangle {
                 onClicked: {
                     if (blockIpField.text.trim().length > 0) {
                         bridge.unblockIp(blockIpField.text.trim())
-                        settingsStatus.text = "Unblock sent (requires root/ring0)"
+                        settingsStatus.text = "Unblock sent"
                     }
                 }
             }
         }
 
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: 8
-            Label { text: "Reload rules:"; color: "#8b949e"; font.pixelSize: 12 }
-            Button {
-                text: "Reload"
-                onClicked: {
-                    bridge.reloadRules()
-                    settingsStatus.text = "Reload sent"
-                }
-            }
-            Item { Layout.fillWidth: true }
-            Button {
-                text: "Shutdown Daemon"
-                flat: true
-                onClicked: {
-                    bridge.shutdownDaemon()
-                    settingsStatus.text = "Shutdown sent"
-                }
-            }
-        }
-
-        // ── Port blocking ──
         RowLayout {
             Layout.fillWidth: true
             spacing: 8
@@ -117,160 +69,37 @@ Rectangle {
                 id: portSpin
                 from: 1; to: 65535; value: 4444
                 editable: true
-                Layout.preferredWidth: 100
+                Layout.preferredWidth: 110
             }
             Button {
                 text: "Block Port"
                 highlighted: true
-                onClicked: {
-                    bridge.blockPort(portSpin.value)
-                    settingsStatus.text = "Block port sent (requires root/ring0)"
-                }
+                onClicked: { bridge.blockPort(portSpin.value); settingsStatus.text = "Block port sent" }
             }
             Button {
                 text: "Unblock Port"
                 flat: true
-                onClicked: {
-                    bridge.unblockPort(portSpin.value)
-                    settingsStatus.text = "Unblock port sent (requires root/ring0)"
-                }
+                onClicked: { bridge.unblockPort(portSpin.value); settingsStatus.text = "Unblock port sent" }
             }
         }
 
-        // ── Maintenance actions ──
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: 8
-            Button {
-                text: "Run Rootkit Scan"
-                onClicked: {
-                    bridge.runRootkitScan()
-                    settingsStatus.text = "Rootkit scan requested"
-                }
-            }
-            Button {
-                text: "Sync Intel Feeds"
-                onClicked: {
-                    bridge.syncIntelFeeds()
-                    settingsStatus.text = "Intel feed sync requested"
-                }
-            }
-            Button {
-                text: "Power Status"
-                onClicked: {
-                    bridge.powerStatus()
-                    settingsStatus.text = "Power status requested"
-                }
-            }
-            Button {
-                text: "Load Alerts…"
-                highlighted: true
-                onClicked: {
-                    var json = bridge.queryLogs(60, 0, 500)
-                    if (json.length === 0) {
-                        settingsStatus.text = "No response from daemon"
-                        return
-                    }
-                    var parsed = JSON.parse(json)
-                    alertHistoryList.model = parsed.alerts || []
-                    alertHistoryDialog.open()
-                    settingsStatus.text = "Loaded " + (parsed.count || 0) + " alerts"
-                }
-            }
-        }
+        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#30363d" }
 
-        Dialog {
-            id: alertHistoryDialog
-            modal: true
-            x: Math.round((parent.width - width) / 2)
-            y: Math.round((parent.height - height) / 2)
-            width: Math.min(parent.width - 40, 760)
-            height: Math.min(parent.height - 60, 480)
-            background: Rectangle { color: "#0d1117"; border.color: "#30363d"; border.width: 1 }
-            header: Label { text: "Recent Alerts (last 60 min)"; color: "#58a6ff"; font.pixelSize: 14; padding: 8 }
-            ListView {
-                id: alertHistoryList
-                anchors.fill: parent
-                anchors.margins: 8
-                clip: true
-                delegate: Rectangle {
-                    width: parent.width
-                    height: 24
-                    color: index % 2 === 0 ? "#161b22" : "#0d1117"
-                    RowLayout {
-                        anchors.fill: parent
-                        anchors.margins: 2
-                        spacing: 6
-                        Label { text: new Date(modelData.timestamp / 1000000).toLocaleTimeString(); color: "#8b949e"; font.pixelSize: 10; Layout.preferredWidth: 100 }
-                        Label { text: modelData.severity || ""; color: modelData.severity === "CRITICAL" ? "#f85149" : modelData.severity === "HIGH" ? "#f0883e" : "#8b949e"; font.pixelSize: 10; Layout.preferredWidth: 70 }
-                        Label { text: "Rule " + (modelData.rule_id || ""); color: "#58a6ff"; font.pixelSize: 10; Layout.preferredWidth: 80 }
-                        Label { text: modelData.signature || ""; color: "#c9d1d9"; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
-                    }
-                }
-            }
-        }
-
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.preferredHeight: 1
-            color: "#30363d"
-        }
-
-        // ── Sensitivity (sent to the daemon; daemon-side persistence is TODO) ──
-        Label { text: "Sensitivity & Thresholds"; color: "#d2a8ff"; font.pixelSize: 13; font.bold: true }
+        Label { text: "About"; color: "#58a6ff"; font.pixelSize: 15; font.bold: true }
         Label {
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
-            color: "#484f58"
-            font.pixelSize: 10
-            text: "Note: the daemon currently logs these values; live enforcement wiring is not implemented yet."
+            color: "#8b949e"
+            font.pixelSize: 11
+            text: "RingZero — Linux eBPF security command center. The daemon (ring0d) must run as root; the GUI connects over /run/ring0d.sock. Detection is AUDIT by default; enforcement is opt-in (RING0_RESPONSE / RING0_DPI_ENFORCE / RING0_LSM_ENFORCE). See the README §7.5 for the threat model."
         }
 
-        GridLayout {
-            columns: 3
-            columnSpacing: 12
-            rowSpacing: 8
-            Layout.fillWidth: true
-
-            Label { text: "CPU Governor Threshold:"; color: "#8b949e"; font.pixelSize: 12 }
-            Slider {
-                id: cpuSlider
-                from: 1; to: 10; value: 3; stepSize: 0.5
-                Layout.fillWidth: true
-                Layout.preferredHeight: 20
-            }
-            Label { text: cpuSlider.value.toFixed(1) + "%"; color: "#c9d1d9"; font.pixelSize: 12 }
-        }
-
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.preferredHeight: 1
-            color: "#30363d"
-        }
-
-        // ── Actions ──
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: 12
-            Button {
-                text: "Save Settings"
-                highlighted: true
-                onClicked: {
-                    var cfg = {
-                        cpuThreshold: cpuSlider.value,
-                        darkMode: settingsRoot.darkMode
-                    }
-                    bridge.updateSettings(JSON.stringify(cfg))
-                    settingsStatus.text = "Saved (daemon logs; not yet enforced)"
-                }
-            }
-            Item { Layout.fillWidth: true }
-            Label {
-                id: settingsStatus
-                text: ""
-                color: "#3fb950"
-                font.pixelSize: 11
-            }
+        Item { Layout.fillWidth: true }
+        Label {
+            id: settingsStatus
+            text: ""
+            color: "#3fb950"
+            font.pixelSize: 11
         }
     }
 }
