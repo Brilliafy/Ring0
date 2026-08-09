@@ -182,6 +182,12 @@ struct Daemon {
     last_status: parking_lot::Mutex<Option<(u64, std::time::Instant)>>,
     /// Per-rule-id alert rate limiter (prevents per-packet alert storms).
     alert_throttle: parking_lot::Mutex<std::collections::HashMap<u32, std::time::Instant>>,
+    /// Per-pid last-connect processing time (secs): the LSM socket_connect
+    /// hook emits up to 2 events/s per pid and the full pipeline runs an rpm
+    /// subprocess + hashing inline on the main loop - that starved status /
+    /// command handling and spiked CPU. The expensive path runs at most once
+    /// per pid per 5s; intermediate connects only update the cheap trackers.
+    connect_throttle: parking_lot::Mutex<std::collections::HashMap<u32, u64>>,
     blocklist_payload: Arc<parking_lot::Mutex<Option<sucadara::SyncPayload>>>,
 }
 
@@ -290,6 +296,7 @@ impl Daemon {
         let event_count = std::sync::atomic::AtomicU64::new(0);
         let last_status = parking_lot::Mutex::new(None);
         let alert_throttle = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let connect_throttle = parking_lot::Mutex::new(std::collections::HashMap::new());
 
         // Kick off the Suricata rules + DNS/IP blocklist sync in the background.
         let blocklist_payload: Arc<parking_lot::Mutex<Option<sucadara::SyncPayload>>> =
@@ -344,6 +351,7 @@ impl Daemon {
             event_count,
             last_status,
             alert_throttle,
+            connect_throttle,
             blocklist_payload,
         })
     }
@@ -367,6 +375,10 @@ impl Daemon {
             tokio::select! {
                 biased;
                 _ = self.shutdown.notified() => { info!("shutdown"); break; }
+                // Commands MUST be served ahead of the event streams: with the
+                // event receivers first in a biased select, a continuous
+                // exec/connect stream starved cmd_rx and ring0ctl status hung.
+                Some(cmd) = self.cmd_rx.recv() => { self.handle_command(cmd).await; }
                 Ok(data) = ring_rx.recv() => { self.on_raw_event(&data).await; }
                 Ok(lsm_data) = lsm_rx.recv() => { self.on_lsm_event(&lsm_data).await; }
                 Ok(rk_data) = rootkit_rx.recv() => { self.on_rootkit_event(&rk_data).await; }
@@ -416,7 +428,6 @@ impl Daemon {
                 }
                 _ = prompt_tick.tick() => { self.prompt.check_timeouts(); }
                 _ = blocklist_tick.tick() => { self.apply_blocklist_payload().await; }
-                Some(cmd) = self.cmd_rx.recv() => { self.handle_command(cmd).await; }
             }
         }
         self.cleanup();
@@ -687,6 +698,23 @@ impl Daemon {
         self.correlation.push_connect(pid, dip, dp);
         self.lineage.record_connect(pid, dip, dp);
         self.baseline.record_connection(dip, dp);
+        // Per-pid throttle: the LSM emits up to 2 connects/s per pid and the
+        // full pipeline runs an rpm subprocess + file hashing. Running it on
+        // every event starved the main loop (status/commands queued behind a
+        // cascade of connect handling). Cheap trackers above still update.
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        {
+            let mut throttle = self.connect_throttle.lock();
+            if let Some(&last) = throttle.get(&pid) {
+                if now_s.saturating_sub(last) < 5 {
+                    return;
+                }
+            }
+            throttle.insert(pid, now_s);
+        }
         if let Some(anomaly) = self.baseline.check_connection_anomaly(dip, dp) {
             let a = build_alert_bytes_rule(8002, 2, &anomaly);
             self.storage.write_alert(&a);
@@ -1567,7 +1595,10 @@ impl Daemon {
             UpdateSettings(json) => info!("Settings: {json}"),
             RunDoctor => info!("Doctor requested"),
             Status => {
-                self.apply_blocklist_payload().await;
+                // Do NOT apply the pending blocklist here: a freshly-fetched
+                // payload (2k+ CIDRs, 190k domains + DPI compile) takes ~30s
+                // and the first ring0ctl status hung the CLI while it ran.
+                // The blocklist_tick applies it; status stays a light query.
                 let total = self.event_count.load(std::sync::atomic::Ordering::Relaxed);
                 let mut last = self.last_status.lock();
                 let now = std::time::Instant::now();

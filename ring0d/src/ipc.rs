@@ -221,20 +221,26 @@ impl IpcServer {
                                         // hop) so the GUI can refresh its process
                                         // tree / socket list without an approval.
                                         Ok(DaemonCmd::ListProcesses) => {
-                                            info!("IPC: ListProcesses from pid {}", peer_cred.pid);
-                                            let procs = crate::proc_snapshot::list_processes();
-                                            let response = build_process_list_response(&procs);
-                                            if resp_tx.send(response).is_err() {
-                                                warn!("IPC: ListProcesses resp_tx send FAILED");
-                                                break;
-                                            }
+                                            // The /proc scan is slow (thousands of
+                                            // entries on an HDD); running it inline
+                                            // stalls this connection's read loop, so
+                                            // every other command (status, events)
+                                            // queues behind it and the GUI freezes
+                                            // waiting. Compute on a blocking task.
+                                            let resp_tx = resp_tx.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                let procs = crate::proc_snapshot::list_processes();
+                                                let response = build_process_list_response(&procs);
+                                                let _ = resp_tx.send(response);
+                                            });
                                         }
                                         Ok(DaemonCmd::ListSockets) => {
-                                            let socks = crate::proc_snapshot::list_sockets();
-                                            let response = build_socket_list_response(&socks);
-                                            if resp_tx.send(response).is_err() {
-                                                break;
-                                            }
+                                            let resp_tx = resp_tx.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                let socks = crate::proc_snapshot::list_sockets();
+                                                let response = build_socket_list_response(&socks);
+                                                let _ = resp_tx.send(response);
+                                            });
                                         }
                                         Ok(cmd) => {
                                             // Destructive/sensitive commands are

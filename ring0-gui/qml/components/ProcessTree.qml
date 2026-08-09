@@ -97,7 +97,7 @@ Rectangle {
             clip: true
             model: root.execModel
             delegate: Rectangle {
-                width: parent.width
+                width: parent ? parent.width : 0
                 height: 20
                 color: index % 2 === 0 ? Theme.bgSurface : Theme.bgBase
                 RowLayout {
@@ -148,7 +148,13 @@ Rectangle {
 
     function refresh() {
         if (bridge && bridge.isConnected()) {
-            setSnapshot(bridge.listProcesses())
+            bridge.listProcesses() // fire-and-forget
         }
+    }
+
+    // Collect a pending snapshot response (called from the poll timer).
+    function collect() {
+        var json = bridge.takeProcesses()
+        if (json.length > 0) setSnapshot(json)
     }
 }
