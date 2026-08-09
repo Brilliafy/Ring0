@@ -57,6 +57,7 @@ Rectangle {
                 spacing: 6
                 Rectangle {
                     width: 46; height: 12; radius: 3
+                    Layout.preferredWidth: 46
                     color: pillColor
                     Layout.alignment: Qt.AlignVCenter
                     Label {
